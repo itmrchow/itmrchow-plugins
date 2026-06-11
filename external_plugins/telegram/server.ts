@@ -4,7 +4,8 @@
  *
  * Self-contained MCP server with full access control: pairing, allowlists,
  * group support with mention-triggering. State lives in
- * ~/.claude/channels/telegram/access.json — managed by the /telegram:access skill.
+ * ~/.claude/channels/telegram/access.json (or $TELEGRAM_STATE_DIR/access.json
+ * when that env is set) — managed by the /telegram:access skill.
  *
  * Telegram's Bot API has no history or search. Reply-only tools.
  */
@@ -29,7 +30,7 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 
-// Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
+// Load ~/.claude/channels/telegram/.env (or $TELEGRAM_STATE_DIR/.env) into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
 try {
   // Token is a credential — lock to owner. No-op on Windows (would need ACLs).
