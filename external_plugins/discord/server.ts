@@ -33,6 +33,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import { BusyGate, capturePaneBusy } from './busy-gate'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -466,6 +467,38 @@ const mcp = new Server(
   },
 )
 
+type ChannelDelivery = {
+  content: string
+  meta: Record<string, string>
+}
+
+// Single busy-gated choke point for inbound Discord delivery (JP-44).
+// notifications/claude/channel does NOT enroll in Claude's pty type-ahead
+// queue, so a mid-turn delivery orphans in the input box and never submits.
+// Gate it: every payload is enqueued and the drain loop flushes it FIFO,
+// one per tick, only when the tmux pane is idle. There is no immediate
+// fast-path on purpose. The capture-pane footer lags ~1s behind the agent
+// going busy, so a post-deliver settle cooldown (FOOTER_SETTLE_MS) holds the
+// next flush across that lag window so two rapid messages cannot both read
+// idle and re-wedge the second.
+// Permission relays and button interactions bypass this (they don't pass through here).
+// Discord has no /inject / scheduler path, so this is the only gate site.
+const channelGate = new BusyGate<ChannelDelivery>({
+  isBusy: () => capturePaneBusy(),
+  deliver: async ({ content, meta }) => {
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: { content, meta },
+      })
+    } catch (err) {
+      process.stderr.write(`discord busy-gate: channel deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
+      throw err
+    }
+  },
+})
+channelGate.start()
+
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
@@ -729,6 +762,7 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
+  channelGate.stop()
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -872,21 +906,16 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content,
-      meta: {
-        chat_id,
-        message_id: msg.id,
-        user: msg.author.username,
-        user_id: msg.author.id,
-        ts: msg.createdAt.toISOString(),
-        ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
-      },
+  channelGate.submit({
+    content,
+    meta: {
+      chat_id,
+      message_id: msg.id,
+      user: msg.author.username,
+      user_id: msg.author.id,
+      ts: msg.createdAt.toISOString(),
+      ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
     },
-  }).catch(err => {
-    process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
 
