@@ -25,6 +25,8 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { BusyGate, capturePaneBusy } from './busy-gate'
+import { decideClear, getContextPercent, sendClear } from './control-plane'
+import { restartAgent } from './restart-agent'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -836,6 +838,71 @@ bot.command('status', async ctx => {
   }
 
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+})
+
+// --- JP-38 bot-layer control plane (survives agent death) ---------------------
+// /ctx, /clear, /restart operate the agent directly via tmux/systemctl. They
+// require a PAIRED owner (allowFrom), a stricter gate than dmCommandGate alone:
+// these act on the host, not just chat, so a pending (un-paired) sender must
+// not reach them.
+
+/** Per-sender last /clear warning, for the busy-confirm gate. */
+const clearWarnedAt = new Map<string, number>()
+
+/** Gate a control command to a paired owner. Returns the senderId or null. */
+function controlGate(ctx: Context): string | null {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return null
+  if (!gated.access.allowFrom.includes(gated.senderId)) return null
+  return gated.senderId
+}
+
+bot.command('ctx', async ctx => {
+  if (!controlGate(ctx)) return
+  const { pct, raw } = await getContextPercent()
+  if (pct === null) {
+    await ctx.reply(
+      raw
+        ? `Context: 無法解析百分比，footer 片段：\n${raw}`
+        : `Context: 讀取 pane 失敗（capture 無回應）。`,
+    )
+    return
+  }
+  await ctx.reply(`Context: ${pct}% used (≈ ${100 - pct}% left)`)
+})
+
+bot.command('clear', async ctx => {
+  const senderId = controlGate(ctx)
+  if (!senderId) return
+  const busy = await capturePaneBusy()
+  const decision = decideClear(busy, clearWarnedAt.get(senderId) ?? null, Date.now())
+  if (decision === 'warn') {
+    clearWarnedAt.set(senderId, Date.now())
+    await ctx.reply('agent 忙碌中，/clear 會打斷當前任務並清空 context。確認請在 30 秒內再送一次 /clear。')
+    return
+  }
+  clearWarnedAt.delete(senderId)
+  try {
+    await sendClear()
+    await ctx.reply('已送出 /clear。')
+  } catch (err) {
+    await ctx.reply(`/clear 投遞失敗：${err}`)
+  }
+})
+
+bot.command('restart', async ctx => {
+  if (!controlGate(ctx)) return
+  // Reply BEFORE restarting: this bot process is killed by the restart, so a
+  // post-restart confirmation can never be sent. The freshly started agent
+  // announces it is back up separately (startup notice).
+  await ctx.reply('重啟中…')
+  const result = await restartAgent('manual /restart (telegram)', { bypassThrottle: true })
+  if (result.status === 'in-progress') {
+    await ctx.reply('已有重啟進行中，請稍候。')
+  } else if (result.status === 'failed') {
+    await ctx.reply(`重啟失敗：${result.error}`)
+  }
+  // status 'ok': this process is likely already gone; the back-up notice covers it.
 })
 
 // Inline-button handler for permission requests. Callback data is
