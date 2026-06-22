@@ -132,6 +132,7 @@ function defaultAccess(): Access {
     allowFrom: [],
     groups: {},
     pending: {},
+    ackReaction: '👀',
   }
 }
 

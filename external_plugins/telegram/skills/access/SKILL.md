@@ -122,7 +122,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
 `textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
-- `ackReaction`: string (emoji) or `""` to disable
+- `ackReaction`: string (emoji) or `""` to disable. Defaults to `👀` (read receipt on inbound messages). Telegram only accepts emoji from its fixed reaction whitelist; `👀` is in it.
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
 - `chunkMode`: `length` | `newline`
