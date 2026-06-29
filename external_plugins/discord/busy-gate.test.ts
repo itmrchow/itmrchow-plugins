@@ -8,11 +8,15 @@ import {
   QUEUE_MAX_SIZE,
 } from './busy-gate'
 
+// Auto-mode idle footer: contains the OLD marker 'esc to interrupt' but NOT
+// 'tokens'. This is the JP-79 regression fixture — auto mode permanently shows
+// `esc to interrupt`, so an idle-vs-busy probe MUST key off something else.
 const IDLE_PANE = [
   '❯ ',
-  '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+  '⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt',
 ].join('\n')
 
+// Generating footer: the live token-counter line that only appears mid-turn.
 const BUSY_PANE = [
   '❯ ',
   '✻ Working… (12s · ↑ 3.4k tokens · esc to interrupt)',
@@ -27,6 +31,13 @@ describe('isPaneBusy', () => {
     expect(isPaneBusy(IDLE_PANE)).toBe(false)
   })
 
+  test('JP-79 regression: auto-mode idle footer (has "esc to interrupt", no "tokens") is idle', () => {
+    // The old marker would mis-read this as busy forever, wedging the queue.
+    expect(IDLE_PANE).toContain('esc to interrupt')
+    expect(IDLE_PANE).not.toContain('tokens')
+    expect(isPaneBusy(IDLE_PANE)).toBe(false)
+  })
+
   test('treats empty capture as idle', () => {
     expect(isPaneBusy('')).toBe(false)
   })
@@ -34,7 +45,7 @@ describe('isPaneBusy', () => {
   test('ignores the marker outside the footer region (false-positive guard)', () => {
     // Agent output echoing the literal marker, then 5+ idle footer lines below.
     const pane = [
-      'user pasted: run with "esc to interrupt" disabled',
+      'user pasted: 1.2k tokens used',
       'line 1',
       'line 2',
       'line 3',
@@ -45,7 +56,7 @@ describe('isPaneBusy', () => {
   })
 
   test('BUSY_MARKER is the documented substring', () => {
-    expect(BUSY_MARKER).toBe('esc to interrupt')
+    expect(BUSY_MARKER).toBe('tokens')
   })
 })
 

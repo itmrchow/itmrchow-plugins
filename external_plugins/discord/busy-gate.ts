@@ -13,8 +13,20 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-/** Substring present in the Claude TUI footer only while a turn is generating. */
-export const BUSY_MARKER = 'esc to interrupt'
+/**
+ * Substring present in the Claude TUI footer only while a turn is generating.
+ *
+ * Must NOT be 'esc to interrupt' (JP-79): in Claude Code auto mode the footer
+ * permanently shows `⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt`,
+ * so BOTH idle and generating panes contain that string. Using it as the marker
+ * made isPaneBusy always return true, so the drain loop never ran and every
+ * inbound DM / scheduler inject wedged in the queue forever.
+ *
+ * 'tokens' appears only in the live token-counter line the TUI renders while a
+ * turn is generating (e.g. `· Working… (8s · ↓ 172 tokens)`); an idle footer
+ * has no such line. It is therefore a true generating-only signal.
+ */
+export const BUSY_MARKER = 'tokens'
 
 /** tmux target (session:window) to inspect. Configurable for non-a1-b hosts. */
 export const TMUX_TARGET = process.env.TMUX_TARGET ?? 'claude-tg-agent:0'
