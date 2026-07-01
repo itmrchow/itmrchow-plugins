@@ -1,0 +1,19 @@
+name: deploy-a1b
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: deploy-a1b
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: SSH deploy to a1-b
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ secrets.A1B_HOST }}
+          username: ${{ secrets.A1B_USER }}
+          key: ${{ secrets.A1B_SSH_KEY }}
+          script: ~/claude-tg-agent/scripts/deploy.sh itmrchow-plugins
