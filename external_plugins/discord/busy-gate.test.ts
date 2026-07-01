@@ -9,7 +9,12 @@ import {
   QUEUE_MAX_SIZE,
 } from './busy-gate'
 
-/** Auto-mode footer line, always present idle or busy (JP-79 always-busy trap). */
+/**
+ * Auto-mode footer line, always present idle or busy (JP-79 always-busy trap).
+ *
+ * Contains the OLD marker 'esc to interrupt' but NOT 'tokens'. Auto mode shows
+ * it permanently, so an idle-vs-busy probe MUST key off the parenthesised timer.
+ */
 const AUTO_MODE_FOOTER = '⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt'
 
 const IDLE_PANE = [
@@ -17,6 +22,7 @@ const IDLE_PANE = [
   AUTO_MODE_FOOTER,
 ].join('\n')
 
+// Generating footer: the live token-counter line that only appears mid-turn.
 const BUSY_PANE = [
   '❯ ',
   '✶ Working… (6m 49s · ↓ 16.0k tokens)',
@@ -61,6 +67,13 @@ describe('isPaneBusy', () => {
     // counter with no parenthesised timer. A bare `tokens` substring read this
     // busy forever and wedged every inbound message. BUSY_PATTERN must not match.
     expect(isPaneBusy(BG_AGENT_IDLE_PANE)).toBe(false)
+  })
+
+  test('JP-79 regression: auto-mode idle footer (has "esc to interrupt", no "tokens") is idle', () => {
+    // The old marker would mis-read this as busy forever, wedging the queue.
+    expect(IDLE_PANE).toContain('esc to interrupt')
+    expect(IDLE_PANE).not.toContain('tokens')
+    expect(isPaneBusy(IDLE_PANE)).toBe(false)
   })
 
   test('treats empty capture as idle', () => {
