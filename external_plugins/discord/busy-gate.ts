@@ -13,8 +13,34 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-/** Substring present in the Claude TUI footer only while a turn is generating. */
-export const BUSY_MARKER = 'esc to interrupt'
+/**
+ * Regex matching the main-generation spinner's parenthesised timer only.
+ *
+ * The Claude TUI renders the live generating spinner as a parenthesised timer
+ * that always leads with an elapsed-time token then a token counter, e.g.
+ * `(6m 49s · ↓ 16.0k tokens)` or `(8s · ↓ 172 tokens · thought for 1s)`. The
+ * leading `\(\d+[hms]` anchors on that opening `(<number><h|m|s>` so only the
+ * real generating spinner matches.
+ *
+ * Why this supersedes a bare `tokens` substring (JP-84, the second always-busy
+ * root cause): a background agent status panel renders its OWN token counter
+ * with no leading parenthesis — e.g. `◯ backend-dev  13s · ↓ 45.3k tokens`.
+ * That line stays pinned in the footer while the MAIN session is idle, so a
+ * bare `tokens` substring reads busy forever and every inbound message wedges
+ * in the queue. Requiring the `(<number><unit>…tokens` parenthesised shape
+ * excludes the unparenthesised background-agent timer. It likewise excludes the
+ * auto-mode footer `⏵⏵ auto mode on … · esc to interrupt` (JP-79's first
+ * always-busy case), which carries no parenthesised token timer.
+ */
+export const BUSY_PATTERN = /\(\d+[hms][^)]*tokens/
+
+/**
+ * @deprecated Superseded by BUSY_PATTERN; kept only for import back-compat.
+ *   The runtime busy probe (isPaneBusy) no longer reads this substring. A bare
+ *   `tokens` match false-positives on background-agent panels (JP-84), which is
+ *   exactly why BUSY_PATTERN replaced it.
+ */
+export const BUSY_MARKER = 'tokens'
 
 /** tmux target (session:window) to inspect. Configurable for non-a1-b hosts. */
 export const TMUX_TARGET = process.env.TMUX_TARGET ?? 'claude-tg-agent:0'
@@ -61,18 +87,23 @@ const FOOTER_TAIL_LINES = 5
 /**
  * Decide whether the Claude pane is mid-turn from a captured pane snapshot.
  *
- * Tests only the last FOOTER_TAIL_LINES lines for the busy marker. The marker
- * lives in the TUI footer; scanning the whole capture would read busy forever
- * if agent output happened to contain the literal marker string.
+ * Tests each of the last FOOTER_TAIL_LINES lines against BUSY_PATTERN. The
+ * generating spinner lives in the TUI footer; scanning the whole capture would
+ * read busy forever if agent output happened to echo a matching timer string.
+ *
+ * Lines are tested individually rather than joined: BUSY_PATTERN's `[^)]*`
+ * segment must not be allowed to span a newline and stitch a stray `(12s`
+ * opener on one line to a `tokens` on another, which a joined haystack would
+ * permit and would resurrect false positives.
  *
  * Args:
  *   pane: stdout of `tmux capture-pane -p`.
  * Returns:
- *   True when the busy marker is present in the footer region, else False.
+ *   True when a footer line matches the generating-spinner pattern, else False.
  */
 export function isPaneBusy(pane: string): boolean {
-  const footer = pane.split('\n').slice(-FOOTER_TAIL_LINES).join('\n')
-  return footer.includes(BUSY_MARKER)
+  const lines = pane.split('\n').slice(-FOOTER_TAIL_LINES)
+  return lines.some(line => BUSY_PATTERN.test(line))
 }
 
 /**
