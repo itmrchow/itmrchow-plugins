@@ -1121,7 +1121,10 @@ async function handleInbound(msg: Message): Promise<void> {
     meta: {
       chat_id,
       message_id: msg.id,
-      user: msg.author.username,
+      // sanitizeMetaText: symmetric with reply_to_user — the sender's username
+      // is a webhook/app display name (attacker-controlled), so neutralize
+      // meta-attribute-breaking chars before it lands in the <channel> tag.
+      user: sanitizeMetaText(msg.author.username),
       user_id: msg.author.id,
       ts: msg.createdAt.toISOString(),
       ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
