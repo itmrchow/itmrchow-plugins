@@ -97,6 +97,7 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`, and quote-replies carry `reply_to: <id>` of the referenced message. Discord's search API isn't exposed to bots, so this is the only lookback. |
 | `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
+| `get_message` | Fetch one message by ID and return its full detail — author, ISO timestamp, complete text, and any attachments' name/type/size. Use it to read the message an inbound quote-reply points at (`reply_to_message_id`). Returns a clear "unavailable" note (not an error) when the message is deleted, missing, or unreadable. |
 
 Inbound messages trigger a typing indicator automatically — Discord shows
 "botname is typing…" while the assistant works on a response.
@@ -113,13 +114,16 @@ whose attributes carry structured metadata:
 | `user` / `user_id` | Sender's username and snowflake ID. |
 | `ts` | ISO 8601 timestamp. |
 | `attachment_count` / `attachments` | Present when the message has attachments — name/type/size list. |
-| `reply_to_message_id` | Present when the sender quote-replied — ID of the referenced message. |
-| `reply_to_user` | Author of the referenced message (`me` = the bot itself). Omitted when the referenced message can't be fetched (e.g. deleted). |
-| `reply_to_preview` | First 120 characters (code points) of the referenced message — newlines flattened, `"`/`<`/`>` replaced with look-alikes, `…` appended when truncated. Omitted when unfetchable or empty. |
+| `reply_to_message_id` | Present when the sender quote-replied — ID of the referenced message. Pass it to `get_message` to read the quoted message's full text. |
+| `reply_to_user` | Author of the referenced message (`me` = the bot itself). Omitted when the referenced message can't be fetched (e.g. deleted). `"`/`<`/`>` in the name are replaced with look-alikes to keep the metadata attribute intact. |
 
-The reply reference lives in metadata (not message text) so the assistant can
-resolve "this" / "that" in a quote-reply without an extra `fetch_messages`
-round-trip — and so it can't be forged by a sender typing a look-alike string.
+The reply reference lives in metadata (not message text) so it can't be forged
+by a sender typing a look-alike string. It carries only the referenced ID and
+author — no inline preview; the assistant calls
+`get_message(chat_id, reply_to_message_id)` to read the quoted message's full
+content on demand. This keeps every inbound notification small (a large quoted
+message never bloats it) and always exposes the complete text rather than a
+truncated slice.
 
 ## Attachments
 
