@@ -32,9 +32,6 @@ const RESTART_STATE_DIR =
 /** Marker file signalling "a bot-initiated restart just happened". */
 const MARKER_FILE = join(RESTART_STATE_DIR, 'restart-notice.json')
 
-/** Suffix appended when a booting server claims the marker atomically. */
-const CLAIMED_SUFFIX = '.claimed'
-
 /** Claude's installed-plugins registry (version + git sha per plugin). */
 const INSTALLED_PLUGINS_FILE =
   process.env.CLAUDE_INSTALLED_PLUGINS_FILE ??
@@ -156,7 +153,7 @@ export function clearRestartMarker(dir: string = RESTART_STATE_DIR): void {
  */
 export function claimRestartMarker(dir: string = RESTART_STATE_DIR): RestartMarker | null {
   const marker = join(dir, 'restart-notice.json')
-  const claimed = marker + CLAIMED_SUFFIX
+  const claimed = marker + '.claimed'
   if (!existsSync(marker)) return null
   try {
     renameSync(marker, claimed)

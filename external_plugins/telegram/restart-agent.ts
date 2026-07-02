@@ -210,16 +210,14 @@ export async function findClaudePidInTree(
   rootPid: number,
   tree: ProcessTreeReader = defaultTreeReader,
 ): Promise<number | null> {
-  let frontier = [rootPid]
-  for (let depth = 0; depth < MAX_TREE_DEPTH && frontier.length > 0; depth++) {
-    const next: number[] = []
-    for (const pid of frontier) {
-      for (const child of await tree.getChildren(pid)) {
-        if ((await tree.getCommand(child)) === CLAUDE_COMM) return child
-        next.push(child)
-      }
+  const queue: Array<{ pid: number; depth: number }> = [{ pid: rootPid, depth: 0 }]
+  while (queue.length > 0) {
+    const { pid, depth } = queue.shift()!
+    if (depth >= MAX_TREE_DEPTH) continue
+    for (const child of await tree.getChildren(pid)) {
+      if ((await tree.getCommand(child)) === CLAUDE_COMM) return child
+      queue.push({ pid: child, depth: depth + 1 })
     }
-    frontier = next
   }
   return null
 }
