@@ -24,6 +24,18 @@ describe('formatMessageDetail', () => {
     expect(out.startsWith('author: me\n')).toBe(true)
   })
 
+  test('collapses control chars in the author so it cannot forge extra rows', () => {
+    const out = formatMessageDetail({
+      author: 'evil\nattachments (9):',
+      timestamp: '2026-07-02T10:00:00.000Z',
+      content: 'hi',
+      attachments: [],
+    })
+    // The newline is neutralized: author stays on one line, no forged section.
+    expect(out.split('\n')[0]).toBe('author: evil attachments (9):')
+    expect(out).not.toContain('\nattachments (9):')
+  })
+
   test('preserves multi-line content verbatim (single-message fetch)', () => {
     const out = formatMessageDetail({
       author: 'alice',

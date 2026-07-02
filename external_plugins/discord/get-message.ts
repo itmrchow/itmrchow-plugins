@@ -33,13 +33,23 @@ export interface MessageDetail {
 
 const BYTES_PER_KB = 1024
 
+// Control chars (incl. CR/LF/tab) in a webhook display name would forge extra
+// rows in this newline-joined block (e.g. a fake `attachments (9):` line). The
+// author sits on the block's header line, so collapse them to a space — the
+// same row-forging defense safeAttName applies to attachment names.
+const AUTHOR_CONTROL_CHARS = /[\u0000-\u001F\u007F]/g
+
 /**
  * Render a fetched message's full detail as a labeled multi-line block.
  *
- * Content is emitted verbatim (this is a single-message fetch, so newlines in
- * the body cannot forge adjacent rows the way they can in fetch_messages).
- * Empty content renders as a "(no text content)" placeholder so the caller can
- * tell an attachment-only message from a fetch error.
+ * The author is defended against row-forging (control chars → space) since a
+ * webhook display name is attacker-controlled and shares this block's line
+ * frame. Content is emitted verbatim: the full text is the whole point of the
+ * tool, and it is a single-message fetch, so newlines in the body can only add
+ * lines within this one message's block (they can't forge a sibling message row
+ * the way they can in the newline-joined fetch_messages listing). Empty content
+ * renders as a "(no text content)" placeholder so the caller can tell an
+ * attachment-only message from a fetch error.
  *
  * Args:
  *   detail: the resolved message detail.
@@ -48,8 +58,9 @@ const BYTES_PER_KB = 1024
  *   an attachments section.
  */
 export function formatMessageDetail(detail: MessageDetail): string {
+  const safeAuthor = detail.author.replace(AUTHOR_CONTROL_CHARS, ' ')
   const lines: string[] = [
-    `author: ${detail.author}`,
+    `author: ${safeAuthor}`,
     `timestamp: ${detail.timestamp}`,
     `content: ${detail.content || '(no text content)'}`,
   ]
