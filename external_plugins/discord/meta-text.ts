@@ -12,10 +12,12 @@
 // single-line <channel ... reply_to_user="..."> attribute; we cannot verify the
 // harness escapes them, and this server already strips structural chars for
 // meta-bound attachment names (safeAttName, which also drops CR/LF). Control
-// chars (incl. CR/LF/tab) collapse to a space so the value can't break the tag
+// chars (C0 incl. CR/LF/tab, DEL, C1 U+0080-U+009F) plus the Unicode line
+// separators U+2028/U+2029 collapse to a space so the value can't break the tag
 // onto a new line or forge adjacent attributes; look-alikes over `"`/`<`/`>`
-// keep the name readable.
-const CONTROL_CHARS = /[\u0000-\u001F\u007F]/g
+// keep the name readable. Escapes are written \uXXXX (never literal control
+// bytes in source).
+const CONTROL_CHARS = /[\u0000-\u001F\u007F\u0080-\u009F\u2028\u2029]/g
 const META_CHAR_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
   [CONTROL_CHARS, ' '],
   [/"/g, "'"],
