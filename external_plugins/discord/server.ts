@@ -43,6 +43,7 @@ import {
   type ControlCommand,
 } from './control-plane'
 import { restartAgent } from './restart-agent'
+import { consumeStartupNotice } from './startup-notice'
 import { parseInjectBody, type ChannelDelivery } from './inject'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -1033,8 +1034,38 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
+/**
+ * Announce "the agent is back" after a bot-initiated restart (JP-38).
+ *
+ * Runs once when the gateway is ready. Claims the shared restart marker
+ * (atomic — a boot race with the telegram server yields exactly one notice)
+ * and DMs the paired owner(s) the plugin versions now loaded, flagging
+ * changes across the restart. Silent on a clean boot (no marker) or when
+ * nobody is paired.
+ *
+ * Returns:
+ *   None.
+ */
+function announceStartup(): void {
+  const access = loadAccess()
+  if (access.allowFrom.length === 0) return
+  const notice = consumeStartupNotice()
+  if (notice === null) return
+  for (const userId of access.allowFrom) {
+    void (async () => {
+      try {
+        const user = await client.users.fetch(userId)
+        await user.send(notice)
+      } catch (err) {
+        process.stderr.write(`discord channel: startup notice to ${userId} failed: ${err}\n`)
+      }
+    })()
+  }
+}
+
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  announceStartup()
 })
 
 client.login(TOKEN).catch(err => {

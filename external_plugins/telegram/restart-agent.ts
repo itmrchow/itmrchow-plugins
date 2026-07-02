@@ -27,6 +27,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { TMUX_TARGET } from './busy-gate'
+import { clearRestartMarker, writeRestartMarker } from './startup-notice'
 
 const execFileAsync = promisify(execFile)
 
@@ -293,10 +294,15 @@ export async function restartAgent(
       return { status: 'throttled', reason: decision.reason, retryAfterMs: decision.retryAfterMs }
     }
 
+    // Marker BEFORE the restart: the freshly booted bot server reads it to
+    // announce "I'm back" with a plugin-version diff (startup-notice.ts).
+    writeRestartMarker(reason, deps.now())
     const tier = await performRestart(deps)
     saveState(decision.nextState)
     return { status: 'ok', tier }
   } catch (err) {
+    // Restart failed — the agent never went down; a boot notice would lie.
+    clearRestartMarker()
     return { status: 'failed', error: String(err) }
   } finally {
     releaseLock()

@@ -27,6 +27,7 @@ import { join, extname, sep } from 'path'
 import { BusyGate, capturePaneBusy } from './busy-gate'
 import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
+import { consumeStartupNotice } from './startup-notice'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -904,6 +905,30 @@ bot.command('restart', async ctx => {
   }
   // status 'ok': this process is likely already gone; the back-up notice covers it.
 })
+
+/**
+ * Announce "the agent is back" after a bot-initiated restart (JP-38).
+ *
+ * Runs once at boot. Claims the shared restart marker (atomic — a boot race
+ * with the discord server yields exactly one notice) and DMs the paired
+ * owner(s) the plugin versions now loaded, flagging changes across the
+ * restart. Silent on a clean boot (no marker) or when nobody is paired.
+ *
+ * Returns:
+ *   None.
+ */
+function announceStartup(): void {
+  const access = loadAccess()
+  if (access.allowFrom.length === 0) return
+  const notice = consumeStartupNotice()
+  if (notice === null) return
+  for (const chat_id of access.allowFrom) {
+    void bot.api.sendMessage(chat_id, notice).catch(err => {
+      process.stderr.write(`telegram channel: startup notice to ${chat_id} failed: ${err}\n`)
+    })
+  }
+}
+announceStartup()
 
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
