@@ -32,6 +32,14 @@ const RESTART_STATE_DIR =
 /** Marker file signalling "a bot-initiated restart just happened". */
 const MARKER_FILE = join(RESTART_STATE_DIR, 'restart-notice.json')
 
+/**
+ * A marker older than this is discarded at claim time. Covers the case where
+ * the restart was initiated but no bot server booted for a long while (e.g.
+ * the launcher's crash-loop brake stopped relaunching): announcing "回來了"
+ * hours later would misattribute an unrelated boot to that stale restart.
+ */
+export const MARKER_TTL_MS = 30 * 60 * 1000
+
 /** Claude's installed-plugins registry (version + git sha per plugin). */
 const INSTALLED_PLUGINS_FILE =
   process.env.CLAUDE_INSTALLED_PLUGINS_FILE ??
@@ -46,9 +54,43 @@ export type PluginSnapshot = Record<string, PluginVersion>
 /** Marker payload written before a restart and consumed on the next boot. */
 export type RestartMarker = { ts: number; reason: string; plugins: PluginSnapshot }
 
+/** One install record inside a plugin's entry array. */
+type InstalledPluginEntry = { version?: string; gitCommitSha?: string; lastUpdated?: string }
+
 /** Shape of installed_plugins.json (version 2) — one entry array per plugin. */
 type InstalledPluginsFile = {
-  plugins?: Record<string, Array<{ version?: string; gitCommitSha?: string }>>
+  plugins?: Record<string, InstalledPluginEntry[]>
+}
+
+/**
+ * Pick which install record to report for a plugin key.
+ *
+ * Keys are `name@marketplace`, so the same plugin from two marketplaces never
+ * shares an array; entries only multiply when ONE plugin is installed at
+ * several scopes (user + project). The registry does not document element
+ * order, so rather than trusting entries[0] this takes the newest lastUpdated
+ * (missing/unparsable timestamps sort oldest; ties keep the earlier element).
+ * Observed live registries hold exactly one entry per key, so this is a
+ * tie-breaker for a rare case — the notice is informational either way.
+ *
+ * Args:
+ *   entries: the plugin's install records.
+ * Returns:
+ *   The chosen entry, or undefined when none is a usable object.
+ */
+function pickNewestEntry(entries: InstalledPluginEntry[]): InstalledPluginEntry | undefined {
+  let best: InstalledPluginEntry | undefined
+  let bestTs = Number.NEGATIVE_INFINITY
+  for (const entry of entries) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const parsed = Date.parse(entry.lastUpdated ?? '')
+    const ts = Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed
+    if (best === undefined || ts > bestTs) {
+      best = entry
+      bestTs = ts
+    }
+  }
+  return best
 }
 
 /**
@@ -75,9 +117,9 @@ export function parseInstalledPlugins(raw: string): PluginSnapshot {
 
   const snapshot: PluginSnapshot = {}
   for (const [key, entries] of Object.entries(parsed.plugins)) {
-    const first = Array.isArray(entries) ? entries[0] : undefined
-    if (!first || typeof first.version !== 'string') continue
-    snapshot[key] = { version: first.version, sha: first.gitCommitSha ?? '' }
+    const chosen = Array.isArray(entries) ? pickNewestEntry(entries) : undefined
+    if (!chosen || typeof chosen.version !== 'string') continue
+    snapshot[key] = { version: chosen.version, sha: chosen.gitCommitSha ?? '' }
   }
   return snapshot
 }
@@ -143,15 +185,21 @@ export function clearRestartMarker(dir: string = RESTART_STATE_DIR): void {
  *
  * rename() is atomic on POSIX, so when telegram and discord boot concurrently
  * exactly one claim succeeds; the loser sees ENOENT and stays silent. The
- * claimed file is deleted after reading, so the notice can never repeat.
+ * claimed file is deleted after reading, so the notice can never repeat. A
+ * marker older than MARKER_TTL_MS is consumed but reported as null — a boot
+ * that long after the restart is not "coming back" from it.
  *
  * Args:
  *   dir: state directory override (tests). Defaults to RESTART_STATE_DIR.
+ *   nowMs: current time in ms (tests). Defaults to Date.now().
  * Returns:
  *   The marker, or null when there is no marker / it was already claimed /
- *   its contents are unreadable.
+ *   its contents are unreadable / it is older than MARKER_TTL_MS.
  */
-export function claimRestartMarker(dir: string = RESTART_STATE_DIR): RestartMarker | null {
+export function claimRestartMarker(
+  dir: string = RESTART_STATE_DIR,
+  nowMs: number = Date.now(),
+): RestartMarker | null {
   const marker = join(dir, 'restart-notice.json')
   const claimed = marker + '.claimed'
   if (!existsSync(marker)) return null
@@ -163,6 +211,7 @@ export function claimRestartMarker(dir: string = RESTART_STATE_DIR): RestartMark
   try {
     const parsed = JSON.parse(readFileSync(claimed, 'utf8')) as Partial<RestartMarker>
     if (typeof parsed.ts !== 'number') return null
+    if (nowMs - parsed.ts > MARKER_TTL_MS) return null // stale — consume silently
     return {
       ts: parsed.ts,
       reason: typeof parsed.reason === 'string' ? parsed.reason : '',

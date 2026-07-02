@@ -7,6 +7,7 @@ import {
   claimRestartMarker,
   clearRestartMarker,
   consumeStartupNotice,
+  MARKER_TTL_MS,
   parseInstalledPlugins,
   writeRestartMarker,
   type PluginSnapshot,
@@ -49,6 +50,34 @@ describe('parseInstalledPlugins', () => {
       },
     })
     expect(parseInstalledPlugins(raw)).toEqual({ good: { version: '1.0.0', sha: '' } })
+  })
+
+  test('multi-scope entries: picks the most recently updated install', () => {
+    const raw = JSON.stringify({
+      plugins: {
+        'multi@m': [
+          { version: '1.0.0', gitCommitSha: 'old', lastUpdated: '2026-01-01T00:00:00Z' },
+          { version: '2.0.0', gitCommitSha: 'new', lastUpdated: '2026-06-01T00:00:00Z' },
+        ],
+      },
+    })
+    expect(parseInstalledPlugins(raw)).toEqual({
+      'multi@m': { version: '2.0.0', sha: 'new' },
+    })
+  })
+
+  test('multi-scope entries without lastUpdated fall back to the first', () => {
+    const raw = JSON.stringify({
+      plugins: {
+        'multi@m': [
+          { version: '1.0.0', gitCommitSha: 'a' },
+          { version: '2.0.0', gitCommitSha: 'b' },
+        ],
+      },
+    })
+    expect(parseInstalledPlugins(raw)).toEqual({
+      'multi@m': { version: '1.0.0', sha: 'a' },
+    })
   })
 })
 
@@ -108,15 +137,15 @@ describe('restart marker lifecycle', () => {
     const dir = tempDir()
     const plugins: PluginSnapshot = { 'discord@m': { version: '0.0.7', sha: 'aaa' } }
     writeRestartMarker('manual /restart (test)', T0, plugins, dir)
-    const marker = claimRestartMarker(dir)
+    const marker = claimRestartMarker(dir, T0 + 1)
     expect(marker).toEqual({ ts: T0, reason: 'manual /restart (test)', plugins })
   })
 
   test('second claim loses the race (single notice guarantee)', () => {
     const dir = tempDir()
     writeRestartMarker('r', T0, {}, dir)
-    expect(claimRestartMarker(dir)).not.toBeNull()
-    expect(claimRestartMarker(dir)).toBeNull()
+    expect(claimRestartMarker(dir, T0 + 1)).not.toBeNull()
+    expect(claimRestartMarker(dir, T0 + 2)).toBeNull()
   })
 
   test('claim on a clean boot (no marker) returns null', () => {
@@ -127,7 +156,7 @@ describe('restart marker lifecycle', () => {
     const dir = tempDir()
     writeRestartMarker('r', T0, {}, dir)
     clearRestartMarker(dir)
-    expect(claimRestartMarker(dir)).toBeNull()
+    expect(claimRestartMarker(dir, T0 + 1)).toBeNull()
   })
 
   test('a corrupt marker is consumed silently (null, no repeat)', () => {
@@ -137,9 +166,24 @@ describe('restart marker lifecycle', () => {
     expect(claimRestartMarker(dir)).toBeNull()
   })
 
+  test('a marker just inside the TTL is still claimable', () => {
+    const dir = tempDir()
+    writeRestartMarker('r', T0, {}, dir)
+    expect(claimRestartMarker(dir, T0 + MARKER_TTL_MS)).not.toBeNull()
+  })
+
+  test('a marker past the TTL is consumed silently (stale restart)', () => {
+    const dir = tempDir()
+    writeRestartMarker('r', T0, {}, dir)
+    expect(claimRestartMarker(dir, T0 + MARKER_TTL_MS + 1)).toBeNull()
+    // Consumed, not left behind: a later claim finds nothing either.
+    expect(claimRestartMarker(dir, T0 + MARKER_TTL_MS + 2)).toBeNull()
+  })
+
   test('consumeStartupNotice builds the diffed notice from the marker', () => {
     const dir = tempDir()
-    writeRestartMarker('r', T0, { 'discord@m': { version: '0.0.7', sha: 'aaa' } }, dir)
+    // consumeStartupNotice claims with the real clock — write a fresh marker.
+    writeRestartMarker('r', Date.now(), { 'discord@m': { version: '0.0.7', sha: 'aaa' } }, dir)
     const notice = consumeStartupNotice(dir, { 'discord@m': { version: '0.0.8', sha: 'bbb' } })
     expect(notice).toContain('回來了')
     expect(notice).toContain('discord@m 0.0.7 -> 0.0.8')
