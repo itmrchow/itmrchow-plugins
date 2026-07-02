@@ -1086,22 +1086,26 @@ async function handleInbound(msg: Message): Promise<void> {
   // carried — no inline preview. The model calls get_message(chat_id, id) when
   // it actually needs the quoted text, so a large quoted message never bloats
   // every inbound notification and the full content is always available (not a
-  // 120-char slice). reply_to_user resolution is best-effort: a deleted or
-  // unreadable reference leaves just the ID.
+  // 120-char slice).
+  //
+  // The author comes from mentions.repliedUser, which discord.js populates from
+  // the referenced_message Discord embeds inline in the MESSAGE_CREATE gateway
+  // payload — so no REST round-trip on the inbound hot path (walkthrough B's
+  // whole point: don't pay a fetch per inbound; pay it only in get_message when
+  // the model actually wants the quoted text). repliedUser is null when the
+  // referenced message was deleted or wasn't embedded — the ID alone survives
+  // and the model can still call get_message.
   const replyMeta: Record<string, string> = {}
   const refId = msg.reference?.messageId
   if (refId) {
     replyMeta.reply_to_message_id = refId
-    try {
-      const ref = await msg.fetchReference()
+    const repliedUser = msg.mentions.repliedUser
+    if (repliedUser) {
       // sanitizeMetaText: webhook/app display names allow arbitrary chars
-      // (incl. `"`), unlike regular usernames — meta-attribute injection surface.
+      // (incl. `"` and newlines), unlike regular usernames — meta-attribute
+      // injection surface.
       replyMeta.reply_to_user =
-        ref.author.id === client.user?.id ? 'me' : sanitizeMetaText(ref.author.username)
-    } catch (err) {
-      // Best-effort by design (deleted message is normal) — but log so a
-      // persistent failure (missing history perms) leaves a diagnostic trail.
-      process.stderr.write(`discord: fetchReference for reply_to_user failed (msg=${msg.id}): ${err}\n`)
+        repliedUser.id === client.user?.id ? 'me' : sanitizeMetaText(repliedUser.username)
     }
   }
 
