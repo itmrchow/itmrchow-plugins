@@ -6,12 +6,14 @@
  *   - JP-37 watchdog — automatic, on detected session death.
  *
  * Two restart tiers (cheapest that works wins):
- *   - Tier 1 (process): kill the Claude process; the launcher's in-session
- *     `while true` loop relaunches it. No sudo, works on a frozen TUI (signal,
- *     not keystroke). Needs the launcher to write CLAUDE_PID_FILE.
+ *   - Tier 1 (process): resolve the Claude PID live from tmux (pane PID ->
+ *     walk the process tree for the `claude` descendant), SIGTERM it, and
+ *     escalate to SIGKILL if it survives the grace period; the launcher's
+ *     in-session `while true` loop relaunches it. No sudo, works on a frozen
+ *     TUI (signal, not keystroke), and no PID file to go stale.
  *   - Tier 2 (service): `sudo systemctl restart <SERVICE>`. Escalation when
- *     Tier 1 is unavailable or the session itself is wedged. Needs scoped
- *     NOPASSWD sudoers.
+ *     no Claude PID can be found or the process survives both signals. Needs
+ *     scoped NOPASSWD sudoers.
  *
  * Storm guard (auto only): cooldown + max-per-window, persisted so a watchdog
  * restart does not reset the counter. Manual `/restart` passes bypassThrottle
@@ -24,6 +26,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { TMUX_TARGET } from './busy-gate'
 
 const execFileAsync = promisify(execFile)
 
@@ -52,8 +55,24 @@ const RESTART_STATE_DIR =
 const STATE_FILE = join(RESTART_STATE_DIR, 'restart-state.json')
 const LOCK_FILE = join(RESTART_STATE_DIR, 'restart.lock')
 
-/** Path to the file holding the Claude PID, written by the launcher (Tier 1). */
-const CLAUDE_PID_FILE = process.env.CLAUDE_PID_FILE ?? join(RESTART_STATE_DIR, 'claude.pid')
+/** Grace period after SIGTERM before escalating to SIGKILL (Tier 1). */
+export const SIGTERM_GRACE_MS = 10_000
+
+/** Grace period after SIGKILL before declaring Tier 1 failed. SIGKILL cannot
+ * be ignored, so this only covers reaping latency / uninterruptible sleep. */
+export const SIGKILL_GRACE_MS = 2_000
+
+/** Poll interval while waiting for a signalled process to exit. */
+export const KILL_POLL_INTERVAL_MS = 250
+
+/** /proc comm name of the Claude CLI process we target with Tier 1. */
+const CLAUDE_COMM = 'claude'
+
+/** BFS depth cap when walking the pane's process tree for the claude PID. */
+const MAX_TREE_DEPTH = 10
+
+/** Hard cap on a single tmux/pgrep probe shell-out. */
+const PROBE_TIMEOUT_MS = 1000
 
 /** Which restart tier actually ran. */
 export type RestartTier = 'process' | 'service'
@@ -112,25 +131,131 @@ export type RestartResult =
   | { status: 'in-progress' }
   | { status: 'failed'; error: string }
 
+/** Signals Tier 1 may send, in escalation order. */
+export type KillSignal = 'SIGTERM' | 'SIGKILL'
+
 /** Injectable side effects (production defaults wire to fs/exec/clock). */
 export type RestartDeps = {
   now: () => number
-  killProcess: (pid: number) => void
+  killProcess: (pid: number, signal: KillSignal) => void
+  isAlive: (pid: number) => boolean
+  sleep: (ms: number) => Promise<void>
+  findClaudePid: () => Promise<number | null>
   systemctlRestart: () => Promise<void>
-  readPid: () => number | null
 }
 
 const defaultDeps: RestartDeps = {
   now: () => Date.now(),
-  killProcess: pid => process.kill(pid, 'SIGTERM'),
+  killProcess: (pid, signal) => process.kill(pid, signal),
+  isAlive: pid => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  },
+  sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  findClaudePid: () => findClaudePidViaTmux(),
   systemctlRestart: async () => {
     await execFileAsync('sudo', ['systemctl', 'restart', SERVICE], { timeout: 30_000 })
   },
-  readPid: () => {
-    if (!existsSync(CLAUDE_PID_FILE)) return null
-    const pid = Number(readFileSync(CLAUDE_PID_FILE, 'utf8').trim())
-    return Number.isInteger(pid) && pid > 0 ? pid : null
+}
+
+/** Injectable process-tree reads for the tmux PID resolution (testable). */
+export type ProcessTreeReader = {
+  getChildren: (pid: number) => Promise<number[]>
+  getCommand: (pid: number) => Promise<string | null>
+}
+
+const defaultTreeReader: ProcessTreeReader = {
+  getChildren: async pid => {
+    try {
+      const { stdout } = await execFileAsync('pgrep', ['-P', String(pid)], {
+        timeout: PROBE_TIMEOUT_MS,
+      })
+      return stdout
+        .split('\n')
+        .map(line => Number(line.trim()))
+        .filter(n => Number.isInteger(n) && n > 0)
+    } catch {
+      // pgrep exits non-zero when a process has no children — not an error.
+      return []
+    }
   },
+  getCommand: async pid => {
+    try {
+      return readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
+    } catch {
+      return null
+    }
+  },
+}
+
+/**
+ * Find the Claude CLI PID under a root process by walking the process tree.
+ *
+ * Breadth-first from rootPid, matching each descendant's comm name against
+ * CLAUDE_COMM, capped at MAX_TREE_DEPTH levels. BFS returns the claude process
+ * closest to the pane shell, which is the launcher-managed one we must signal.
+ *
+ * Args:
+ *   rootPid: PID to start the walk from (tmux pane PID in production).
+ *   tree: injectable process-tree reads.
+ * Returns:
+ *   The claude PID, or null when no descendant matches.
+ */
+export async function findClaudePidInTree(
+  rootPid: number,
+  tree: ProcessTreeReader = defaultTreeReader,
+): Promise<number | null> {
+  let frontier = [rootPid]
+  for (let depth = 0; depth < MAX_TREE_DEPTH && frontier.length > 0; depth++) {
+    const next: number[] = []
+    for (const pid of frontier) {
+      for (const child of await tree.getChildren(pid)) {
+        if ((await tree.getCommand(child)) === CLAUDE_COMM) return child
+        next.push(child)
+      }
+    }
+    frontier = next
+  }
+  return null
+}
+
+/**
+ * Resolve the Claude PID live from tmux: pane PID -> claude descendant.
+ *
+ * Replaces the former PID-file lookup — tmux is the source of truth for what
+ * is actually running in the agent session, so the PID can never go stale the
+ * way a launcher-written file can. Returns null (Tier 2 escalation) when the
+ * tmux target is gone, the pane PID is unparsable, or no claude descendant
+ * exists.
+ *
+ * Args:
+ *   target: tmux session:window to inspect. Defaults to TMUX_TARGET.
+ *   tree: injectable process-tree reads.
+ * Returns:
+ *   The claude PID, or null when it cannot be resolved.
+ */
+export async function findClaudePidViaTmux(
+  target: string = TMUX_TARGET,
+  tree: ProcessTreeReader = defaultTreeReader,
+): Promise<number | null> {
+  let panePid: number
+  try {
+    const { stdout } = await execFileAsync(
+      'tmux',
+      ['list-panes', '-t', target, '-F', '#{pane_pid}'],
+      { timeout: PROBE_TIMEOUT_MS },
+    )
+    panePid = Number(stdout.split('\n')[0]?.trim())
+  } catch (err) {
+    process.stderr.write(`restart-agent: tmux list-panes failed for ${target}: ${err}\n`)
+    return null
+  }
+  if (!Number.isInteger(panePid) || panePid <= 0) return null
+  return findClaudePidInTree(panePid, tree)
 }
 
 /**
@@ -179,9 +304,10 @@ export async function restartAgent(
 }
 
 /**
- * Run the cheapest restart tier that works: Tier 1 (process kill) when a PID is
- * available, else Tier 2 (systemctl). Falls through to Tier 2 if the kill
- * throws (e.g. stale PID).
+ * Run the cheapest restart tier that works: Tier 1 (signal the claude PID
+ * resolved live from tmux, SIGTERM then SIGKILL) when a PID is found, else
+ * Tier 2 (systemctl). Escalates to Tier 2 when no PID resolves or the process
+ * survives both signals.
  *
  * Args:
  *   deps: injectable side effects.
@@ -189,17 +315,58 @@ export async function restartAgent(
  *   The tier that ran. Throws only if Tier 2 itself fails.
  */
 export async function performRestart(deps: RestartDeps = defaultDeps): Promise<RestartTier> {
-  const pid = deps.readPid()
+  const pid = await deps.findClaudePid()
   if (pid !== null) {
-    try {
-      deps.killProcess(pid)
-      return 'process'
-    } catch (err) {
-      process.stderr.write(`restart-agent: Tier 1 kill(${pid}) failed, escalating: ${err}\n`)
-    }
+    if (await terminateWithEscalation(pid, deps)) return 'process'
+    process.stderr.write(
+      `restart-agent: Tier 1 pid ${pid} survived SIGTERM+SIGKILL, escalating to Tier 2\n`,
+    )
   }
   await deps.systemctlRestart()
   return 'service'
+}
+
+/**
+ * Terminate a process with SIGTERM -> SIGKILL escalation.
+ *
+ * Sends SIGTERM and polls liveness for up to SIGTERM_GRACE_MS; if the process
+ * survives, sends SIGKILL and polls for up to SIGKILL_GRACE_MS. A kill() that
+ * throws (e.g. ESRCH after the process exited on its own) resolves to the
+ * current liveness rather than an error.
+ *
+ * Args:
+ *   pid: process to terminate.
+ *   deps: injectable side effects (clock, signals, liveness, sleep).
+ * Returns:
+ *   True when the process is gone, false when it survived both signals.
+ */
+export async function terminateWithEscalation(pid: number, deps: RestartDeps): Promise<boolean> {
+  if (!sendSignal(pid, 'SIGTERM', deps)) return !deps.isAlive(pid)
+  if (await waitForExit(pid, SIGTERM_GRACE_MS, deps)) return true
+  process.stderr.write(`restart-agent: pid ${pid} survived SIGTERM, sending SIGKILL\n`)
+  if (!sendSignal(pid, 'SIGKILL', deps)) return !deps.isAlive(pid)
+  return waitForExit(pid, SIGKILL_GRACE_MS, deps)
+}
+
+/** Send a signal; false when kill() threw (process may already be gone). */
+function sendSignal(pid: number, signal: KillSignal, deps: RestartDeps): boolean {
+  try {
+    deps.killProcess(pid, signal)
+    return true
+  } catch (err) {
+    process.stderr.write(`restart-agent: kill(${pid}, ${signal}) threw: ${err}\n`)
+    return false
+  }
+}
+
+/** Poll liveness until the process exits or graceMs elapses. True = exited. */
+async function waitForExit(pid: number, graceMs: number, deps: RestartDeps): Promise<boolean> {
+  const deadline = deps.now() + graceMs
+  while (deps.now() < deadline) {
+    if (!deps.isAlive(pid)) return true
+    await deps.sleep(KILL_POLL_INTERVAL_MS)
+  }
+  return !deps.isAlive(pid)
 }
 
 /** Load persisted restart state; missing/corrupt file -> empty history. */
