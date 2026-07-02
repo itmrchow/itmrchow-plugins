@@ -45,7 +45,8 @@ import {
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { parseInjectBody, type ChannelDelivery } from './inject'
-import { formatReplyPreview, sanitizeMetaText } from './reply-preview'
+import { sanitizeMetaText } from './meta-text'
+import { formatMessageDetail, formatMessageUnavailable, type MessageDetail } from './get-message'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -472,7 +473,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. If the sender quote-replied to an earlier message, the tag carries reply_to_message_id (the referenced message\'s ID), reply_to_user (its author, "me" = this bot), and reply_to_preview (first 120 chars, newlines flattened) — use these to resolve what "this"/"that" refers to before fetching history. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. If the sender quote-replied to an earlier message, the tag carries reply_to_message_id (the referenced message\'s ID) and reply_to_user (its author, "me" = this bot) — no inline preview. To read the quoted message\'s full text, call get_message(chat_id, reply_to_message_id); use it to resolve what "this"/"that" refers to before fetching wider history. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -655,6 +656,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'get_message',
+      description:
+        "Fetch one message by its ID and return its full content (author, ISO timestamp, complete text, and any attachments' name/type/size). Use this to read the message an inbound quote-reply points at — pass chat_id and reply_to_message_id. Returns a clear error (not a crash) when the message is deleted, missing, or unreadable.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
+    {
       name: 'fetch_messages',
       description:
         "Fetch recent messages from a Discord channel. Returns oldest-first with message IDs; quote-replies carry reply_to: <id> of the referenced message. Discord's search API isn't exposed to bots, so this is the only way to look back.",
@@ -782,6 +796,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         return {
           content: [{ type: 'text', text: `downloaded ${lines.length} attachment(s):\n${lines.join('\n')}` }],
+        }
+      }
+      case 'get_message': {
+        const ch = await fetchAllowedChannel(args.chat_id as string)
+        const message_id = args.message_id as string
+        try {
+          const msg = await ch.messages.fetch(message_id)
+          const detail: MessageDetail = {
+            author: msg.author.id === client.user?.id ? 'me' : msg.author.username,
+            timestamp: msg.createdAt.toISOString(),
+            content: msg.content,
+            attachments: [...msg.attachments.values()].map(att => ({
+              // safeAttName: uploader-controlled name lands in a newline-joined
+              // tool result — strip delimiter chars that could forge rows.
+              name: safeAttName(att),
+              contentType: att.contentType ?? 'unknown',
+              sizeBytes: att.size,
+            })),
+          }
+          return { content: [{ type: 'text', text: formatMessageDetail(detail) }] }
+        } catch (err) {
+          // Deleted / never-existed / unreadable — surface a clear, non-fatal
+          // result so the model can carry on instead of the whole call erroring.
+          const reason = err instanceof Error ? err.message : String(err)
+          return { content: [{ type: 'text', text: formatMessageUnavailable(message_id, reason) }] }
         }
       }
       default:
@@ -1043,9 +1082,12 @@ async function handleInbound(msg: Message): Promise<void> {
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
   // Quote-reply reference goes in meta for the same reason: forgeable in-content,
-  // trustworthy as a structured attribute. Preview is best-effort — the
-  // referenced message may be deleted or unreadable, in which case only the
-  // ID survives.
+  // trustworthy as a structured attribute. Only the referenced ID + author are
+  // carried — no inline preview. The model calls get_message(chat_id, id) when
+  // it actually needs the quoted text, so a large quoted message never bloats
+  // every inbound notification and the full content is always available (not a
+  // 120-char slice). reply_to_user resolution is best-effort: a deleted or
+  // unreadable reference leaves just the ID.
   const replyMeta: Record<string, string> = {}
   const refId = msg.reference?.messageId
   if (refId) {
@@ -1053,16 +1095,13 @@ async function handleInbound(msg: Message): Promise<void> {
     try {
       const ref = await msg.fetchReference()
       // sanitizeMetaText: webhook/app display names allow arbitrary chars
-      // (incl. `"`), unlike regular usernames — same meta-attribute injection
-      // surface as the preview.
+      // (incl. `"`), unlike regular usernames — meta-attribute injection surface.
       replyMeta.reply_to_user =
         ref.author.id === client.user?.id ? 'me' : sanitizeMetaText(ref.author.username)
-      const preview = formatReplyPreview(ref.content)
-      if (preview) replyMeta.reply_to_preview = preview
     } catch (err) {
       // Best-effort by design (deleted message is normal) — but log so a
       // persistent failure (missing history perms) leaves a diagnostic trail.
-      process.stderr.write(`discord: fetchReference for reply preview failed (msg=${msg.id}): ${err}\n`)
+      process.stderr.write(`discord: fetchReference for reply_to_user failed (msg=${msg.id}): ${err}\n`)
     }
   }
 
