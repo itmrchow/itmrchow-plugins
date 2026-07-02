@@ -140,6 +140,7 @@ export type RestartDeps = {
   now: () => number
   killProcess: (pid: number, signal: KillSignal) => void
   isAlive: (pid: number) => boolean
+  readComm: (pid: number) => string | null
   sleep: (ms: number) => Promise<void>
   findClaudePid: () => Promise<number | null>
   systemctlRestart: () => Promise<void>
@@ -154,6 +155,13 @@ const defaultDeps: RestartDeps = {
       return true
     } catch {
       return false
+    }
+  },
+  readComm: pid => {
+    try {
+      return readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
+    } catch {
+      return null
     }
   },
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
@@ -223,13 +231,32 @@ export async function findClaudePidInTree(
 }
 
 /**
- * Resolve the Claude PID live from tmux: pane PID -> claude descendant.
+ * Parse `tmux list-panes -F '#{pane_pid}'` output into pane PIDs.
+ *
+ * Pure (no IO) so the multi-pane handling is unit-testable. Blank and
+ * non-numeric lines are dropped.
+ *
+ * Args:
+ *   stdout: raw list-panes output, one pane PID per line.
+ * Returns:
+ *   All valid pane PIDs, in pane order.
+ */
+export function parsePanePids(stdout: string): number[] {
+  return stdout
+    .split('\n')
+    .map(line => Number(line.trim()))
+    .filter(n => Number.isInteger(n) && n > 0)
+}
+
+/**
+ * Resolve the Claude PID live from tmux: pane PIDs -> claude descendant.
  *
  * Replaces the former PID-file lookup — tmux is the source of truth for what
  * is actually running in the agent session, so the PID can never go stale the
- * way a launcher-written file can. Returns null (Tier 2 escalation) when the
- * tmux target is gone, the pane PID is unparsable, or no claude descendant
- * exists.
+ * way a launcher-written file can. Every pane of the target window is probed
+ * in order (a split window must not hide claude behind pane 0); the first
+ * claude descendant wins. Returns null (Tier 2 escalation) when the tmux
+ * target is gone, no pane PID is parsable, or no claude descendant exists.
  *
  * Args:
  *   target: tmux session:window to inspect. Defaults to TMUX_TARGET.
@@ -241,20 +268,23 @@ export async function findClaudePidViaTmux(
   target: string = TMUX_TARGET,
   tree: ProcessTreeReader = defaultTreeReader,
 ): Promise<number | null> {
-  let panePid: number
+  let panePids: number[]
   try {
     const { stdout } = await execFileAsync(
       'tmux',
       ['list-panes', '-t', target, '-F', '#{pane_pid}'],
       { timeout: PROBE_TIMEOUT_MS },
     )
-    panePid = Number(stdout.split('\n')[0]?.trim())
+    panePids = parsePanePids(stdout)
   } catch (err) {
     process.stderr.write(`restart-agent: tmux list-panes failed for ${target}: ${err}\n`)
     return null
   }
-  if (!Number.isInteger(panePid) || panePid <= 0) return null
-  return findClaudePidInTree(panePid, tree)
+  for (const panePid of panePids) {
+    const pid = await findClaudePidInTree(panePid, tree)
+    if (pid !== null) return pid
+  }
+  return null
 }
 
 /**
@@ -347,6 +377,12 @@ export async function performRestart(deps: RestartDeps = defaultDeps): Promise<R
 export async function terminateWithEscalation(pid: number, deps: RestartDeps): Promise<boolean> {
   if (!sendSignal(pid, 'SIGTERM', deps)) return !deps.isAlive(pid)
   if (await waitForExit(pid, SIGTERM_GRACE_MS, deps)) return true
+  // PID-reuse guard: SIGTERM_GRACE_MS is long enough for the target to exit
+  // AND the kernel to hand its PID to an unrelated process — isAlive alone
+  // would then report "survived" and the SIGKILL below would hit an innocent
+  // victim. Re-verify the PID still names a claude process before escalating;
+  // a mismatch (or a vanished /proc entry) means our target is already gone.
+  if (deps.readComm(pid) !== CLAUDE_COMM) return true
   process.stderr.write(`restart-agent: pid ${pid} survived SIGTERM, sending SIGKILL\n`)
   if (!sendSignal(pid, 'SIGKILL', deps)) return !deps.isAlive(pid)
   return waitForExit(pid, SIGKILL_GRACE_MS, deps)

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   decideRestart,
   findClaudePidInTree,
+  parsePanePids,
   performRestart,
   RESTART_COOLDOWN_MS,
   RESTART_MAX_PER_WINDOW,
@@ -76,6 +77,7 @@ function fakeDeps(overrides: Partial<RestartDeps>): RestartDeps {
     now: () => clock,
     killProcess: () => {},
     isAlive: () => false,
+    readComm: () => 'claude',
     sleep: async ms => {
       clock += ms
     },
@@ -183,6 +185,52 @@ describe('terminateWithEscalation (SIGTERM -> SIGKILL)', () => {
       }),
     )
     expect(ok).toBe(true)
+  })
+
+  test('does not SIGKILL a reused PID (comm no longer claude)', async () => {
+    const signals: string[] = []
+    const ok = await terminateWithEscalation(
+      4242,
+      fakeDeps({
+        killProcess: (_pid, signal) => {
+          signals.push(signal)
+        },
+        isAlive: () => true, // PID looks alive — but it is a different process now
+        readComm: () => 'python3',
+      }),
+    )
+    expect(ok).toBe(true)
+    expect(signals).toEqual(['SIGTERM'])
+  })
+
+  test('does not SIGKILL when /proc/<pid>/comm vanished (target exited)', async () => {
+    const signals: string[] = []
+    const ok = await terminateWithEscalation(
+      4242,
+      fakeDeps({
+        killProcess: (_pid, signal) => {
+          signals.push(signal)
+        },
+        isAlive: () => true,
+        readComm: () => null,
+      }),
+    )
+    expect(ok).toBe(true)
+    expect(signals).toEqual(['SIGTERM'])
+  })
+})
+
+describe('parsePanePids (multi-pane list-panes output)', () => {
+  test('parses one PID per line, in pane order', () => {
+    expect(parsePanePids('100\n200\n300\n')).toEqual([100, 200, 300])
+  })
+
+  test('drops blank and non-numeric lines', () => {
+    expect(parsePanePids('100\n\nnot-a-pid\n-5\n0\n200\n')).toEqual([100, 200])
+  })
+
+  test('returns empty on empty output', () => {
+    expect(parsePanePids('')).toEqual([])
   })
 })
 
