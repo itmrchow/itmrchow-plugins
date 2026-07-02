@@ -115,7 +115,7 @@ whose attributes carry structured metadata:
 | `attachment_count` / `attachments` | Present when the message has attachments — name/type/size list. |
 | `reply_to_message_id` | Present when the sender quote-replied — ID of the referenced message. |
 | `reply_to_user` | Author of the referenced message (`me` = the bot itself). Omitted when the referenced message can't be fetched (e.g. deleted). |
-| `reply_to_preview` | First 120 chars of the referenced message, newlines flattened, `…` appended when truncated. Omitted when unfetchable or empty. |
+| `reply_to_preview` | First 120 characters (code points) of the referenced message — newlines flattened, `"`/`<`/`>` replaced with look-alikes, `…` appended when truncated. Omitted when unfetchable or empty. |
 
 The reply reference lives in metadata (not message text) so the assistant can
 resolve "this" / "that" in a quote-reply without an extra `fetch_messages`

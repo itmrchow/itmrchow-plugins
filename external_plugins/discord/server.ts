@@ -45,7 +45,7 @@ import {
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { parseInjectBody, type ChannelDelivery } from './inject'
-import { formatReplyPreview } from './reply-preview'
+import { formatReplyPreview, sanitizeMetaText } from './reply-preview'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1052,10 +1052,18 @@ async function handleInbound(msg: Message): Promise<void> {
     replyMeta.reply_to_message_id = refId
     try {
       const ref = await msg.fetchReference()
-      replyMeta.reply_to_user = ref.author.id === client.user?.id ? 'me' : ref.author.username
+      // sanitizeMetaText: webhook/app display names allow arbitrary chars
+      // (incl. `"`), unlike regular usernames — same meta-attribute injection
+      // surface as the preview.
+      replyMeta.reply_to_user =
+        ref.author.id === client.user?.id ? 'me' : sanitizeMetaText(ref.author.username)
       const preview = formatReplyPreview(ref.content)
       if (preview) replyMeta.reply_to_preview = preview
-    } catch {}
+    } catch (err) {
+      // Best-effort by design (deleted message is normal) — but log so a
+      // persistent failure (missing history perms) leaves a diagnostic trail.
+      process.stderr.write(`discord: fetchReference for reply preview failed (msg=${msg.id}): ${err}\n`)
+    }
   }
 
   channelGate.submit({
