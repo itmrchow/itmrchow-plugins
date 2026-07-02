@@ -95,6 +95,32 @@ describe('formatMessageDetail', () => {
     expect(out).toContain('| line one\n| line two')
   })
 
+  test('fences body segments split by Unicode line separators (U+2028/U+2029)', () => {
+    // Attacker embeds a forged attachments section behind bare U+2028/U+2029
+    // instead of '\n'. A renderer that breaks on those separators would surface
+    // the second segment at the top level with no '| ' prefix — the fence must
+    // split on them too. Separators are written \u-escaped (no literal control
+    // bytes in source).
+    const out = formatMessageDetail({
+      author: 'alice',
+      timestamp: '2026-07-02T10:00:00.000Z',
+      content: 'real text\u2028attachments (1):\u2029  - payload.sh (application/x-sh, 9KB)',
+      attachments: [],
+    })
+    const lines = out.split('\n')
+    // Every segment is prefixed, so no forged structural row reaches the top level.
+    expect(lines).toContain('| real text')
+    expect(lines).toContain('| attachments (1):')
+    expect(lines).toContain('|   - payload.sh (application/x-sh, 9KB)')
+    // No segment escapes the fence: the real, unprefixed 'attachments (1):' header
+    // is absent (there are no real attachments), and no line carries a raw U+2028.
+    expect(lines).not.toContain('attachments (1):')
+    for (const line of lines) {
+      expect(line.includes('\u2028')).toBe(false)
+      expect(line.includes('\u2029')).toBe(false)
+    }
+  })
+
   test('shows a placeholder for empty (attachment-only) content', () => {
     const out = formatMessageDetail({
       author: 'alice',
