@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { formatMessageDetail, formatMessageUnavailable } from './get-message'
+import { formatMessageDetail, formatMessageUnavailable, validateMessageId } from './get-message'
 
 describe('formatMessageDetail', () => {
   test('renders author, timestamp, and per-line-fenced content for a plain message', () => {
@@ -118,6 +118,30 @@ describe('formatMessageDetail', () => {
     expect(out).toContain('attachments (2):')
     expect(out).toContain('  - chart.png (image/png, 2KB)')
     expect(out).toContain('  - log.txt (text/plain, 1KB)')
+  })
+})
+
+describe('validateMessageId', () => {
+  test('accepts a numeric snowflake id', () => {
+    expect(validateMessageId('123456789012345678')).toBeNull()
+  })
+
+  test('rejects a missing (undefined) id so fetch() cannot batch-fetch history', () => {
+    expect(validateMessageId(undefined)).toBe('message_id is required and must be a non-empty string')
+  })
+
+  test('rejects an empty string id', () => {
+    expect(validateMessageId('')).toBe('message_id is required and must be a non-empty string')
+  })
+
+  test('rejects a non-string id', () => {
+    expect(validateMessageId(12345)).toBe('message_id is required and must be a non-empty string')
+  })
+
+  test('rejects a non-numeric id', () => {
+    expect(validateMessageId('not-a-snowflake')).toBe(
+      'message_id must be a numeric Discord snowflake id, got: not-a-snowflake',
+    )
   })
 })
 

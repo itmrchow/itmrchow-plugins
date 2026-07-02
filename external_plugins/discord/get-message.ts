@@ -33,6 +33,37 @@ export interface MessageDetail {
 
 const BYTES_PER_KB = 1024
 
+// Discord message ids are snowflakes — decimal-digit strings. A shape check is
+// enough to reject empty / non-numeric input before it reaches the gateway;
+// crucially it stops an undefined/empty id from degrading ch.messages.fetch()
+// into a batch fetch of ~50 recent messages (fetch() with no argument lists a
+// page instead of erroring).
+const SNOWFLAKE_PATTERN = /^\d+$/
+
+/**
+ * Validate a raw get_message `message_id` argument before any gateway call.
+ *
+ * Guards against a missing, empty, or non-numeric id. Without this, passing
+ * `undefined` to discord.js `messages.fetch()` silently lists a batch of recent
+ * messages instead of fetching the one requested — leaking unrelated history and
+ * masking the caller's mistake.
+ *
+ * Args:
+ *   messageId: the raw argument value (untyped at the MCP boundary).
+ * Returns:
+ *   `null` when the id is a valid snowflake string, otherwise a human-readable
+ *   error message describing why it was rejected.
+ */
+export function validateMessageId(messageId: unknown): string | null {
+  if (typeof messageId !== 'string' || messageId.length === 0) {
+    return 'message_id is required and must be a non-empty string'
+  }
+  if (!SNOWFLAKE_PATTERN.test(messageId)) {
+    return `message_id must be a numeric Discord snowflake id, got: ${messageId}`
+  }
+  return null
+}
+
 // Control chars (incl. CR/LF/tab), Unicode line separators (U+2028/U+2029), and
 // C1 controls (U+0080-U+009F) in a webhook display name would forge extra rows
 // in this newline-joined block (e.g. a fake `attachments (9):` line). The author

@@ -46,7 +46,7 @@ import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { parseInjectBody, type ChannelDelivery } from './inject'
 import { sanitizeMetaText } from './meta-text'
-import { formatMessageDetail, formatMessageUnavailable, type MessageDetail } from './get-message'
+import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -799,8 +799,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
       case 'get_message': {
-        const ch = await fetchAllowedChannel(args.chat_id as string)
+        // Guard the id first: an empty/undefined message_id would degrade
+        // ch.messages.fetch() into a batch fetch of recent history instead of
+        // erroring. Fail fast before any gateway round-trip.
+        const idError = validateMessageId(args.message_id)
+        if (idError) {
+          return { content: [{ type: 'text', text: idError }], isError: true }
+        }
         const message_id = args.message_id as string
+        const ch = await fetchAllowedChannel(args.chat_id as string)
         try {
           const msg = await ch.messages.fetch(message_id)
           const detail: MessageDetail = {
