@@ -100,6 +100,9 @@ async function main() {
         { command: 'start', description: 'Welcome and setup guide' },
         { command: 'help', description: 'What this bot can do' },
         { command: 'status', description: 'Check your pairing status' },
+        { command: 'ctx', description: 'Show context usage' },
+        { command: 'clear', description: 'Clear the agent context' },
+        { command: 'restart', description: 'Restart the agent' },
       ],
       { scope: { type: 'all_private_chats' } },
     )

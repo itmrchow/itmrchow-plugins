@@ -103,6 +103,33 @@ export async function capturePaneBusy(target: string = TMUX_TARGET): Promise<boo
 }
 
 /**
+ * Capture the configured tmux pane and return its text.
+ *
+ * Same capture path as capturePaneBusy, but returns the raw pane text instead
+ * of a busy boolean — used by the control plane (/ctx) to parse the context
+ * gauge from the footer. Returns null on any capture failure (distinct from an
+ * empty-but-successful capture '') so the caller can report "could not read the
+ * pane" rather than a misleading empty parse.
+ *
+ * Args:
+ *   target: tmux session:window to inspect. Defaults to TMUX_TARGET.
+ * Returns:
+ *   Promise resolving to the pane text, or null on capture failure.
+ */
+export async function capturePaneText(target: string = TMUX_TARGET): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('tmux', ['capture-pane', '-p', '-t', target], {
+      encoding: 'utf8',
+      timeout: CAPTURE_TIMEOUT_MS,
+    })
+    return stdout
+  } catch (err) {
+    process.stderr.write(`telegram busy-gate: capture-pane (text) failed: ${err}\n`)
+    return null
+  }
+}
+
+/**
  * Dependencies a BusyGate needs, injected for testability.
  *
  * isBusy: busy probe (production: capturePaneBusy). May be sync or async;

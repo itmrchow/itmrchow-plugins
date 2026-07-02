@@ -35,6 +35,15 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { BusyGate, capturePaneBusy } from './busy-gate'
+import {
+  decideClear,
+  getContextPercent,
+  parseControlCommand,
+  sendClear,
+  type ControlCommand,
+} from './control-plane'
+import { restartAgent } from './restart-agent'
+import { consumeStartupNotice } from './startup-notice'
 import { parseInjectBody, type ChannelDelivery } from './inject'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -802,6 +811,21 @@ process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+process.on('SIGHUP', shutdown)
+
+// Orphan watchdog (parity with telegram/server.ts): stdin events above don't
+// reliably fire when the parent chain (`bun run` wrapper → shell → us) is
+// severed by a crash. Poll for reparenting (POSIX) or a dead stdin pipe and
+// self-terminate — a JP-38 Tier 1 restart kills the Claude parent, and a
+// surviving zombie here would hold the gateway connection and stale state.
+const bootPpid = process.ppid
+setInterval(() => {
+  const orphaned =
+    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+    process.stdin.destroyed ||
+    process.stdin.readableEnded
+  if (orphaned) shutdown()
+}, 5000).unref()
 
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
@@ -873,6 +897,68 @@ client.on('messageCreate', msg => {
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
+// --- JP-38 bot-layer control plane (survives agent death) ---------------------
+// Per-sender last /clear warning, for the busy-confirm gate.
+const clearWarnedAt = new Map<string, number>()
+
+/**
+ * Run a bot-layer control command and reply on the same message.
+ *
+ * Caller has already gated to a paired owner in a DM. /restart replies BEFORE
+ * acting because the restart kills this process — the freshly started agent
+ * announces it is back up separately.
+ *
+ * Args:
+ *   cmd: the parsed control command.
+ *   msg: the inbound discord message to reply on.
+ * Returns:
+ *   Promise that resolves once the command has run and a reply was attempted.
+ */
+async function handleControlCommand(cmd: ControlCommand, msg: Message): Promise<void> {
+  const senderId = msg.author.id
+
+  if (cmd === 'ctx') {
+    const { pct, raw } = await getContextPercent()
+    await msg.reply(
+      pct === null
+        ? raw
+          ? `Context: 無法解析百分比，footer 片段：\n${raw}`
+          : 'Context: 讀取 pane 失敗（capture 無回應）。'
+        : `Context: ${pct}% used (≈ ${100 - pct}% left)`,
+    )
+    return
+  }
+
+  if (cmd === 'clear') {
+    const busy = await capturePaneBusy()
+    const decision = decideClear(busy, clearWarnedAt.get(senderId) ?? null, Date.now())
+    if (decision === 'warn') {
+      clearWarnedAt.set(senderId, Date.now())
+      await msg.reply(
+        'agent 忙碌中，/clear 會打斷當前任務並清空 context。確認請在 30 秒內再送一次 /clear。',
+      )
+      return
+    }
+    clearWarnedAt.delete(senderId)
+    try {
+      await sendClear()
+      await msg.reply('已送出 /clear。')
+    } catch (err) {
+      await msg.reply(`/clear 投遞失敗：${err}`)
+    }
+    return
+  }
+
+  // restart
+  await msg.reply('重啟中…')
+  const result = await restartAgent('manual /restart (discord)', { bypassThrottle: true })
+  if (result.status === 'in-progress') {
+    await msg.reply('已有重啟進行中，請稍候。')
+  } else if (result.status === 'failed') {
+    await msg.reply(`重啟失敗：${result.error}`)
+  }
+}
+
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
 
@@ -914,6 +1000,19 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
+  // Control-command intercept (JP-38): /ctx /clear /restart operate the agent
+  // directly via tmux/systemctl. DM + paired owner only; bypasses the chat path.
+  // discord has no native command router, so we prefix-match here.
+  const control = parseControlCommand(msg.content)
+  if (
+    control &&
+    msg.channel.type === ChannelType.DM &&
+    result.access.allowFrom.includes(msg.author.id)
+  ) {
+    await handleControlCommand(control, msg)
+    return
+  }
+
   // Typing indicator — signals "processing" until we reply (or ~10s elapses).
   if ('sendTyping' in msg.channel) {
     void msg.channel.sendTyping().catch(() => {})
@@ -951,8 +1050,38 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
+/**
+ * Announce "the agent is back" after a bot-initiated restart (JP-38).
+ *
+ * Runs once when the gateway is ready. Claims the shared restart marker
+ * (atomic — a boot race with the telegram server yields exactly one notice)
+ * and DMs the paired owner(s) the plugin versions now loaded, flagging
+ * changes across the restart. Silent on a clean boot (no marker) or when
+ * nobody is paired.
+ *
+ * Returns:
+ *   None.
+ */
+function announceStartup(): void {
+  const access = loadAccess()
+  if (access.allowFrom.length === 0) return
+  const notice = consumeStartupNotice()
+  if (notice === null) return
+  for (const userId of access.allowFrom) {
+    void (async () => {
+      try {
+        const user = await client.users.fetch(userId)
+        await user.send(notice)
+      } catch (err) {
+        process.stderr.write(`discord channel: startup notice to ${userId} failed: ${err}\n`)
+      }
+    })()
+  }
+}
+
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  announceStartup()
 })
 
 client.login(TOKEN).catch(err => {
