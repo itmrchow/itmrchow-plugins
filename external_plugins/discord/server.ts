@@ -810,6 +810,21 @@ process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+process.on('SIGHUP', shutdown)
+
+// Orphan watchdog (parity with telegram/server.ts): stdin events above don't
+// reliably fire when the parent chain (`bun run` wrapper → shell → us) is
+// severed by a crash. Poll for reparenting (POSIX) or a dead stdin pipe and
+// self-terminate — a JP-38 Tier 1 restart kills the Claude parent, and a
+// surviving zombie here would hold the gateway connection and stale state.
+const bootPpid = process.ppid
+setInterval(() => {
+  const orphaned =
+    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+    process.stdin.destroyed ||
+    process.stdin.readableEnded
+  if (orphaned) shutdown()
+}, 5000).unref()
 
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
