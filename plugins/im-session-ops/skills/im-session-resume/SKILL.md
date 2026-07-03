@@ -76,3 +76,4 @@ EOF
 - 若列表為空，回覆「找不到任何 session，請確認 workspace 路徑正確」
 - 用戶回覆超出範圍的數字，回覆「編號無效，請重新選擇」
 - 切換後 restart loop 需幾秒重啟，屬正常現象
+- `IM_SESSION_INTENT_FILE` / `IM_AGENT_TMUX_SESSION` 的預設值為 load-bearing（描述性說法：預設值本身就是正確行為的一部分，不能亂改）：agent 的 restart loop（`start-tg-agent.sh`）目前仍硬編對應值、尚未讀這兩個 env。單獨覆寫此 env 會與 loop 端失步（intent file 寫到 loop 讀不到的路徑 -> resume 失聯；tmux target 打錯 -> send-keys 送到別的 session）。loop 端接線待 JP-96 rename 時一併處理；目前請維持預設、不要覆寫。
