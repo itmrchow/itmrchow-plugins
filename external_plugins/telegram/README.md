@@ -26,7 +26,7 @@ These are Claude Code commands — run `claude` to start a session first.
 
 Install the plugin:
 ```
-/plugin install telegram@claude-plugins-official
+/plugin install telegram@itmrchow-plugins
 /reload-plugins
 ```
 
@@ -45,7 +45,7 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env` (this path
 The server won't connect without this — exit your session and start a new one:
 
 ```sh
-claude --channels plugin:telegram@claude-plugins-official
+claude --channels plugin:telegram@itmrchow-plugins
 ```
 
 **5. Pair.**
@@ -69,6 +69,18 @@ Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers
 See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, delivery config, skill commands, and the `access.json` schema.
 
 Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](https://t.me/userinfobot)). Default policy is `pairing`. `ackReaction` only accepts Telegram's fixed emoji whitelist.
+
+## Fork additions
+
+This fork extends the upstream plugin with operational features for running the bot as an always-on agent (e.g. inside a tmux session on a VM):
+
+- **`/inject` HTTP endpoint** — `POST /inject` on `127.0.0.1:7842` (override with `INJECT_PORT`) delivers text from schedulers or other local processes into the session as a synthetic channel message. Body: `{"text": "...", "chat_id": "..."}`. Bound to loopback only.
+- **External poller mode** — `poller.ts` runs Telegram long-polling as a standalone process and forwards raw updates to `POST /update` on the same port. Needed on aarch64 hosts, where the in-process long-poll loop starves under the MCP stdio watcher; on x86 the built-in poll works as-is.
+- **Bot-layer control commands** — `/ctx` (context usage), `/clear` (clear context), `/restart` (restart the agent). The bot process drives these directly via tmux, so they keep working even when the agent is wedged or dead. Restricted to paired owners.
+- **Startup notice** — after a restart, the bot messages the paired owner(s) that the agent is back, listing loaded plugin versions and flagging any that changed across the restart. Claimed atomically, so multi-channel setups send exactly one notice.
+- **Busy-gate delivery** — inbound and scheduler messages are queued and flushed one at a time, only when the agent's pane is idle. Prevents mid-turn deliveries from orphaning unsubmitted in the input box.
+- **Read receipt** — inbound messages get an emoji reaction (default 👀) as a "seen" ack. Configure via `ackReaction` in `access.json` (see [ACCESS.md](./ACCESS.md)); only Telegram's fixed emoji whitelist is accepted.
+- **Orphan watchdog** — the server exits when its parent agent process dies (plus SIGHUP handling), so no stale bot process lingers holding the token.
 
 ## Tools exposed to the assistant
 
