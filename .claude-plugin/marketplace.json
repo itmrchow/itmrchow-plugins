@@ -1825,6 +1825,12 @@
       "homepage": "https://servicenow.github.io/sdk/"
     },
     {
+      "name": "im-session-ops",
+      "description": "IM session 維運指令：clear / rename / resume 三個 skill 加 im-send 發訊器，多 channel（Telegram / Discord）多 agent 共用。",
+      "source": "./plugins/im-session-ops",
+      "category": "productivity"
+    },
+    {
       "name": "session-report",
       "description": "Generate an explorable HTML report of Claude Code session usage — tokens, cache efficiency, subagents, skills, and the most expensive prompts — from local ~/.claude/projects transcripts.",
       "author": {
