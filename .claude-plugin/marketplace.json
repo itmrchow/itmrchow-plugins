@@ -1827,8 +1827,13 @@
     {
       "name": "im-session-ops",
       "description": "IM session 維運指令：clear / rename / resume 三個 skill 加 im-send 發訊器，多 channel（Telegram / Discord）多 agent 共用。",
+      "author": {
+        "name": "itmrchow",
+        "email": "itmrchow@gmail.com"
+      },
       "source": "./plugins/im-session-ops",
-      "category": "productivity"
+      "category": "productivity",
+      "homepage": "https://github.com/itmrchow/itmrchow-plugins/tree/main/plugins/im-session-ops"
     },
     {
       "name": "session-report",
