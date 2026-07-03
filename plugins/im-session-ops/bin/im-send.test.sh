@@ -44,9 +44,23 @@ check "discord auth header mode"      '[[ "$(echo "$out" | field auth)" == "head
 out="$(TELEGRAM_BOT_TOKEN=tg-test IM_SEND_DRY_RUN=1 "$SEND" telegram 12345 '中文 test')"
 check "telegram non-ascii text field" '[[ "$(echo "$out" | field body.text)" == "中文 test" ]]'
 
+# --- JSON special-char escape round-trip (quotes, backslash, newline survive json.dumps + parse) ---
+# Core risk axis: json_obj (os.environ + json.dumps) must escape " \ and newline without
+# corruption or shell expansion. Value has an internal newline (not trailing) so command
+# substitution does not strip it away.
+special=$'a"b\\c\nline2'
+out="$(TELEGRAM_BOT_TOKEN=tg-test IM_SEND_DRY_RUN=1 "$SEND" telegram 12345 "$special")"
+check "telegram special chars round-trip" '[[ "$(echo "$out" | field body.text)" == "$special" ]]'
+out="$(DISCORD_BOT_TOKEN=dc-test IM_SEND_DRY_RUN=1 "$SEND" discord 999 "$special")"
+check "discord special chars round-trip" '[[ "$(echo "$out" | field body.content)" == "$special" ]]'
+
 # --- token from .env fallback (discord style) ---
-tmp="$(mktemp -d)"; printf 'DISCORD_BOT_TOKEN=env-file-tok\n' > "$tmp/.env"
-out="$(DISCORD_STATE_DIR="$tmp" IM_SEND_DRY_RUN=1 "$SEND" discord 5 'x')"
+# env -u DISCORD_BOT_TOKEN forces the .env path (else ambient env var would satisfy it and
+# weaken the assertion). Discord dry-run does not emit the token (it only goes into the curl
+# Authorization header), so a resolvable .env token is proven by im-send emitting output at
+# all: without it im-send would exit 1 with no channel field.
+tmp="$(mktemp -d)"; printf 'DISCORD_BOT_TOKEN=dc-env-file-tok\n' > "$tmp/.env"
+out="$(env -u DISCORD_BOT_TOKEN DISCORD_STATE_DIR="$tmp" IM_SEND_DRY_RUN=1 "$SEND" discord 5 'x')"
 check "discord token from .env file" '[[ "$(echo "$out" | field channel)" == "discord" ]]'
 rm -rf "$tmp"
 
