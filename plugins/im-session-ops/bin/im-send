@@ -3,7 +3,7 @@
 # Channel-agnostic IM sender. Token resolution mirrors the channel plugin
 # server.ts convention: real env var wins, else read <STATE_DIR>/.env.
 # Set IM_SEND_DRY_RUN=1 to print the resolved request as JSON instead of
-# performing the HTTP call (used by im-send.test.sh).
+# performing the HTTP call (exercised by the co-located im-send.test.sh).
 # JSON bodies are built with python3 (json.dumps) so this script needs no external JSON tool.
 set -euo pipefail
 
