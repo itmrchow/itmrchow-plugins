@@ -28,6 +28,8 @@ import { BusyGate, capturePaneBusy } from './busy-gate'
 import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
+import { sanitizeMetaText } from './meta-text'
+import { buildReplyMeta } from './reply-meta'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -405,7 +407,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the sender quote-replied to an earlier message, the tag carries reply_to_message_id (the referenced message\'s ID), reply_to_user (its author, "me" = this bot), and reply_to_text (the referenced message\'s full body, already inlined by Telegram — no extra fetch, and none is possible since Telegram exposes no history API). Read reply_to_text directly to resolve what "this"/"that" refers to. (Field names match the Discord channel; there reply_to_text is absent and you must call get_message — here Telegram hands you the full text up front.) Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -1164,23 +1166,26 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // Include replied-to message content so Claude can see what the user is referencing.
-  const replyMsg = ctx.message?.reply_to_message
-  const replyText = replyMsg?.text ?? replyMsg?.caption
-  const contentWithReply = replyText
-    ? `[Replying to: "${replyText}"]\n${text}`
-    : text
+  // Quote-reply reference goes in meta, not inline in content: an in-content
+  // "[Replying to: ...]" prefix is forgeable by any allowlisted sender typing
+  // that string, whereas a structured <channel> attribute is trustworthy.
+  // buildReplyMeta attaches the full quoted body (Telegram inlines it for free;
+  // there is no history API to fetch it later) — see its doc for the rationale.
+  const replyMeta = buildReplyMeta(ctx.message?.reply_to_message, botUsername)
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   channelGate.submit({
-    content: contentWithReply,
+    content: text,
     meta: {
       chat_id,
       ...(msgId != null ? { message_id: String(msgId) } : {}),
-      user: from.username ?? String(from.id),
+      // sanitizeMetaText: the sender's username is sender-controlled and lands
+      // inside the single-line <channel> tag — neutralize tag-breaking chars.
+      user: from.username ? sanitizeMetaText(from.username) : String(from.id),
       user_id: String(from.id),
       ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      ...replyMeta,
       ...(imagePath ? { image_path: imagePath } : {}),
       ...(attachment ? {
         attachment_kind: attachment.kind,
