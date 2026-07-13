@@ -93,21 +93,30 @@ export type InjectServerOptions = {
  *   carrying the HTTP status (400) and reason to write back.
  */
 export function parseInjectBody(raw: string): InjectParse {
-  let body: { text?: unknown; chat_id?: unknown }
+  let body: unknown
   try {
     body = JSON.parse(raw)
   } catch {
     return { ok: false, status: HTTP_BAD_REQUEST, message: 'invalid json' }
   }
-  if (typeof body.text !== 'string' || !body.text || typeof body.chat_id !== 'string' || !body.chat_id) {
+  // JSON.parse succeeds on valid non-objects — `null`, `"str"`, `123`, `[]`.
+  // `JSON.parse('null')` in particular returns null, and reading `.text` off it
+  // throws a TypeError out of the request handler, killing the whole channel
+  // server: one unauthenticated `curl -d null` was enough to take the process
+  // down. Reject anything that is not a JSON object before touching a field.
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { ok: false, status: HTTP_BAD_REQUEST, message: 'body must be a json object' }
+  }
+  const { text, chat_id } = body as { text?: unknown; chat_id?: unknown }
+  if (typeof text !== 'string' || !text || typeof chat_id !== 'string' || !chat_id) {
     return { ok: false, status: HTTP_BAD_REQUEST, message: 'missing text or chat_id' }
   }
   return {
     ok: true,
     delivery: {
-      content: body.text,
+      content: text,
       meta: {
-        chat_id: body.chat_id,
+        chat_id,
         user: SCHEDULER_ACTOR,
         user_id: SCHEDULER_ACTOR,
         ts: new Date().toISOString(),
@@ -163,7 +172,17 @@ export function startInjectServer(options: InjectServerOptions): Server {
     })
   })
 
-  server.listen(port, BIND_ADDR)
-  process.stderr.write(`${channelName} channel: inject endpoint listening on ${BIND_ADDR}:${port}\n`)
+  // Log from the listen callback, not right after the call: listen() is async,
+  // so logging inline announces "listening" before the bind has actually
+  // succeeded (and before the port is connectable). Callers that need the bound
+  // port must likewise wait for the 'listening' event — on node, address() is
+  // null until then.
+  server.listen(port, BIND_ADDR, () => {
+    // Report the port actually bound, not the one requested — they differ when
+    // the caller passes 0 (ephemeral) as the tests do.
+    const addr = server.address()
+    const boundPort = typeof addr === 'object' && addr !== null ? addr.port : port
+    process.stderr.write(`${channelName} channel: inject endpoint listening on ${BIND_ADDR}:${boundPort}\n`)
+  })
   return server
 }

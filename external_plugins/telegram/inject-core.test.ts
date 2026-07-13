@@ -39,14 +39,36 @@ describe('parseInjectBody', () => {
   test('rejects a non-string chat_id with 400', () => {
     expect(parseInjectBody('{"text":"hi","chat_id":123}')).toEqual({ ok: false, status: 400, message: 'missing text or chat_id' })
   })
+
+  test('rejects a non-string text with 400', () => {
+    expect(parseInjectBody('{"text":123,"chat_id":"1"}')).toEqual({ ok: false, status: 400, message: 'missing text or chat_id' })
+  })
+
+  // `JSON.parse` succeeds on these — reading `.text` off `null` used to throw a
+  // TypeError straight out of the request handler and kill the channel server.
+  test.each([
+    ['null', 'null'],
+    ['a bare string', '"just a string"'],
+    ['a bare number', '123'],
+    ['an array', '[]'],
+    ['a bare boolean', 'true'],
+  ])('rejects %s body with 400 instead of throwing', (_label, raw) => {
+    expect(parseInjectBody(raw)).toEqual({ ok: false, status: 400, message: 'body must be a json object' })
+  })
 })
 
 describe('startInjectServer', () => {
   let server: Server | null = null
   const submitted: ChannelDelivery[] = []
 
-  /** Boot the core on an ephemeral port with a recording gate; returns its base URL. */
-  function boot(extraRoutes?: Parameters<typeof startInjectServer>[0]['extraRoutes']): string {
+  /**
+   * Boot the core on an ephemeral port with a recording gate; returns its base URL.
+   *
+   * Awaits the 'listening' event before reading the bound port: listen() is
+   * async, and on node (telegram's runtime is node via tsx) address() is null
+   * until it fires.
+   */
+  async function boot(extraRoutes?: Parameters<typeof startInjectServer>[0]['extraRoutes']): Promise<string> {
     submitted.length = 0
     server = startInjectServer({
       channelName: 'test',
@@ -54,7 +76,9 @@ describe('startInjectServer', () => {
       gate: { submit: d => { submitted.push(d) } },
       extraRoutes,
     })
-    const { port } = server.address() as AddressInfo
+    const bound = server
+    await new Promise<void>(resolve => bound.once('listening', () => resolve()))
+    const { port } = bound.address() as AddressInfo
     return `http://${BIND_ADDR}:${port}`
   }
 
@@ -64,7 +88,7 @@ describe('startInjectServer', () => {
   })
 
   test('POST /inject submits the delivery to the gate and answers 200 ok', async () => {
-    const base = boot()
+    const base = await boot()
     const res = await fetch(`${base}/inject`, {
       method: 'POST',
       body: '{"text":"report ready","chat_id":"555"}',
@@ -77,29 +101,44 @@ describe('startInjectServer', () => {
   })
 
   test('POST /inject with a bad body answers 400 and submits nothing', async () => {
-    const base = boot()
+    const base = await boot()
     const res = await fetch(`${base}/inject`, { method: 'POST', body: '{"text":"hi"}' })
     expect(res.status).toBe(400)
     expect(await res.text()).toBe('missing text or chat_id')
     expect(submitted).toHaveLength(0)
   })
 
+  test('POST /inject with a null body answers 400 and the server survives', async () => {
+    const base = await boot()
+    const res = await fetch(`${base}/inject`, { method: 'POST', body: 'null' })
+    expect(res.status).toBe(400)
+    expect(await res.text()).toBe('body must be a json object')
+    expect(submitted).toHaveLength(0)
+    // The regression: `null` used to throw out of the handler and kill the
+    // process. Prove the server is still serving by driving a valid inject
+    // through it afterwards.
+    const after = await fetch(`${base}/inject`, { method: 'POST', body: '{"text":"still alive","chat_id":"1"}' })
+    expect(after.status).toBe(200)
+    expect(submitted).toHaveLength(1)
+    expect(submitted[0].content).toBe('still alive')
+  })
+
   test('GET /inject is a 404 — POST only', async () => {
-    const base = boot()
+    const base = await boot()
     const res = await fetch(`${base}/inject`)
     expect(res.status).toBe(404)
     expect(submitted).toHaveLength(0)
   })
 
   test('an unknown path is a 404', async () => {
-    const base = boot()
+    const base = await boot()
     const res = await fetch(`${base}/nope`, { method: 'POST', body: '{}' })
     expect(res.status).toBe(404)
   })
 
   test('an extra route receives the raw body and owns the response', async () => {
     const seen: string[] = []
-    const base = boot({
+    const base = await boot({
       '/update': (raw, res) => {
         seen.push(raw)
         res.writeHead(200)
@@ -114,7 +153,7 @@ describe('startInjectServer', () => {
   })
 
   test('an unregistered extra route stays a 404', async () => {
-    const base = boot({ '/update': (_raw, res) => { res.writeHead(200); res.end('ok') } })
+    const base = await boot({ '/update': (_raw, res) => { res.writeHead(200); res.end('ok') } })
     const res = await fetch(`${base}/other`, { method: 'POST', body: '{}' })
     expect(res.status).toBe(404)
   })
