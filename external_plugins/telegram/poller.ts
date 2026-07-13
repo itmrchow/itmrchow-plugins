@@ -23,8 +23,6 @@ const STATE_DIR =
   join(process.env.HOME || '', '.claude', 'channels', 'telegram')
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
-// Must stay in sync with server.ts: this is the port the poller POSTs /update to.
-const TELEGRAM_INJECT_PORT = parseInt(process.env.TELEGRAM_INJECT_PORT ?? '7842', 10)
 
 // Load STATE_DIR/.env (real env wins) — same convention as server.ts.
 try {
@@ -34,6 +32,12 @@ try {
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
   }
 } catch {}
+
+// Must be read AFTER the .env load above, and must resolve to the same port
+// server.ts binds — this is where the poller POSTs /update. Reading it earlier
+// would ignore a port set in the state .env while server.ts (which reads it
+// after its own load) honours it, moving the server but not the poller.
+const TELEGRAM_INJECT_PORT = parseInt(process.env.TELEGRAM_INJECT_PORT ?? '7842', 10)
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
