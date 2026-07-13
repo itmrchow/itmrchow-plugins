@@ -76,9 +76,11 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-// Scheduler-inject HTTP port. Default 7843 — distinct from telegram's 7842 so
-// both channel servers can run concurrently without a port clash.
-const INJECT_PORT = parseInt(process.env.INJECT_PORT ?? '7843', 10)
+// Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
+// every channel plugin is spawned by the same Claude Code process and inherits
+// one env, so a shared key would override both defaults to the same value and
+// make the second binder die with EADDRINUSE. Default 7843; telegram uses 7842.
+const DISCORD_INJECT_PORT = parseInt(process.env.DISCORD_INJECT_PORT ?? '7843', 10)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -590,8 +592,8 @@ createServer((req, res) => {
     res.writeHead(200)
     res.end('ok')
   })
-}).listen(INJECT_PORT, '127.0.0.1')
-process.stderr.write(`discord channel: inject endpoint listening on 127.0.0.1:${INJECT_PORT}\n`)
+}).listen(DISCORD_INJECT_PORT, '127.0.0.1')
+process.stderr.write(`discord channel: inject endpoint listening on 127.0.0.1:${DISCORD_INJECT_PORT}\n`)
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [

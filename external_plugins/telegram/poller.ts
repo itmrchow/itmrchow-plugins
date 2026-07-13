@@ -23,7 +23,8 @@ const STATE_DIR =
   join(process.env.HOME || '', '.claude', 'channels', 'telegram')
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
-const INJECT_PORT = parseInt(process.env.INJECT_PORT ?? '7842', 10)
+// Must stay in sync with server.ts: this is the port the poller POSTs /update to.
+const TELEGRAM_INJECT_PORT = parseInt(process.env.TELEGRAM_INJECT_PORT ?? '7842', 10)
 
 // Load STATE_DIR/.env (real env wins) — same convention as server.ts.
 try {
@@ -68,7 +69,7 @@ function forwardUpdate(update: unknown, me: unknown): Promise<boolean> {
     const req = request(
       {
         host: '127.0.0.1',
-        port: INJECT_PORT,
+        port: TELEGRAM_INJECT_PORT,
         path: '/update',
         method: 'POST',
         headers: {

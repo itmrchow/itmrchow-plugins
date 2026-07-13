@@ -57,7 +57,10 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const INJECT_PORT = parseInt(process.env.INJECT_PORT ?? '7842', 10)
+// Scheduler-inject HTTP port. Per-plugin env key: every channel plugin is spawned
+// by the same Claude Code process and inherits one env, so a shared INJECT_PORT
+// would make two channels bind the same port.
+const TELEGRAM_INJECT_PORT = parseInt(process.env.TELEGRAM_INJECT_PORT ?? '7842', 10)
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
@@ -555,8 +558,8 @@ createServer((req, res) => {
       res.end('ok')
     })()
   })
-}).listen(INJECT_PORT, '127.0.0.1')
-process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${INJECT_PORT}\n`)
+}).listen(TELEGRAM_INJECT_PORT, '127.0.0.1')
+process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${TELEGRAM_INJECT_PORT}\n`)
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
