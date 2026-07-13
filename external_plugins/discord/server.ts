@@ -47,6 +47,7 @@ import { consumeStartupNotice } from './startup-notice'
 import { parseInjectBody, type ChannelDelivery } from './inject'
 import { sanitizeMetaText } from './meta-text'
 import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
+import { resolveInjectPort } from './inject-port'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -80,7 +81,11 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // every channel plugin is spawned by the same Claude Code process and inherits
 // one env, so a shared key would override both defaults to the same value and
 // make the second binder die with EADDRINUSE. Default 7843; telegram uses 7842.
-const DISCORD_INJECT_PORT = parseInt(process.env.DISCORD_INJECT_PORT ?? '7843', 10)
+const DISCORD_INJECT_PORT = resolveInjectPort(
+  process.env.DISCORD_INJECT_PORT,
+  7843,
+  'DISCORD_INJECT_PORT',
+)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.

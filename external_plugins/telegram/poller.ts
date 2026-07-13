@@ -17,6 +17,7 @@ import { Bot } from 'grammy'
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { request } from 'node:http'
+import { resolveInjectPort } from './inject-port'
 
 const STATE_DIR =
   process.env.TELEGRAM_STATE_DIR ||
@@ -37,7 +38,11 @@ try {
 // server.ts binds — this is where the poller POSTs /update. Reading it earlier
 // would ignore a port set in the state .env while server.ts (which reads it
 // after its own load) honours it, moving the server but not the poller.
-const TELEGRAM_INJECT_PORT = parseInt(process.env.TELEGRAM_INJECT_PORT ?? '7842', 10)
+const TELEGRAM_INJECT_PORT = resolveInjectPort(
+  process.env.TELEGRAM_INJECT_PORT,
+  7842,
+  'TELEGRAM_INJECT_PORT',
+)
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
