@@ -30,7 +30,6 @@ import {
   type Interaction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
@@ -44,7 +43,7 @@ import {
 } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
-import { parseInjectBody, type ChannelDelivery } from './inject'
+import { startInjectServer, type ChannelDelivery } from './inject-core'
 import { sanitizeMetaText } from './meta-text'
 import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
 
@@ -562,36 +561,19 @@ mcp.setNotificationHandler(
   },
 )
 
-// node http (mirrors telegram's /inject) — bound to loopback only. The
-// scheduler POSTs report text here; we wrap it as a synthetic channel message
-// and funnel it through the same busy-gate as inbound gateway messages, so it
-// reaches the agent as if it came from Discord. Telegram also exposes /update
-// for its external poller; Discord runs on the gateway, so /inject is the only
-// route.
-createServer((req, res) => {
-  const path = req.url ?? ''
-  if (req.method !== 'POST' || path !== '/inject') {
-    res.writeHead(404)
-    res.end('not found')
-    return
-  }
-  let raw = ''
-  req.on('data', chunk => { raw += chunk })
-  req.on('end', () => {
-    // /inject: scheduler text delivered as a synthetic channel message.
-    const parsed = parseInjectBody(raw)
-    if (!parsed.ok) {
-      res.writeHead(parsed.status)
-      res.end(parsed.message)
-      return
-    }
-    channelGate.submit(parsed.delivery)
-    process.stderr.write(`discord channel: injected via HTTP for chat_id=${parsed.delivery.meta.chat_id}\n`)
-    res.writeHead(200)
-    res.end('ok')
-  })
-}).listen(INJECT_PORT, '127.0.0.1')
-process.stderr.write(`discord channel: inject endpoint listening on 127.0.0.1:${INJECT_PORT}\n`)
+// Scheduler /inject endpoint — bound to loopback only. The scheduler POSTs
+// report text here; the shared inject core (inject-core.ts, JP-113) wraps it as
+// a synthetic channel message and funnels it through the same busy-gate as
+// inbound gateway messages, so it reaches the agent as if it came from Discord.
+// This channel keeps its own port (7843) because the inject payload has no
+// channel discriminator: the port IS the channel selector. Telegram adds an
+// /update route for its external poller; Discord runs on the gateway, so
+// /inject is the only route here.
+startInjectServer({
+  channelName: 'discord',
+  port: INJECT_PORT,
+  gate: channelGate,
+})
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [

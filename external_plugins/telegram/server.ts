@@ -20,11 +20,12 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { createServer } from 'node:http'
+import type { ServerResponse } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { BusyGate, capturePaneBusy } from './busy-gate'
+import { startInjectServer, type ChannelDelivery } from './inject-core'
 import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
@@ -416,11 +417,6 @@ const mcp = new Server(
   },
 )
 
-type ChannelDelivery = {
-  content: string
-  meta: Record<string, string>
-}
-
 // Single busy-gated choke point for inbound IM + scheduler delivery (JP-44).
 // notifications/claude/channel does NOT enroll in Claude's pty type-ahead
 // queue, so a mid-turn delivery orphans in the input box and never submits.
@@ -481,82 +477,56 @@ mcp.setNotificationHandler(
   },
 )
 
-// node http (was Bun.serve) — runtime is node via tsx, not bun, to avoid the
-// bun (aarch64) event-loop starvation where the MCP stdin watcher freezes the
-// grammy poll. node's libuv loop schedules stdin, timers and HTTP fairly.
-createServer((req, res) => {
-  const path = req.url ?? ''
-  if (req.method !== 'POST' || (path !== '/inject' && path !== '/update')) {
-    res.writeHead(404)
-    res.end('not found')
+/**
+ * Handle `/update`: a raw Telegram update forwarded by the external poller.
+ *
+ * Telegram-only, so it stays out of the shared inject core (Discord runs on the
+ * gateway and has no poller). The poller runs standalone (idle stdin), so its
+ * grammy long-poll is not starved by the MCP StdioServerTransport stdin watcher
+ * — a bun/node aarch64 issue where an in-process poll loop never fires once
+ * Claude drives the MCP connection. Feeding the update through bot.handleUpdate
+ * here reuses ALL gate / pairing / command logic and channel delivery
+ * (mcp.notification) unchanged.
+ *
+ * @param raw - Raw request body: JSON `{ update, me? }` from poller.ts.
+ * @param res - Response to write the poller's ack (200 ok) or 400 to.
+ * @returns Nothing; the response is written before it resolves.
+ */
+async function handlePollerUpdate(raw: string, res: ServerResponse): Promise<void> {
+  let body: { update: unknown; me?: { id: number; is_bot: boolean; first_name: string; username: string } }
+  try {
+    body = JSON.parse(raw)
+  } catch {
+    res.writeHead(400)
+    res.end('invalid json')
     return
   }
-  let raw = ''
-  req.on('data', chunk => { raw += chunk })
-  req.on('end', () => {
-    void (async () => {
-      // /update: a raw Telegram update forwarded by the external poller process.
-      // The poller runs standalone (idle stdin), so its grammy long-poll is not
-      // starved by the MCP StdioServerTransport stdin watcher — a bun/node
-      // aarch64 issue where an in-process poll loop never fires once Claude
-      // drives the MCP connection. Feeding the update through bot.handleUpdate
-      // here reuses ALL gate / pairing / command logic and channel delivery
-      // (mcp.notification) unchanged.
-      if (path === '/update') {
-        let body: { update: unknown; me?: { id: number; is_bot: boolean; first_name: string; username: string } }
-        try {
-          body = JSON.parse(raw)
-        } catch {
-          res.writeHead(400)
-          res.end('invalid json')
-          return
-        }
-        // The poller already called getMe; set botInfo so handleUpdate works
-        // without an in-process bot.init() (whose getMe would starve under the
-        // MCP stdin watcher).
-        if (body.me && !bot.isInited()) {
-          bot.botInfo = body.me as typeof bot.botInfo
-          botUsername = body.me.username
-        }
-        try {
-          await bot.handleUpdate(body.update as Parameters<typeof bot.handleUpdate>[0])
-        } catch (err) {
-          process.stderr.write(`telegram channel: handleUpdate error: ${err}\n`)
-        }
-        res.writeHead(200)
-        res.end('ok')
-        return
-      }
-      // /inject: scheduler text delivered as a synthetic channel message.
-      let body: { text: string; chat_id: string }
-      try {
-        body = JSON.parse(raw)
-      } catch {
-        res.writeHead(400)
-        res.end('invalid json')
-        return
-      }
-      if (!body.text || !body.chat_id) {
-        res.writeHead(400)
-        res.end('missing text or chat_id')
-        return
-      }
-      channelGate.submit({
-        content: body.text,
-        meta: {
-          chat_id: body.chat_id,
-          user: 'scheduler',
-          user_id: 'scheduler',
-          ts: new Date().toISOString(),
-        },
-      })
-      process.stderr.write(`telegram channel: injected via HTTP for chat_id=${body.chat_id}\n`)
-      res.writeHead(200)
-      res.end('ok')
-    })()
-  })
-}).listen(INJECT_PORT, '127.0.0.1')
-process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${INJECT_PORT}\n`)
+  // The poller already called getMe; set botInfo so handleUpdate works without
+  // an in-process bot.init() (whose getMe would starve under the MCP stdin
+  // watcher).
+  if (body.me && !bot.isInited()) {
+    bot.botInfo = body.me as typeof bot.botInfo
+    botUsername = body.me.username
+  }
+  try {
+    await bot.handleUpdate(body.update as Parameters<typeof bot.handleUpdate>[0])
+  } catch (err) {
+    process.stderr.write(`telegram channel: handleUpdate error: ${err}\n`)
+  }
+  res.writeHead(200)
+  res.end('ok')
+}
+
+// Scheduler /inject endpoint — the HTTP skeleton, body parse and busy-gate
+// hand-off are shared with the Discord channel (inject-core.ts, JP-113). This
+// channel keeps its own port (7842) because the inject payload has no channel
+// discriminator: the port IS the channel selector.
+startInjectServer({
+  channelName: 'telegram',
+  port: INJECT_PORT,
+  gate: channelGate,
+  extraRoutes: { '/update': handlePollerUpdate },
+})
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
