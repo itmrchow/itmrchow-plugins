@@ -57,9 +57,10 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-// Scheduler-inject HTTP port. Per-plugin env key: every channel plugin is spawned
-// by the same Claude Code process and inherits one env, so a shared INJECT_PORT
-// would make two channels bind the same port.
+// Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
+// every channel plugin is spawned by the same Claude Code process and inherits
+// one env, so a shared key would override both defaults to the same value and
+// make the second binder die with EADDRINUSE. Default 7842; discord uses 7843.
 const TELEGRAM_INJECT_PORT = parseInt(process.env.TELEGRAM_INJECT_PORT ?? '7842', 10)
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
