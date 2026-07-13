@@ -28,6 +28,7 @@ import { BusyGate, capturePaneBusy } from './busy-gate'
 import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
+import { resolveInjectPort } from './inject-port'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -57,7 +58,15 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const INJECT_PORT = parseInt(process.env.INJECT_PORT ?? '7842', 10)
+// Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
+// every channel plugin is spawned by the same Claude Code process and inherits
+// one env, so a shared key would override both defaults to the same value and
+// make the second binder die with EADDRINUSE. Default 7842; discord uses 7843.
+const TELEGRAM_INJECT_PORT = resolveInjectPort(
+  process.env.TELEGRAM_INJECT_PORT,
+  7842,
+  'TELEGRAM_INJECT_PORT',
+)
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
@@ -555,8 +564,8 @@ createServer((req, res) => {
       res.end('ok')
     })()
   })
-}).listen(INJECT_PORT, '127.0.0.1')
-process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${INJECT_PORT}\n`)
+}).listen(TELEGRAM_INJECT_PORT, '127.0.0.1')
+process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${TELEGRAM_INJECT_PORT}\n`)
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
