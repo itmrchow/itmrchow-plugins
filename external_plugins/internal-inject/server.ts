@@ -19,6 +19,7 @@ import { createServer } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { loadTokens, resolveService } from './auth'
+import { createBodyCollector } from './body'
 import { parseInjectBody, REPLY_CHANNELS, type ChannelDelivery } from './inject'
 import { resolveInjectPort } from './inject-port'
 
@@ -26,8 +27,6 @@ const DEFAULT_PORT = 7844
 const HTTP_OK = 200
 const HTTP_UNAUTHORIZED = 401
 const HTTP_NOT_FOUND = 404
-/** Cap on the request body — the caller is a local service, not the open internet. */
-const MAX_BODY_BYTES = 64 * 1024
 const HTTP_PAYLOAD_TOO_LARGE = 413
 
 // Per-plugin env key (not a shared INJECT_PORT): every channel plugin binds its
@@ -105,12 +104,14 @@ createServer((req, res) => {
     return
   }
 
-  let raw = ''
+  // Bytes are buffered and decoded once at the end, never chunk by chunk: the alert
+  // text is Chinese, and a character straddling a chunk boundary would otherwise
+  // decode as two U+FFFD — a 200 to the caller, a corrupted message to the agent.
+  const body = createBodyCollector()
   let aborted = false
   req.on('data', chunk => {
     if (aborted) return
-    raw += chunk
-    if (raw.length > MAX_BODY_BYTES) {
+    if (!body.push(chunk)) {
       aborted = true
       res.writeHead(HTTP_PAYLOAD_TOO_LARGE)
       res.end('payload too large')
@@ -119,6 +120,7 @@ createServer((req, res) => {
   })
   req.on('end', () => {
     if (aborted) return
+    const raw = body.decode()
 
     // Re-read the token file per request: rotating or revoking a token then takes
     // effect immediately, instead of at the next agent restart. The file is tiny
