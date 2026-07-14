@@ -34,7 +34,7 @@ import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
-import { BusyGate, capturePaneBusy } from './busy-gate'
+import { capturePaneBusy } from './tmux-pane'
 import {
   decideClear,
   getContextPercent,
@@ -491,32 +491,35 @@ const mcp = new Server(
   },
 )
 
-// Single busy-gated choke point for inbound Discord delivery (JP-44).
-// notifications/claude/channel does NOT enroll in Claude's pty type-ahead
-// queue, so a mid-turn delivery orphans in the input box and never submits.
-// Gate it: every payload is enqueued and the drain loop flushes it FIFO,
-// one per tick, only when the tmux pane is idle. There is no immediate
-// fast-path on purpose. The capture-pane footer lags ~1s behind the agent
-// going busy, so a post-deliver settle cooldown (FOOTER_SETTLE_MS) holds the
-// next flush across that lag window so two rapid messages cannot both read
-// idle and re-wedge the second.
-// Permission relays and button interactions bypass this (they don't pass through here).
-// Inbound gateway messages and the /inject scheduler endpoint both funnel here.
-const channelGate = new BusyGate<ChannelDelivery>({
-  isBusy: () => capturePaneBusy(),
-  deliver: async ({ content, meta }) => {
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content, meta },
-      })
-    } catch (err) {
-      process.stderr.write(`discord busy-gate: channel deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
-      throw err
-    }
-  },
-})
-channelGate.start()
+/**
+ * Deliver one inbound/scheduler payload to the agent as a channel notification.
+ *
+ * Inbound gateway messages and the /inject scheduler endpoint both funnel here;
+ * permission relays and button interactions do not pass through.
+ *
+ * Fired immediately — no queue. This used to run through a busy-gate (JP-44):
+ * notifications/claude/channel does not enroll in Claude's pty type-ahead
+ * queue, so a mid-turn delivery orphaned in the input box and never submitted
+ * (the "wedge"). That was fixed upstream — a message delivered mid-generation
+ * is now received and acted on — so the queue, its drain loop and its
+ * capture-pane busy probe are gone (JP-121).
+ *
+ * Args:
+ *   delivery: the {content, meta} channel-notification body.
+ * Returns:
+ *   Nothing. Never throws: a failed notification is logged and dropped, since
+ *   no caller is in a position to retry it.
+ */
+async function deliverToChannel({ content, meta }: ChannelDelivery): Promise<void> {
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+  } catch (err) {
+    process.stderr.write(`discord channel: deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
+  }
+}
 
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
@@ -571,7 +574,7 @@ mcp.setNotificationHandler(
 
 // node http (mirrors telegram's /inject) — bound to loopback only. The
 // scheduler POSTs report text here; we wrap it as a synthetic channel message
-// and funnel it through the same busy-gate as inbound gateway messages, so it
+// and funnel it down the same delivery path as inbound gateway messages, so it
 // reaches the agent as if it came from Discord. Telegram also exposes /update
 // for its external poller; Discord runs on the gateway, so /inject is the only
 // route.
@@ -592,7 +595,7 @@ createServer((req, res) => {
       res.end(parsed.message)
       return
     }
-    channelGate.submit(parsed.delivery)
+    void deliverToChannel(parsed.delivery)
     process.stderr.write(`discord channel: injected via HTTP for chat_id=${parsed.delivery.meta.chat_id}\n`)
     res.writeHead(200)
     res.end('ok')
@@ -861,7 +864,6 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
-  channelGate.stop()
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -1123,7 +1125,7 @@ async function handleInbound(msg: Message): Promise<void> {
     }
   }
 
-  channelGate.submit({
+  await deliverToChannel({
     content,
     meta: {
       chat_id,

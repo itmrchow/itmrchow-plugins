@@ -24,7 +24,7 @@ import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { BusyGate, capturePaneBusy } from './busy-gate'
+import { capturePaneBusy } from './tmux-pane'
 import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
@@ -430,31 +430,32 @@ type ChannelDelivery = {
   meta: Record<string, string>
 }
 
-// Single busy-gated choke point for inbound IM + scheduler delivery (JP-44).
-// notifications/claude/channel does NOT enroll in Claude's pty type-ahead
-// queue, so a mid-turn delivery orphans in the input box and never submits.
-// Gate it: every payload is enqueued and the drain loop flushes it FIFO,
-// one per tick, only when the tmux pane is idle. There is no immediate
-// fast-path on purpose. The capture-pane footer lags ~1s behind the agent
-// going busy, so a post-deliver settle cooldown (FOOTER_SETTLE_MS) holds the
-// next flush across that lag window so two rapid messages cannot both read
-// idle and re-wedge the second.
-// Bot commands and permission relays bypass this (they don't pass through here).
-const channelGate = new BusyGate<ChannelDelivery>({
-  isBusy: () => capturePaneBusy(),
-  deliver: async ({ content, meta }) => {
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content, meta },
-      })
-    } catch (err) {
-      process.stderr.write(`telegram busy-gate: channel deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
-      throw err
-    }
-  },
-})
-channelGate.start()
+/**
+ * Deliver one inbound/scheduler payload to the agent as a channel notification.
+ *
+ * Fired immediately — no queue. This used to run through a busy-gate (JP-44):
+ * notifications/claude/channel does not enroll in Claude's pty type-ahead
+ * queue, so a mid-turn delivery orphaned in the input box and never submitted
+ * (the "wedge"). That was fixed upstream — a message delivered mid-generation
+ * is now received and acted on — so the queue, its drain loop and its
+ * capture-pane busy probe are gone (JP-121).
+ *
+ * Args:
+ *   delivery: the {content, meta} channel-notification body.
+ * Returns:
+ *   Nothing. Never throws: a failed notification is logged and dropped, since
+ *   no caller is in a position to retry it.
+ */
+async function deliverToChannel({ content, meta }: ChannelDelivery): Promise<void> {
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+  } catch (err) {
+    process.stderr.write(`telegram channel: deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
+  }
+}
 
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
@@ -550,7 +551,7 @@ createServer((req, res) => {
         res.end('missing text or chat_id')
         return
       }
-      channelGate.submit({
+      void deliverToChannel({
         content: body.text,
         meta: {
           chat_id: body.chat_id,
@@ -775,7 +776,6 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  channelGate.stop()
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
@@ -1182,7 +1182,7 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  channelGate.submit({
+  await deliverToChannel({
     content: contentWithReply,
     meta: {
       chat_id,

@@ -26,7 +26,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { TMUX_TARGET } from './busy-gate'
+import { TMUX_TARGET } from './tmux-pane'
 import { clearRestartMarker, writeRestartMarker } from './startup-notice'
 
 const execFileAsync = promisify(execFile)
