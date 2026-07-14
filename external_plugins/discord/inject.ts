@@ -3,10 +3,10 @@
  *
  * Split out from server.ts (which has top-level side effects: token check,
  * MCP connect, gateway login) so the HTTP contract is unit-testable in
- * isolation — same pattern as busy-gate.ts / busy-gate.test.ts.
+ * isolation.
  */
 
-/** Synthetic channel message handed to the busy-gate for delivery. */
+/** Synthetic channel message handed to the channel delivery path. */
 export type ChannelDelivery = {
   content: string
   meta: Record<string, string>
@@ -21,8 +21,8 @@ export type InjectParse =
  * Parse and validate a raw /inject request body into a channel delivery.
  *
  * The scheduler POSTs `{ text, chat_id }`; this turns it into the synthetic
- * `scheduler` channel message handed to the busy-gate. Kept pure (no I/O) so
- * the HTTP contract is unit-testable without booting the MCP server.
+ * `scheduler` channel message handed to the channel delivery path. Kept pure
+ * (no I/O) so the HTTP contract is unit-testable without booting the MCP server.
  *
  * @param raw - Raw request body, expected to be JSON `{ text, chat_id }`.
  * @returns `{ ok: true, delivery }` on success, else `{ ok: false, status, message }`
