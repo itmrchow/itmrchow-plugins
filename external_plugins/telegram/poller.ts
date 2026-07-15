@@ -18,6 +18,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { request } from 'node:http'
 import { resolveInjectPort } from './inject-port'
+import { BOT_COMMANDS } from './bot-commands'
 
 const STATE_DIR =
   process.env.TELEGRAM_STATE_DIR ||
@@ -105,17 +106,7 @@ async function main() {
   const me = bot.botInfo
   process.stderr.write(`telegram poller: polling as @${me.username}\n`)
   void bot.api
-    .setMyCommands(
-      [
-        { command: 'start', description: 'Welcome and setup guide' },
-        { command: 'help', description: 'What this bot can do' },
-        { command: 'status', description: 'Check your pairing status' },
-        { command: 'ctx', description: 'Show context usage' },
-        { command: 'clear', description: 'Clear the agent context' },
-        { command: 'restart', description: 'Restart the agent' },
-      ],
-      { scope: { type: 'all_private_chats' } },
-    )
+    .setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
     .catch(() => {})
 
   let offset: number | undefined

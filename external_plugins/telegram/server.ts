@@ -29,6 +29,8 @@ import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { resolveInjectPort } from './inject-port'
+import { resolvePollMode } from './poll-mode'
+import { BOT_COMMANDS } from './bot-commands'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -101,6 +103,12 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
+
+// How this process consumes updates. decoupled (arm64-linux): rely on the
+// external poller + /update. builtin (x86 / non-starving platforms): poll
+// in-process via bot.start() at the end of this file. Resolved after the state
+// .env load above so TELEGRAM_POLL_MODE set there is honoured.
+const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
 
 type PendingEntry = {
   senderId: string
@@ -1208,10 +1216,57 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// NO in-process polling here. On bun/node (aarch64) the MCP StdioServerTransport
-// stdin watcher starves an in-process grammy poll loop once Claude drives the
-// MCP connection — the loop silently never fires (even setTimeout timers stall),
-// so inbound updates are never consumed. Polling is delegated to the standalone
-// `poller.ts` process (idle stdin → unaffected), which forwards each update to
-// the /update HTTP endpoint above; bot.handleUpdate runs there, network-driven,
-// which is serviced normally. setMyCommands is also done by the poller.
+// Polling strategy depends on POLL_MODE (resolved above; see poll-mode.ts).
+//
+// decoupled (arm64-linux): NO in-process polling here. The MCP
+// StdioServerTransport stdin watcher starves an in-process grammy poll loop once
+// Claude drives the MCP connection — the loop silently never fires (even
+// setTimeout timers stall), so inbound updates are never consumed. Polling is
+// delegated to the standalone `poller.ts` process (idle stdin → unaffected),
+// which forwards each update to the /update HTTP endpoint above; bot.handleUpdate
+// runs there, network-driven, which is serviced normally. setMyCommands is done
+// by the poller. In this mode the block below does not run — behaviour is
+// identical to before JP-76.
+//
+// builtin (x86 / non-starving platforms): poll in-process via bot.start(), like
+// upstream. No external poller, no /update traffic. init() must precede start()
+// so botInfo/botUsername are set before the first update is handled (isMentioned
+// depends on botUsername), and setMyCommands mirrors the poller's menu.
+if (POLL_MODE === 'builtin') {
+  // init() is the most misconfig-prone step (bad token / no network 401s here).
+  // Give it an explicit diagnostic rather than letting it fall to the generic
+  // top-level unhandledRejection handler, which would leave botUsername='' and
+  // silently skip setMyCommands + polling with no actionable message. The
+  // unhandledRejection handler keeps the process alive on purpose (MCP tools
+  // still serve), so this is an observability fix, not a behaviour change.
+  try {
+    await bot.init()
+    botUsername = bot.botInfo.username
+  } catch (err) {
+    process.stderr.write(
+      `telegram channel: bot.init() failed — check TELEGRAM_BOT_TOKEN and network: ${err}\n`,
+    )
+  }
+  // Gate the rest on a fully-inited bot: a half-inited bot has no botInfo, so
+  // polling it is meaningless. This is top-level (no function to early-return
+  // from), so guard with bot.isInited() — same API as the /update guard (R3).
+  if (bot.isInited()) {
+    try {
+      await bot.api.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
+    } catch (err) {
+      process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`)
+    }
+    // Not awaited: bot.start()'s promise resolves only once the bot stops, so
+    // awaiting would block the top level forever. bot.catch above keeps polling
+    // alive across handler throws.
+    void bot
+      .start({
+        onStart: me => {
+          process.stderr.write(`telegram channel: builtin polling as @${me.username}\n`)
+        },
+      })
+      .catch(err => {
+        process.stderr.write(`telegram channel: bot.start failed: ${err}\n`)
+      })
+  }
+}
