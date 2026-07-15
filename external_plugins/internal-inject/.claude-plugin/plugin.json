@@ -1,0 +1,12 @@
+{
+  "name": "internal-inject",
+  "description": "Internal-service inject channel for Claude Code — token-authenticated localhost HTTP endpoint that delivers backend-service messages into the session. No IM gateway, no reply tool.",
+  "version": "0.1.0",
+  "keywords": [
+    "inject",
+    "internal",
+    "service",
+    "channel",
+    "mcp"
+  ]
+}
