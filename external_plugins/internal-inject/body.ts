@@ -22,12 +22,10 @@ export type BodyCollector = {
    * Add one chunk.
    *
    * @param chunk - Raw bytes from the request stream.
-   * @returns false once the accumulated body exceeds the cap; the caller should
-   *   then answer 413 and destroy the request.
+   * @returns false once the body would exceed the cap; the chunk is not kept, and
+   *   the caller should answer 413 and destroy the request.
    */
   push(chunk: Buffer): boolean
-  /** Total bytes accumulated so far. */
-  size(): number
   /** Decode everything accumulated as UTF-8. Call once, after the last chunk. */
   decode(): string
 }
@@ -45,14 +43,13 @@ export function createBodyCollector(maxBytes: number = MAX_BODY_BYTES): BodyColl
   return {
     push(chunk: Buffer): boolean {
       // Buffer.length is a byte count — unlike a decoded string's .length, which
-      // counts UTF-16 code units and would undercount every non-ASCII character.
+      // counts UTF-16 code units: 3 for '線線線' (9 bytes), 2 for a single emoji
+      // (4 bytes). A cap read off the decoded string admits several times what it
+      // claims to.
+      if (size + chunk.length > maxBytes) return false
       size += chunk.length
-      if (size > maxBytes) return false
       chunks.push(chunk)
       return true
-    },
-    size(): number {
-      return size
     },
     decode(): string {
       // ONE decode over the concatenated bytes: a character straddling a chunk
