@@ -1233,23 +1233,40 @@ bot.catch(err => {
 // so botInfo/botUsername are set before the first update is handled (isMentioned
 // depends on botUsername), and setMyCommands mirrors the poller's menu.
 if (POLL_MODE === 'builtin') {
-  await bot.init()
-  botUsername = bot.botInfo.username
+  // init() is the most misconfig-prone step (bad token / no network 401s here).
+  // Give it an explicit diagnostic rather than letting it fall to the generic
+  // top-level unhandledRejection handler, which would leave botUsername='' and
+  // silently skip setMyCommands + polling with no actionable message. The
+  // unhandledRejection handler keeps the process alive on purpose (MCP tools
+  // still serve), so this is an observability fix, not a behaviour change.
   try {
-    await bot.api.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
+    await bot.init()
+    botUsername = bot.botInfo.username
   } catch (err) {
-    process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`)
+    process.stderr.write(
+      `telegram channel: bot.init() failed — check TELEGRAM_BOT_TOKEN and network: ${err}\n`,
+    )
   }
-  // Not awaited: bot.start()'s promise resolves only once the bot stops, so
-  // awaiting would block the top level forever. bot.catch above keeps polling
-  // alive across handler throws.
-  void bot
-    .start({
-      onStart: me => {
-        process.stderr.write(`telegram channel: builtin polling as @${me.username}\n`)
-      },
-    })
-    .catch(err => {
-      process.stderr.write(`telegram channel: bot.start failed: ${err}\n`)
-    })
+  // Gate the rest on a fully-inited bot: a half-inited bot has no botInfo, so
+  // polling it is meaningless. This is top-level (no function to early-return
+  // from), so guard with bot.isInited() — same API as the /update guard (R3).
+  if (bot.isInited()) {
+    try {
+      await bot.api.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
+    } catch (err) {
+      process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`)
+    }
+    // Not awaited: bot.start()'s promise resolves only once the bot stops, so
+    // awaiting would block the top level forever. bot.catch above keeps polling
+    // alive across handler throws.
+    void bot
+      .start({
+        onStart: me => {
+          process.stderr.write(`telegram channel: builtin polling as @${me.username}\n`)
+        },
+      })
+      .catch(err => {
+        process.stderr.write(`telegram channel: bot.start failed: ${err}\n`)
+      })
+  }
 }
