@@ -38,5 +38,10 @@ if is_arm_linux || [ "$MODE" = "decoupled" ]; then
   fi
   exec tsx "$DIR/server.ts"
 else
+  if ! command -v bun >/dev/null 2>&1; then
+    echo "telegram channel: builtin mode needs 'bun' but it is not on PATH." >&2
+    echo "  Install bun (x86 / GCP hosts run the server under bun, not tsx)." >&2
+    exit 1
+  fi
   exec bun "$DIR/server.ts"
 fi
