@@ -98,6 +98,34 @@ This fork extends the upstream plugin with operational features for running the 
 Inbound messages trigger a typing indicator automatically — Telegram shows
 "botname is typing…" while the assistant works on a response.
 
+## Inbound message fields
+
+Each inbound message arrives as a `<channel source="telegram" ...>` notification
+whose attributes carry structured metadata:
+
+| Field | Meaning |
+| --- | --- |
+| `chat_id` | Chat ID — pass it back to `reply`. |
+| `message_id` | ID of this message — usable as `reply_to` for native threading. |
+| `user` / `user_id` | Sender's username (or numeric ID when no username) and numeric ID. |
+| `ts` | ISO 8601 timestamp. |
+| `image_path` | Present when the message has a photo — local path to `Read`. |
+| `attachment_kind` / `attachment_file_id` / `attachment_size` / `attachment_mime` / `attachment_name` | Present when the message has a non-photo attachment — pass `attachment_file_id` to `download_attachment`. |
+| `reply_to_message_id` | Present when the sender quote-replied — ID of the referenced message. |
+| `reply_to_user` | Author of the referenced message (`me` = the bot itself). |
+| `reply_to_text` | Full body of the referenced message. |
+
+The quote-reply reference lives in metadata (not message text) so it can't be
+forged by a sender typing a look-alike string. Field names mirror the Discord
+channel, but the body-delivery strategy differs: Discord's gateway payload omits
+the quoted body (so it carries only the ID + author, and the assistant calls
+`get_message` on demand), whereas Telegram embeds the full referenced message in
+the same update and exposes no history API — so `reply_to_text` ships the
+**complete** quoted body up front (no fetch, no truncated preview).
+`reply_to_user`, `reply_to_text`, and `user` are sender-controlled: control
+chars (incl. newlines) collapse to spaces and `"`/`<`/`>` become look-alikes so
+the value can't break the single-line `<channel>` tag.
+
 ## Photos
 
 Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` (this path when `$TELEGRAM_STATE_DIR` is unset; if set, the `inbox/` lives under that env-specified directory) and the
