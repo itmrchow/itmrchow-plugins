@@ -12,7 +12,7 @@
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { capturePaneText, TMUX_TARGET } from './busy-gate'
+import { capturePaneText, TMUX_TARGET } from './tmux-pane'
 
 const execFileAsync = promisify(execFile)
 

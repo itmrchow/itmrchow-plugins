@@ -24,12 +24,15 @@ import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { BusyGate, capturePaneBusy } from './busy-gate'
+import { capturePaneBusy } from './tmux-pane'
 import { decideClear, getContextPercent, sendClear } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { sanitizeMetaText } from './meta-text'
 import { buildReplyMeta } from './reply-meta'
+import { resolveInjectPort } from './inject-port'
+import { resolvePollMode } from './poll-mode'
+import { BOT_COMMANDS } from './bot-commands'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -59,7 +62,15 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const INJECT_PORT = parseInt(process.env.INJECT_PORT ?? '7842', 10)
+// Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
+// every channel plugin is spawned by the same Claude Code process and inherits
+// one env, so a shared key would override both defaults to the same value and
+// make the second binder die with EADDRINUSE. Default 7842; discord uses 7843.
+const TELEGRAM_INJECT_PORT = resolveInjectPort(
+  process.env.TELEGRAM_INJECT_PORT,
+  7842,
+  'TELEGRAM_INJECT_PORT',
+)
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
@@ -94,6 +105,12 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
+
+// How this process consumes updates. decoupled (arm64-linux): rely on the
+// external poller + /update. builtin (x86 / non-starving platforms): poll
+// in-process via bot.start() at the end of this file. Resolved after the state
+// .env load above so TELEGRAM_POLL_MODE set there is honoured.
+const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
 
 type PendingEntry = {
   senderId: string
@@ -423,31 +440,32 @@ type ChannelDelivery = {
   meta: Record<string, string>
 }
 
-// Single busy-gated choke point for inbound IM + scheduler delivery (JP-44).
-// notifications/claude/channel does NOT enroll in Claude's pty type-ahead
-// queue, so a mid-turn delivery orphans in the input box and never submits.
-// Gate it: every payload is enqueued and the drain loop flushes it FIFO,
-// one per tick, only when the tmux pane is idle. There is no immediate
-// fast-path on purpose. The capture-pane footer lags ~1s behind the agent
-// going busy, so a post-deliver settle cooldown (FOOTER_SETTLE_MS) holds the
-// next flush across that lag window so two rapid messages cannot both read
-// idle and re-wedge the second.
-// Bot commands and permission relays bypass this (they don't pass through here).
-const channelGate = new BusyGate<ChannelDelivery>({
-  isBusy: () => capturePaneBusy(),
-  deliver: async ({ content, meta }) => {
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content, meta },
-      })
-    } catch (err) {
-      process.stderr.write(`telegram busy-gate: channel deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
-      throw err
-    }
-  },
-})
-channelGate.start()
+/**
+ * Deliver one inbound/scheduler payload to the agent as a channel notification.
+ *
+ * Fired immediately — no queue. This used to run through a busy-gate (JP-44):
+ * notifications/claude/channel does not enroll in Claude's pty type-ahead
+ * queue, so a mid-turn delivery orphaned in the input box and never submitted
+ * (the "wedge"). That was fixed upstream — a message delivered mid-generation
+ * is now received and acted on — so the queue, its drain loop and its
+ * capture-pane busy probe are gone (JP-121).
+ *
+ * Args:
+ *   delivery: the {content, meta} channel-notification body.
+ * Returns:
+ *   Nothing. Never throws: a failed notification is logged and dropped, since
+ *   no caller is in a position to retry it.
+ */
+async function deliverToChannel({ content, meta }: ChannelDelivery): Promise<void> {
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+  } catch (err) {
+    process.stderr.write(`telegram channel: deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
+  }
+}
 
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
@@ -543,7 +561,7 @@ createServer((req, res) => {
         res.end('missing text or chat_id')
         return
       }
-      channelGate.submit({
+      void deliverToChannel({
         content: body.text,
         meta: {
           chat_id: body.chat_id,
@@ -557,8 +575,8 @@ createServer((req, res) => {
       res.end('ok')
     })()
   })
-}).listen(INJECT_PORT, '127.0.0.1')
-process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${INJECT_PORT}\n`)
+}).listen(TELEGRAM_INJECT_PORT, '127.0.0.1')
+process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${TELEGRAM_INJECT_PORT}\n`)
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -768,7 +786,6 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  channelGate.stop()
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
@@ -1175,7 +1192,7 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  channelGate.submit({
+  await deliverToChannel({
     content: text,
     meta: {
       chat_id,
@@ -1204,10 +1221,57 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// NO in-process polling here. On bun/node (aarch64) the MCP StdioServerTransport
-// stdin watcher starves an in-process grammy poll loop once Claude drives the
-// MCP connection — the loop silently never fires (even setTimeout timers stall),
-// so inbound updates are never consumed. Polling is delegated to the standalone
-// `poller.ts` process (idle stdin → unaffected), which forwards each update to
-// the /update HTTP endpoint above; bot.handleUpdate runs there, network-driven,
-// which is serviced normally. setMyCommands is also done by the poller.
+// Polling strategy depends on POLL_MODE (resolved above; see poll-mode.ts).
+//
+// decoupled (arm64-linux): NO in-process polling here. The MCP
+// StdioServerTransport stdin watcher starves an in-process grammy poll loop once
+// Claude drives the MCP connection — the loop silently never fires (even
+// setTimeout timers stall), so inbound updates are never consumed. Polling is
+// delegated to the standalone `poller.ts` process (idle stdin → unaffected),
+// which forwards each update to the /update HTTP endpoint above; bot.handleUpdate
+// runs there, network-driven, which is serviced normally. setMyCommands is done
+// by the poller. In this mode the block below does not run — behaviour is
+// identical to before JP-76.
+//
+// builtin (x86 / non-starving platforms): poll in-process via bot.start(), like
+// upstream. No external poller, no /update traffic. init() must precede start()
+// so botInfo/botUsername are set before the first update is handled (isMentioned
+// depends on botUsername), and setMyCommands mirrors the poller's menu.
+if (POLL_MODE === 'builtin') {
+  // init() is the most misconfig-prone step (bad token / no network 401s here).
+  // Give it an explicit diagnostic rather than letting it fall to the generic
+  // top-level unhandledRejection handler, which would leave botUsername='' and
+  // silently skip setMyCommands + polling with no actionable message. The
+  // unhandledRejection handler keeps the process alive on purpose (MCP tools
+  // still serve), so this is an observability fix, not a behaviour change.
+  try {
+    await bot.init()
+    botUsername = bot.botInfo.username
+  } catch (err) {
+    process.stderr.write(
+      `telegram channel: bot.init() failed — check TELEGRAM_BOT_TOKEN and network: ${err}\n`,
+    )
+  }
+  // Gate the rest on a fully-inited bot: a half-inited bot has no botInfo, so
+  // polling it is meaningless. This is top-level (no function to early-return
+  // from), so guard with bot.isInited() — same API as the /update guard (R3).
+  if (bot.isInited()) {
+    try {
+      await bot.api.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
+    } catch (err) {
+      process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`)
+    }
+    // Not awaited: bot.start()'s promise resolves only once the bot stops, so
+    // awaiting would block the top level forever. bot.catch above keeps polling
+    // alive across handler throws.
+    void bot
+      .start({
+        onStart: me => {
+          process.stderr.write(`telegram channel: builtin polling as @${me.username}\n`)
+        },
+      })
+      .catch(err => {
+        process.stderr.write(`telegram channel: bot.start failed: ${err}\n`)
+      })
+  }
+}

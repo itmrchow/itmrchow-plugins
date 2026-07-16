@@ -17,13 +17,14 @@ import { Bot } from 'grammy'
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { request } from 'node:http'
+import { resolveInjectPort } from './inject-port'
+import { BOT_COMMANDS } from './bot-commands'
 
 const STATE_DIR =
   process.env.TELEGRAM_STATE_DIR ||
   join(process.env.HOME || '', '.claude', 'channels', 'telegram')
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
-const INJECT_PORT = parseInt(process.env.INJECT_PORT ?? '7842', 10)
 
 // Load STATE_DIR/.env (real env wins) — same convention as server.ts.
 try {
@@ -33,6 +34,16 @@ try {
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
   }
 } catch {}
+
+// Must be read AFTER the .env load above, and must resolve to the same port
+// server.ts binds — this is where the poller POSTs /update. Reading it earlier
+// would ignore a port set in the state .env while server.ts (which reads it
+// after its own load) honours it, moving the server but not the poller.
+const TELEGRAM_INJECT_PORT = resolveInjectPort(
+  process.env.TELEGRAM_INJECT_PORT,
+  7842,
+  'TELEGRAM_INJECT_PORT',
+)
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
@@ -68,7 +79,7 @@ function forwardUpdate(update: unknown, me: unknown): Promise<boolean> {
     const req = request(
       {
         host: '127.0.0.1',
-        port: INJECT_PORT,
+        port: TELEGRAM_INJECT_PORT,
         path: '/update',
         method: 'POST',
         headers: {
@@ -95,17 +106,7 @@ async function main() {
   const me = bot.botInfo
   process.stderr.write(`telegram poller: polling as @${me.username}\n`)
   void bot.api
-    .setMyCommands(
-      [
-        { command: 'start', description: 'Welcome and setup guide' },
-        { command: 'help', description: 'What this bot can do' },
-        { command: 'status', description: 'Check your pairing status' },
-        { command: 'ctx', description: 'Show context usage' },
-        { command: 'clear', description: 'Clear the agent context' },
-        { command: 'restart', description: 'Restart the agent' },
-      ],
-      { scope: { type: 'all_private_chats' } },
-    )
+    .setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
     .catch(() => {})
 
   let offset: number | undefined

@@ -94,10 +94,9 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 
 This fork extends the upstream plugin with operational features for running the bot as an always-on agent (e.g. inside a tmux session on a VM):
 
-- **`/inject` HTTP endpoint** — `POST /inject` on `127.0.0.1:7843` (override with `INJECT_PORT`) delivers text from schedulers or other local processes into the session as a synthetic channel message. Body: `{"text": "...", "chat_id": "..."}`. Bound to loopback only.
+- **`/inject` HTTP endpoint** — `POST /inject` on `127.0.0.1:7843` (override with `DISCORD_INJECT_PORT`) delivers text from schedulers or other local processes into the session as a synthetic channel message. Body: `{"text": "...", "chat_id": "..."}`. Bound to loopback only.
 - **Bot-layer control commands** — `/ctx` (context usage), `/clear` (clear context), `/restart` (restart the agent). The bot process drives these directly via tmux, so they keep working even when the agent is wedged or dead. Restricted to paired owners.
 - **Startup notice** — after a restart, the bot messages the paired owner(s) that the agent is back, listing loaded plugin versions and flagging any that changed across the restart. Claimed atomically, so multi-channel setups send exactly one notice.
-- **Busy-gate delivery** — inbound and scheduler messages are queued and flushed one at a time, only when the agent's pane is idle. Prevents mid-turn deliveries from orphaning unsubmitted in the input box.
 - **Read receipt** — inbound messages get an emoji reaction (default 👀) as a "seen" ack. Configure via `ackReaction` in `access.json` (see [ACCESS.md](./ACCESS.md)).
 - **Orphan watchdog** — the server exits when its parent agent process dies (plus SIGHUP handling), so no stale bot process lingers holding the token.
 
