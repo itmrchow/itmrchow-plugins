@@ -21,9 +21,11 @@ import { join } from 'node:path'
 import { loadTokens, resolveService } from './auth'
 import { createBodyCollector } from './body'
 import { parseInjectBody, REPLY_CHANNELS, type ChannelDelivery } from './inject'
+import { resolveInjectHost } from './inject-host'
 import { resolveInjectPort } from './inject-port'
 
 const DEFAULT_PORT = 7844
+const DEFAULT_HOST = '127.0.0.1'
 const HTTP_OK = 200
 const HTTP_UNAUTHORIZED = 401
 const HTTP_NOT_FOUND = 404
@@ -39,6 +41,12 @@ const INTERNAL_INJECT_PORT = resolveInjectPort(
   DEFAULT_PORT,
   'INTERNAL_INJECT_PORT',
 )
+
+// Bind host is controlled by INTERNAL_INJECT_HOST, defaulting to loopback. Exposing
+// this beyond localhost is a deliberate deployment decision with its own threat
+// model (JP-153/OP-8688): the token is an identity, not a firewall, so a non-loopback
+// bind must be paired with a network-level source restriction.
+const INTERNAL_INJECT_HOST = resolveInjectHost(process.env.INTERNAL_INJECT_HOST, DEFAULT_HOST)
 
 const STATE_DIR = process.env.INTERNAL_INJECT_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'internal-inject')
 const TOKENS_FILE = join(STATE_DIR, 'tokens.json')
@@ -95,8 +103,9 @@ async function deliverToChannel({ content, meta }: ChannelDelivery): Promise<voi
 
 await mcp.connect(new StdioServerTransport())
 
-// Loopback only. Exposing this beyond localhost is a separate decision with a
-// separate threat model (see OP-8688) — the token is an identity, not a firewall.
+// Binds INTERNAL_INJECT_HOST (default 127.0.0.1). Exposing this beyond localhost is
+// a deliberate deployment decision with a separate threat model (JP-153/OP-8688) —
+// the token is an identity, not a firewall.
 createServer((req, res) => {
   if (req.method !== 'POST' || (req.url ?? '') !== '/inject') {
     res.writeHead(HTTP_NOT_FOUND)
@@ -154,7 +163,7 @@ createServer((req, res) => {
     res.writeHead(HTTP_OK)
     res.end('ok')
   })
-}).listen(INTERNAL_INJECT_PORT, '127.0.0.1')
+}).listen(INTERNAL_INJECT_PORT, INTERNAL_INJECT_HOST)
 
 // Boot-time token check is a WARNING, never an exit. An exit leaves nobody
 // listening on the inject port, and the claude-tg-agent watchdog reads an unbound
@@ -170,6 +179,6 @@ if (boot.problem) {
   process.stderr.write(`internal-inject channel: ${boot.entries.length} service token(s) loaded from ${TOKENS_FILE}\n`)
 }
 process.stderr.write(
-  `internal-inject channel: inject endpoint listening on 127.0.0.1:${INTERNAL_INJECT_PORT} ` +
+  `internal-inject channel: inject endpoint listening on ${INTERNAL_INJECT_HOST}:${INTERNAL_INJECT_PORT} ` +
   `(reply_via: ${REPLY_CHANNELS.join(', ')})\n`,
 )
