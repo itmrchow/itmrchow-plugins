@@ -92,6 +92,7 @@ missing token file would otherwise turn into an endless restart loop.
 | Env | Default | Purpose |
 |---|---|---|
 | `INTERNAL_INJECT_PORT` | `7844` | Port for the `/inject` listener. Must match `INTERNAL_INJECT_PORT` in `claude-tg-agent/scripts/lib-channels.sh`, which the watchdog probes. |
+| `INTERNAL_INJECT_HOST` | `127.0.0.1` | Interface the `/inject` listener binds to. Defaults to loopback; binding beyond localhost (e.g. a VM-internal IP) is a deliberate deployment decision — the token is an identity, not a firewall, so a non-loopback bind must be paired with a network-level source restriction (JP-153/OP-8688). |
 | `INTERNAL_INJECT_STATE_DIR` | `~/.claude/channels/internal-inject` | Where `tokens.json` lives. |
 
 The token itself is **never** passed through the environment: the launcher exports
