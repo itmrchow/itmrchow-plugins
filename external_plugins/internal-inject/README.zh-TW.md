@@ -86,6 +86,7 @@ bash scripts/internal-inject-token.sh revoke stock-monitor
 | Env | 預設 | 用途 |
 |---|---|---|
 | `INTERNAL_INJECT_PORT` | `7844` | `/inject` listener 的 port。必須與 `claude-tg-agent/scripts/lib-channels.sh` 的 `INTERNAL_INJECT_PORT` 一致，watchdog 探測的就是這個號。 |
+| `INTERNAL_INJECT_HOST` | `127.0.0.1` | `/inject` listener 綁定的介面。預設 loopback；綁到 localhost 以外（例如 VM 內網 IP）是刻意的部署決策 —— token 是身分憑證而非防火牆，綁非 loopback 位址必須搭配網路層的來源限制（JP-153/OP-8688）。 |
 | `INTERNAL_INJECT_STATE_DIR` | `~/.claude/channels/internal-inject` | `tokens.json` 的位置。 |
 
 token 本身**絕不走 env**：launcher 會把 `.env` export 進每一個 channel plugin 的 MCP
