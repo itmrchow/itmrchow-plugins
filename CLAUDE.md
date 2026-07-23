@@ -8,7 +8,7 @@ fork 自 Anthropic 官方 plugin 目錄的個人 marketplace。`plugins/` 多為
 
 **merge 前必須 bump 版本號**：在該次 PR 內改 `plugins/im-session-ops/.claude-plugin/plugin.json` 的 `version`。漏 bump 則 `claude plugin update` 判定「已是最新」直接跳過，快取原封不動 —— 成果對任何 agent 都不生效。
 
-版號規則（semver）：破壞相容改 major；新增能力改 minor；純修字 / bugfix 改 patch。
+版號規則（semver）：破壞相容改 major；新增能力改 minor；純修字 / bugfix 改 patch。判準單位：major = 破壞相容；minor = 新增功能；patch = 非新功能、對既有功能的調整。
 
 ## PR base 防呆（本 repo 是 fork）
 

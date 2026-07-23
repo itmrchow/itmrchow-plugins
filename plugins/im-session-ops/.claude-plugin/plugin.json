@@ -1,7 +1,7 @@
 {
   "name": "im-session-ops",
   "description": "IM session 維運指令：clear / rename / resume 三個 skill 加 im-send 發訊器，多 channel（Telegram / Discord）多 agent 共用。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "itmrchow",
     "email": "itmrchow@gmail.com"
