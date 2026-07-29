@@ -92,6 +92,19 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+## Invite tokens
+
+Pairing is pull-shaped: a stranger arrives, the bot mints a code, a human approves after the fact. Invites are the opposite — an **admin** mints a token up front, hands it out, and whoever redeems it is admitted with no further approval step.
+
+Redemption is `/start <token>` in a DM, usually reached by tapping a deep-link `https://t.me/<bot>?start=<token>` (Telegram sends the command automatically). A valid token puts the sender into `allowFrom` and clears any pairing code they were waiting on.
+
+Every failure is a **silent drop** — unknown, expired, and revoked tokens all get no reply, so the endpoint cannot be used to probe which tokens exist. Redemption is also disabled entirely under `TELEGRAM_ACCESS_MODE=static`, since static mode never writes `access.json` and an admitted sender would be blocked on their next message; the server logs a warning at boot when invites are present.
+
+Tokens are managed from an admin's DM via the `im-invite` skill (`im-session-ops` plugin): `create` / `revoke` / `list`. Two properties are deliberate and permanent:
+
+- **`admins` is read-only to every program.** The first admin is set by editing `access.json` by hand. No code path and no skill adds one, so a redeemed invite can never be escalated into admin rights through conversation.
+- **Revoking a token is not the same as removing the people who used it.** `revoke` stops future redemptions and leaves a tombstone (`revokedAt`, pruned after 30 days); existing members stay in `allowFrom` until removed with `/telegram:access remove <id>`. `usedBy` records who came in on which token.
+
 ## Skill reference
 
 | Command | Effect |
@@ -128,6 +141,30 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
       "allowFrom": []
     }
   },
+
+  // Per-platform admin user IDs — who may mint invites via the im-invite
+  // skill. Hand-edited only; the server and every skill treat this as
+  // read-only. Optional; absent = nobody can mint invites.
+  "admins": { "telegram": ["412587349"] },
+
+  // Invite tickets, keyed by token. Written by the im-invite skill.
+  "invites": {
+    "a1b2c3d4e5f60718293a4b5c6d7e8f90": {
+      "note": "for Bob",
+      "createdAt": 1700000000000,
+      "createdBy": "telegram:412587349",
+      // Required, epoch ms. There is no never-expiring invite.
+      "expiresAt": 1700604800000,
+      // Who redeemed it, bucketed by platform.
+      "usedBy": { "telegram": ["987654321"] },
+      // Tombstone. Non-null blocks redemption; the key is kept for 30 days.
+      "revokedAt": null
+    }
+  },
+
+  // The bot's @username, backfilled by the server once known. Lets the
+  // im-invite skill build deep-links without reading the bot token.
+  "botUsername": "myclaudebot",
 
   // Case-insensitive regexes that count as a mention.
   "mentionPatterns": ["^hey claude\\b"],
