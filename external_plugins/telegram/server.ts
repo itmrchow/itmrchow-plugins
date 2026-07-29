@@ -33,6 +33,13 @@ import { buildReplyMeta } from './reply-meta'
 import { resolveInjectPort } from './inject-port'
 import { resolvePollMode } from './poll-mode'
 import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS } from './invite'
+import {
+  migrateInvitesFromAccess,
+  readInvites,
+  readLegacyAccessInvites,
+  resolveInvitesFile,
+  saveInvites,
+} from './invites-file'
 import { defaultAccess, pickAccessFields, type Access } from './access-schema'
 import { BOT_COMMANDS } from './bot-commands'
 
@@ -114,6 +121,11 @@ let botUsername = ''
 // .env load above so TELEGRAM_POLL_MODE set there is honoured.
 const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
 
+// Invites are shared with every other channel, so this deliberately sits
+// outside STATE_DIR — see invites-file.ts. Resolved after the state .env load
+// above so an INVITES_FILE override set there is honoured.
+const INVITES_FILE = resolveInvitesFile(process.env, homedir())
+
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
@@ -121,12 +133,26 @@ const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 // document. Claude can already Read+paste file contents, so this isn't a new
 // exfil channel for arbitrary paths — but the server's own state is the one
 // thing Claude has no reason to ever send.
-function assertSendable(f: string): void {
-  let real, stateReal: string
+function realpathOrNull(p: string): string | null {
   try {
-    real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return } // statSync will fail properly; or STATE_DIR absent → nothing to leak
+    return realpathSync(p)
+  } catch {
+    return null
+  }
+}
+
+function assertSendable(f: string): void {
+  const real = realpathOrNull(f)
+  if (real === null) return // statSync will fail properly
+  // The shared invites file is NOT under STATE_DIR — it belongs to no single
+  // platform (invites-file.ts) — so the prefix test below cannot cover it. Its
+  // contents are bearer tokens, i.e. the same class of secret as .env, so it
+  // gets its own explicit check rather than being left outside the guard.
+  if (real === realpathOrNull(INVITES_FILE)) {
+    throw new Error(`refusing to send channel state: ${f}`)
+  }
+  const stateReal = realpathOrNull(STATE_DIR)
+  if (stateReal === null) return // STATE_DIR absent → nothing to leak
   const inbox = join(stateReal, 'inbox')
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
@@ -162,7 +188,7 @@ const BOOT_ACCESS: Access | null = STATIC
         )
         a.dmPolicy = 'allowlist'
       }
-      if (a.invites && Object.keys(a.invites).length > 0) {
+      if (Object.keys(readInvites(INVITES_FILE)).length > 0) {
         process.stderr.write(
           'telegram channel: static mode — invite redemption disabled (/start <token> is a no-op)\n',
         )
@@ -192,6 +218,22 @@ function saveAccess(a: Access): void {
   writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
   renameSync(tmp, ACCESS_FILE)
 }
+
+// Invites used to live inside access.json. ACCESS_FIELDS no longer lists the
+// field, so anything left there would be dropped by the first saveAccess() —
+// silently and permanently. Hence a boot-time move rather than a deployment
+// checklist step. It must sit above every saveAccess() caller, and it is
+// idempotent, so whichever channel starts first does the work.
+migrateInvitesFromAccess({
+  isStatic: STATIC,
+  readLegacy: () => readLegacyAccessInvites(ACCESS_FILE),
+  readShared: () => readInvites(INVITES_FILE),
+  saveShared: invites => { saveInvites(INVITES_FILE, invites) },
+  // Rewriting through the whitelist is what drops the field: pickAccessFields
+  // no longer keeps `invites`, so the round-trip removes it.
+  stripLegacy: () => { saveAccess(readAccessFile()) },
+  warn: m => { process.stderr.write(m) },
+})
 
 function pruneExpired(a: Access): boolean {
   const now = Date.now()
@@ -225,13 +267,24 @@ function persistBotUsername(username: string): void {
   }
 }
 
+// Revoked tombstones live in the shared invites file, so this persists itself
+// rather than reporting up to the caller's saveAccess() — the two halves of the
+// old pruneStale() now write different files.
+function pruneStaleInvites(): void {
+  if (STATIC) return
+  const invites = readInvites(INVITES_FILE)
+  if (!pruneRevoked(invites, Date.now(), REVOKED_RETENTION_MS)) return
+  try {
+    saveInvites(INVITES_FILE, invites)
+  } catch (err) {
+    process.stderr.write(`telegram channel: failed to prune revoked invites: ${err}\n`)
+  }
+}
+
 // Both kinds of garbage collection ride the same inbound hook — no extra timer.
 function pruneStale(a: Access): boolean {
-  const prunedPending = pruneExpired(a)
-  const prunedInvites = a.invites
-    ? pruneRevoked(a.invites, Date.now(), REVOKED_RETENTION_MS)
-    : false
-  return prunedPending || prunedInvites
+  pruneStaleInvites()
+  return pruneExpired(a)
 }
 
 type GateResult =
@@ -832,7 +885,7 @@ function redeemInvite(ctx: Context, token: string): boolean {
     // /start <anything>, and the branch is reachable without dmCommandGate
     // (A2), so an unconditional write would be a cheap log-flood surface
     // that reads like a security event. Never log the token itself (A3).
-    if (Object.keys(BOOT_ACCESS?.invites ?? {}).length > 0) {
+    if (Object.keys(readInvites(INVITES_FILE)).length > 0) {
       process.stderr.write(
         'telegram channel: static mode — ignoring an invite redemption attempt\n',
       )
@@ -842,9 +895,9 @@ function redeemInvite(ctx: Context, token: string): boolean {
   if (!ctx.from) return false
   const senderId = String(ctx.from.id)
 
-  // Re-read rather than reusing any caller's copy: the im-invite skill is a
-  // separate process writing the same file, and a stale object would clobber
-  // a token it minted seconds ago.
+  // Re-read rather than reusing any caller's copy: the im-invite skill and the
+  // other channel's server are separate processes writing these same files, and
+  // a stale object would clobber a token minted seconds ago.
   const access = readAccessFile()
   // 'disabled' means the bot does nothing in DMs, so the token's validity must
   // not even be evaluated. Skipping this check would still write the sender
@@ -852,25 +905,40 @@ function redeemInvite(ctx: Context, token: string): boolean {
   // operator switches back to pairing/allowlist that person is already on the
   // list, admitted without review and with nothing in the record to show it.
   if (access.dmPolicy === 'disabled') return false
-  const invites = access.invites ?? {}
+  const invites = readInvites(INVITES_FILE)
   if (!checkInvite(invites, token, Date.now()).ok) return false
 
-  let changed = applyBind(invites[token], 'telegram', senderId)
+  const bound = applyBind(invites[token], 'telegram', senderId)
+  let accessChanged = false
   if (!access.allowFrom.includes(senderId)) {
     access.allowFrom.push(senderId)
-    changed = true
+    accessChanged = true
   }
   // Any pairing code this sender was waiting on is now dead weight.
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId !== senderId) continue
     delete access.pending[code]
-    changed = true
+    accessChanged = true
   }
 
   // Persist before replying: a failed write plus a sent welcome would leave
   // someone believing they have access they don't have. Re-redeeming an
   // already-redeemed token changes nothing and still gets the welcome.
-  if (!changed) return true
+  //
+  // Two files now, and the order is load-bearing. usedBy first: if the second
+  // write then fails the sender is not in allowFrom but the redemption is on
+  // record, and redeeming again fixes it (applyBind returns false, allowFrom
+  // still gets written). The reverse order would admit someone with no
+  // redemption record — an audit gap that never self-heals.
+  if (bound) {
+    try {
+      saveInvites(INVITES_FILE, invites)
+    } catch (err) {
+      process.stderr.write(`telegram channel: invite bind failed to save: ${err}\n`)
+      return false
+    }
+  }
+  if (!accessChanged) return true
   try {
     saveAccess(access)
   } catch (err) {
