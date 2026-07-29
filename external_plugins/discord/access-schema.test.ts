@@ -92,23 +92,22 @@ describe('pickAccessFields', () => {
     expect(pickAccessFields({}).allowFrom).toEqual([])
   })
 
-  test('preserves admins and invites, the fields whose loss is silent', () => {
+  test('preserves admins, the field whose loss is silent', () => {
     const input: Partial<Access> = {
       dmPolicy: 'pairing',
       allowFrom: ['6083473232'],
       admins: { discord: ['6083473232'] },
-      invites: {
-        tok: {
-          createdAt: 1,
-          createdBy: 'discord:6083473232',
-          expiresAt: 2,
-          usedBy: { discord: ['111'] },
-          revokedAt: null,
-        },
-      },
     }
     const out = pickAccessFields(input)
     expect(out.admins).toEqual({ discord: ['6083473232'] })
-    expect(out.invites?.tok.usedBy).toEqual({ discord: ['111'] })
+  })
+
+  test('drops a legacy invites field — invites moved to the shared file', () => {
+    // A deployment that predates the move still has this on disk. Dropping it
+    // here is intentional and safe only because migrateInvitesFromAccess()
+    // rescues the tokens at boot, before anything writes access.json.
+    const legacy = { dmPolicy: 'pairing', allowFrom: [], invites: { tok: {} } }
+    const out = pickAccessFields(legacy as Partial<Access>)
+    expect(Object.keys(out)).not.toContain('invites')
   })
 })
