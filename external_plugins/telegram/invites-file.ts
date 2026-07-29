@@ -211,7 +211,17 @@ export function migrateInvitesFromAccess(deps: MigrateDeps): boolean {
     deps.stripLegacy()
     return moved
   } catch (err) {
-    deps.warn(`invites: migration from access.json failed, leaving it in place: ${err}\n`)
+    // access.json is left untouched, but `invites` is no longer a field the
+    // access schema keeps — so the next write of that file drops it silently.
+    // Nothing here can prevent that without blocking the channel from booting,
+    // which an auxiliary feature has no business doing. Say plainly what the
+    // operator has to do instead.
+    deps.warn(
+      `invites: migration from access.json FAILED: ${err}\n` +
+      'invites: BACK UP the channel access.json NOW, before this channel writes ' +
+      'to it again. The invites still inside it are no longer part of the access ' +
+      'schema, so the next write drops them permanently and without warning.\n',
+    )
     return false
   }
 }

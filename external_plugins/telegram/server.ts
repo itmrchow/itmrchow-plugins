@@ -32,7 +32,7 @@ import { sanitizeMetaText } from './meta-text'
 import { buildReplyMeta } from './reply-meta'
 import { resolveInjectPort } from './inject-port'
 import { resolvePollMode } from './poll-mode'
-import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS } from './invite'
+import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS, type Invite } from './invite'
 import {
   migrateInvitesFromAccess,
   readInvites,
@@ -176,6 +176,15 @@ function readAccessFile(): Access {
   }
 }
 
+// Boot snapshot of the shared invites file, used only to decide whether static
+// mode is worth warning about. Static mode never writes, so a fresh read would
+// return the same thing forever; dynamic mode reads fresh at every use and has
+// nothing to snapshot. Taking it once also keeps /start off an unconditional
+// file read — that command runs ahead of the gate, so anyone can trigger it.
+const BOOT_INVITES: Record<string, Invite> | undefined = STATIC
+  ? readInvites(INVITES_FILE)
+  : undefined
+
 // In static mode, access is snapshotted at boot and never re-read or written.
 // Pairing requires runtime mutation, so it's downgraded to allowlist with a
 // startup warning — handing out codes that never get approved would be worse.
@@ -188,7 +197,7 @@ const BOOT_ACCESS: Access | null = STATIC
         )
         a.dmPolicy = 'allowlist'
       }
-      if (Object.keys(readInvites(INVITES_FILE)).length > 0) {
+      if (Object.keys(BOOT_INVITES ?? {}).length > 0) {
         process.stderr.write(
           'telegram channel: static mode — invite redemption disabled (/start <token> is a no-op)\n',
         )
@@ -885,7 +894,7 @@ function redeemInvite(ctx: Context, token: string): boolean {
     // /start <anything>, and the branch is reachable without dmCommandGate
     // (A2), so an unconditional write would be a cheap log-flood surface
     // that reads like a security event. Never log the token itself (A3).
-    if (Object.keys(readInvites(INVITES_FILE)).length > 0) {
+    if (Object.keys(BOOT_INVITES ?? {}).length > 0) {
       process.stderr.write(
         'telegram channel: static mode — ignoring an invite redemption attempt\n',
       )
