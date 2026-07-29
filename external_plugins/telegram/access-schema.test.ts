@@ -42,12 +42,22 @@ describe('pickAccessFields', () => {
     expect(Object.keys(out).sort()).toEqual([...ACCESS_FIELDS].sort())
   })
 
-  test('drops unknown fields instead of passing them through', () => {
-    const input = { ...allFieldsPresent(), evilKey: 'nope', __proto__: 'nope' }
-    const out = pickAccessFields(input as Partial<Access>) as unknown as Record<string, unknown>
+  test('drops unknown fields, including a genuine __proto__ own property', () => {
+    // Built with JSON.parse, not an object literal: `__proto__:` in a literal
+    // is a prototype setter, so the key never becomes an own property and this
+    // test would pass without exercising anything. JSON.parse is also the
+    // exact shape readAccessFile() feeds in.
+    const hostile = JSON.parse('{"__proto__":{"polluted":1},"evilKey":"nope"}')
+    // Guards the guard — if this ever goes false the test below is vacuous.
+    expect(Object.hasOwn(hostile, '__proto__')).toBe(true)
+
+    const input = Object.assign(hostile, allFieldsPresent()) as Partial<Access>
+    const out = pickAccessFields(input) as unknown as Record<string, unknown>
+
     expect(out).not.toHaveProperty('evilKey')
-    expect(Object.keys(out)).toEqual(expect.arrayContaining([...ACCESS_FIELDS]))
-    expect(Object.keys(out).length).toBe(ACCESS_FIELDS.length)
+    expect(Object.hasOwn(out, '__proto__')).toBe(false)
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+    expect(Object.keys(out).sort()).toEqual([...ACCESS_FIELDS].sort())
   })
 
   test('defaults the four required fields when given an empty object', () => {

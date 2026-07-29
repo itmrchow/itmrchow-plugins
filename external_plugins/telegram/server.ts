@@ -824,13 +824,19 @@ setInterval(() => {
  */
 function redeemInvite(ctx: Context, token: string): boolean {
   // Static mode never writes access.json, so a "bound" sender would be blocked
-  // on their very next message. Dropping is the honest outcome. Logged every
-  // time, not just at boot: an admin who mints a token after startup gets no
-  // other signal that redemption is silently dead. Never log the token itself.
+  // on their very next message. Dropping is the honest outcome.
   if (STATIC) {
-    process.stderr.write(
-      'telegram channel: static mode — ignoring an invite redemption attempt\n',
-    )
+    // Log only where there are invites to fail — that's the case worth
+    // warning about: an admin minted a token after boot and it silently
+    // cannot work. With none configured this is just a stranger typing
+    // /start <anything>, and the branch is reachable without dmCommandGate
+    // (A2), so an unconditional write would be a cheap log-flood surface
+    // that reads like a security event. Never log the token itself (A3).
+    if (Object.keys(BOOT_ACCESS?.invites ?? {}).length > 0) {
+      process.stderr.write(
+        'telegram channel: static mode — ignoring an invite redemption attempt\n',
+      )
+    }
     return false
   }
   if (!ctx.from) return false
