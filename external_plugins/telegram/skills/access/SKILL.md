@@ -42,7 +42,7 @@ path in this skill (`access.json`, `approved/`) is relative to `<STATE_DIR>`.
 
 `<STATE_DIR>/access.json`:
 
-```json
+```jsonc
 {
   "dmPolicy": "pairing",
   "allowFrom": ["<senderId>", ...],
@@ -55,9 +55,27 @@ path in this skill (`access.json`, `approved/`) is relative to `<STATE_DIR>`.
       "createdAt": <ms>, "expiresAt": <ms>
     }
   },
-  "mentionPatterns": ["@mybot"]
+  "mentionPatterns": ["@mybot"],
+
+  // READ-ONLY. Admin user IDs, per platform. Hand-edited by a human only:
+  // no code path and no skill ever adds an entry, which is what stops a
+  // redeemed invite from being escalated into admin rights. Preserve it
+  // verbatim on every write. Never add, remove, or reorder entries — not
+  // even when asked to.
+  "admins": { "<platform>": ["<userId>"] }
 }
 ```
+
+The shape above is a **field reference, not a template**. Real files carry
+delivery settings (`ackReaction`, `replyToMode`, `textChunkLimit`,
+`chunkMode`) and the bot's `botUsername`, all of which are none of this
+skill's business and are absent here on purpose.
+
+Invite tokens are **not** in this file. They live in the shared, cross-platform
+`~/.claude/channels/invites.json`, managed by the `im-invite` skill. This skill
+never reads or writes them. An older deployment may still show an `invites` key
+here — leave it exactly as found; the channel server migrates it on its next
+boot.
 
 Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 
@@ -136,6 +154,12 @@ Read, set the key, write, confirm.
 
 - **Always** Read the file before Write — the channel server may have added
   pending entries. Don't clobber.
+- **Preserve the whole file.** Write back everything you Read, changing only
+  the specific key the command targets. Do not rebuild the object from the
+  State shape above, do not drop keys you don't recognize, do not reorder or
+  "tidy" anything. The State shape lists the fields this skill acts on, not
+  the fields a real file contains — rebuilding from it silently deletes
+  `admins`, delivery settings, and anything a future version adds.
 - Pretty-print the JSON (2-space indent) so it's hand-editable.
 - The channels dir might not exist if the server hasn't run yet — handle
   ENOENT gracefully and create defaults.
