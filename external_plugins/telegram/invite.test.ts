@@ -50,6 +50,13 @@ describe('checkInvite', () => {
   test('accepts a live token', () => {
     expect(checkInvite({ tok: makeInvite() }, 'tok', NOW)).toEqual({ ok: true })
   })
+
+  test('rejects inherited Object keys as unknown, not by luck of another check', () => {
+    const invites = { tok: makeInvite() }
+    for (const key of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+      expect(checkInvite(invites, key, NOW)).toEqual({ ok: false, reason: 'unknown' })
+    }
+  })
 })
 
 describe('applyBind', () => {

@@ -59,8 +59,12 @@ export function checkInvite(
   token: string,
   now: number,
 ): InviteCheck {
+  // hasOwn, not a truthiness check: the token is attacker-supplied, and a
+  // plain lookup of '__proto__' or 'constructor' yields an inherited object
+  // rather than undefined. The revoked check below happens to reject those
+  // today, but that is coincidence, not intent.
+  if (!Object.hasOwn(invites, token)) return { ok: false, reason: 'unknown' }
   const invite = invites[token]
-  if (!invite) return { ok: false, reason: 'unknown' }
   // Revoked wins over expired: an admin pulling a token is the more specific
   // fact, and it stays true after the token would have expired anyway.
   if (invite.revokedAt !== null) return { ok: false, reason: 'revoked' }
@@ -87,8 +91,9 @@ export function applyBind(invite: Invite, platform: string, senderId: string): b
 /**
  * Drop revoked tombstones older than the retention window, in place.
  *
- * Never touches un-revoked invites — expired-but-live ones are kept so `list`
- * can still explain why a token stopped working.
+ * Never touches un-revoked invites, including expired ones: `usedBy` records
+ * which ticket admitted which member, and that has to outlive the ticket or
+ * nobody can answer where an existing member came from.
  *
  * @param invites All known invites, keyed by token.
  * @param now Current time, epoch ms.
