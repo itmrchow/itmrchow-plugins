@@ -824,8 +824,15 @@ setInterval(() => {
  */
 function redeemInvite(ctx: Context, token: string): boolean {
   // Static mode never writes access.json, so a "bound" sender would be blocked
-  // on their very next message. Dropping is the honest outcome.
-  if (STATIC) return false
+  // on their very next message. Dropping is the honest outcome. Logged every
+  // time, not just at boot: an admin who mints a token after startup gets no
+  // other signal that redemption is silently dead. Never log the token itself.
+  if (STATIC) {
+    process.stderr.write(
+      'telegram channel: static mode — ignoring an invite redemption attempt\n',
+    )
+    return false
+  }
   if (!ctx.from) return false
   const senderId = String(ctx.from.id)
 
@@ -873,6 +880,11 @@ bot.command('start', async ctx => {
   // attempt, and only that path can drop silently.
   const token = (ctx.match ?? '').trim()
   if (token) {
+    // NOT redundant with dmCommandGate's identical check — this branch
+    // deliberately never reaches dmCommandGate (see redeemInvite). grammy's
+    // bot.command() fires in groups too, so this is the only thing stopping
+    // any group member from redeeming a token in-channel. Do not delete it as
+    // dead defensive code.
     if (ctx.chat?.type !== 'private') return
     if (!redeemInvite(ctx, token)) return
     await ctx.reply(`You're in. Just message me here and Claude will pick it up.`)
