@@ -48,6 +48,9 @@ import { parseInjectBody, type ChannelDelivery } from './inject'
 import { sanitizeMetaText } from './meta-text'
 import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
 import { resolveInjectPort } from './inject-port'
+import { pruneRevoked, REVOKED_RETENTION_MS } from './invite'
+import { defaultAccess, pickAccessFields, type Access } from './access-schema'
+import { parseStartToken, redeemInvite, type RedeemDeps } from './invite-redeem'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -113,47 +116,6 @@ const client = new Client({
   partials: [Partials.Channel],
 })
 
-type PendingEntry = {
-  senderId: string
-  chatId: string // DM channel ID — where to send the approval confirm
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-type GroupPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
-  allowFrom: string[]
-  /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
-  groups: Record<string, GroupPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  // delivery/UX config — optional, defaults live in the reply handler
-  /** Emoji to react with on receipt. Empty string disables. Unicode char or custom emoji ID. */
-  ackReaction?: string
-  /** Which chunks get Discord's reply reference when reply_to is passed. Default: 'first'. 'off' = never thread. */
-  replyToMode?: 'off' | 'first' | 'all'
-  /** Max chars per outbound message before splitting. Default: 2000 (Discord's hard cap). */
-  textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
-  chunkMode?: 'length' | 'newline'
-}
-
-function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    groups: {},
-    pending: {},
-    ackReaction: '👀',
-  }
-}
-
 const MAX_CHUNK_LIMIT = 2000
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
@@ -177,17 +139,10 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-    }
+    // The field whitelist lives in access-schema.ts and is the only rebuild
+    // path — do not reintroduce a second one here. A field it doesn't list is
+    // dropped on the next write, which is how admins/invites would vanish.
+    return pickAccessFields(parsed)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
@@ -237,6 +192,24 @@ function pruneExpired(a: Access): boolean {
   return changed
 }
 
+// Both kinds of garbage collection ride the same inbound hook — no extra timer.
+function pruneStale(a: Access): boolean {
+  const prunedPending = pruneExpired(a)
+  const prunedInvites = a.invites
+    ? pruneRevoked(a.invites, Date.now(), REVOKED_RETENTION_MS)
+    : false
+  return prunedPending || prunedInvites
+}
+
+const REDEEM_DEPS: RedeemDeps = {
+  readAccess: readAccessFile,
+  saveAccess,
+  now: Date.now,
+  isStatic: STATIC,
+  bootInvites: BOOT_ACCESS?.invites,
+  warn: m => { process.stderr.write(m) },
+}
+
 type GateResult =
   | { action: 'deliver'; access: Access }
   | { action: 'drop' }
@@ -260,7 +233,7 @@ function noteSent(id: string): void {
 
 async function gate(msg: Message): Promise<GateResult> {
   const access = loadAccess()
-  const pruned = pruneExpired(access)
+  const pruned = pruneStale(access)
   if (pruned) saveAccess(access)
 
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
@@ -1020,6 +993,21 @@ async function handleControlCommand(cmd: ControlCommand, msg: Message): Promise<
 }
 
 async function handleInbound(msg: Message): Promise<void> {
+  // Invite redemption runs BEFORE gate(): under 'allowlist' the gate drops
+  // every stranger, and under 'pairing' it mints them a code to wait on —
+  // and a stranger holding a valid token is exactly who this is for.
+  const inviteToken = parseStartToken(msg.content)
+  if (inviteToken !== null) {
+    // Not dead defensive code, and not redundant with gate()'s own DM check —
+    // this branch deliberately never reaches gate(), so this line is the only
+    // thing stopping any guild member from redeeming a token in-channel. It
+    // also keeps the token out of the agent's session context. Do not delete.
+    if (msg.channel.type !== ChannelType.DM) return
+    if (!redeemInvite(REDEEM_DEPS, msg.author.id, inviteToken)) return
+    await msg.reply(`You're in. Just message me here and Claude will pick it up.`)
+    return
+  }
+
   const result = await gate(msg)
 
   if (result.action === 'drop') return

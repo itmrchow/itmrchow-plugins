@@ -89,6 +89,20 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+## Invite tokens
+
+Pairing is pull-shaped: a stranger arrives, the bot mints a code, a human approves after the fact. Invites are the opposite — an **admin** mints a token up front, hands it out, and whoever redeems it is admitted with no further approval step.
+
+Redemption is `/start <token>` sent as a DM to the bot. Discord has no deep-link mechanism and no command router, so the holder types the token by hand and the server prefix-matches the plain text. The match is strict — exactly 32 lowercase hex characters, nothing before or after — so an ordinary message that happens to begin with `/start ` is still handled normally. A valid token puts the sender's **user snowflake** into `allowFrom` and clears any pairing code they were waiting on.
+
+Every failure is a **silent drop** — unknown, expired, and revoked tokens all get no reply, so this cannot be used to probe which tokens exist. Redemption in a guild channel is refused outright; only DMs count. It is also disabled entirely under `DISCORD_ACCESS_MODE=static`, since static mode never writes `access.json` and an admitted sender would be blocked on their next message; the server logs a warning when invites are configured.
+
+Tokens are managed from an admin's DM via the `im-invite` skill (`im-session-ops` plugin): `create` / `revoke` / `list`. Three properties are deliberate and permanent:
+
+- **`admins` is read-only to every program.** The first admin is set by editing `access.json` by hand. No code path and no skill adds one, so a redeemed invite can never be escalated into admin rights through conversation.
+- **Revoking a token is not the same as removing the people who used it.** `revoke` stops future redemptions and leaves a tombstone (`revokedAt`, pruned after 30 days); existing members stay in `allowFrom` until removed with `/discord:access remove <id>`. `usedBy` records who came in on which token.
+- **`usedBy` is bucketed per platform.** The same token carried across to a Telegram deployment redeems independently there; one side's redemption never overwrites the other's record.
+
 ## Skill reference
 
 | Command | Effect |
@@ -138,6 +152,25 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   "textChunkLimit": 2000,
 
   // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  "chunkMode": "newline",
+
+  // Admin user snowflakes, per platform. Hand-edited only — no code path
+  // and no skill ever adds an entry here.
+  "admins": { "discord": ["184695080709324800"] },
+
+  // Invite tickets, keyed by token. Written by the im-invite skill.
+  "invites": {
+    "a1b2c3d4e5f60718293a4b5c6d7e8f90": {
+      "note": "for Bob",
+      "createdAt": 1700000000000,
+      "createdBy": "discord:184695080709324800",
+      // Required, epoch ms. There is no never-expiring invite.
+      "expiresAt": 1700604800000,
+      // Who redeemed it, bucketed by platform.
+      "usedBy": { "discord": ["987654321098765432"] },
+      // Tombstone. Non-null blocks redemption; the key is kept for 30 days.
+      "revokedAt": null
+    }
+  }
 }
 ```
