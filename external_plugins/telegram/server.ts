@@ -32,13 +32,8 @@ import { sanitizeMetaText } from './meta-text'
 import { buildReplyMeta } from './reply-meta'
 import { resolveInjectPort } from './inject-port'
 import { resolvePollMode } from './poll-mode'
-import {
-  applyBind,
-  checkInvite,
-  pruneRevoked,
-  REVOKED_RETENTION_MS,
-  type Invite,
-} from './invite'
+import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS } from './invite'
+import { defaultAccess, pickAccessFields, type Access } from './access-schema'
 import { BOT_COMMANDS } from './bot-commands'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -119,56 +114,6 @@ let botUsername = ''
 // .env load above so TELEGRAM_POLL_MODE set there is honoured.
 const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
 
-type PendingEntry = {
-  senderId: string
-  chatId: string
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-type GroupPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
-  allowFrom: string[]
-  groups: Record<string, GroupPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  // delivery/UX config — optional, defaults live in the reply handler
-  /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
-  ackReaction?: string
-  /** Which chunks get Telegram's reply reference when reply_to is passed. Default: 'first'. 'off' = never thread. */
-  replyToMode?: 'off' | 'first' | 'all'
-  /** Max chars per outbound message before splitting. Default: 4096 (Telegram's hard cap). */
-  textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
-  chunkMode?: 'length' | 'newline'
-  /** Per-platform admin user ids. Written by a human editing this file (or the
-   *  im-invite skill's operator); this process only ever reads it. There is
-   *  deliberately no code path that adds an admin. */
-  admins?: Record<string, string[]>
-  /** Invite tickets, keyed by token. Minted by the im-invite skill, redeemed
-   *  here via /start <token>. */
-  invites?: Record<string, Invite>
-  /** The bot's @username, backfilled once known so the im-invite skill can
-   *  build t.me deep-links without reading the bot token. */
-  botUsername?: string
-}
-
-function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    groups: {},
-    pending: {},
-    ackReaction: '👀',
-  }
-}
-
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
@@ -192,22 +137,9 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-      // Listed explicitly like every other field: this rebuild is a whitelist,
-      // so a field missing here is silently dropped on the next saveAccess().
-      admins: parsed.admins,
-      invites: parsed.invites,
-      botUsername: parsed.botUsername,
-    }
+    // Whitelist rebuild — see access-schema.ts. A field missing from
+    // ACCESS_FIELDS is silently dropped on the next saveAccess().
+    return pickAccessFields(parsed)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try {
