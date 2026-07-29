@@ -32,6 +32,8 @@ import { sanitizeMetaText } from './meta-text'
 import { buildReplyMeta } from './reply-meta'
 import { resolveInjectPort } from './inject-port'
 import { resolvePollMode } from './poll-mode'
+import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS } from './invite'
+import { defaultAccess, pickAccessFields, type Access } from './access-schema'
 import { BOT_COMMANDS } from './bot-commands'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -112,46 +114,6 @@ let botUsername = ''
 // .env load above so TELEGRAM_POLL_MODE set there is honoured.
 const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
 
-type PendingEntry = {
-  senderId: string
-  chatId: string
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-type GroupPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
-  allowFrom: string[]
-  groups: Record<string, GroupPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  // delivery/UX config — optional, defaults live in the reply handler
-  /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
-  ackReaction?: string
-  /** Which chunks get Telegram's reply reference when reply_to is passed. Default: 'first'. 'off' = never thread. */
-  replyToMode?: 'off' | 'first' | 'all'
-  /** Max chars per outbound message before splitting. Default: 4096 (Telegram's hard cap). */
-  textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
-  chunkMode?: 'length' | 'newline'
-}
-
-function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    groups: {},
-    pending: {},
-    ackReaction: '👀',
-  }
-}
-
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
@@ -175,17 +137,9 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-    }
+    // Whitelist rebuild — see access-schema.ts. A field missing from
+    // ACCESS_FIELDS is silently dropped on the next saveAccess().
+    return pickAccessFields(parsed)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try {
@@ -207,6 +161,11 @@ const BOOT_ACCESS: Access | null = STATIC
           'telegram channel: static mode — dmPolicy "pairing" downgraded to "allowlist"\n',
         )
         a.dmPolicy = 'allowlist'
+      }
+      if (a.invites && Object.keys(a.invites).length > 0) {
+        process.stderr.write(
+          'telegram channel: static mode — invite redemption disabled (/start <token> is a no-op)\n',
+        )
       }
       a.pending = {}
       return a
@@ -246,6 +205,35 @@ function pruneExpired(a: Access): boolean {
   return changed
 }
 
+/**
+ * Record the bot's @username in access.json so the im-invite skill can build
+ * `t.me/<bot>?start=<token>` links. The skill reads only access.json — the
+ * username lives nowhere else it may look, since .env holds the bot token and
+ * is off-limits to it.
+ *
+ * @param username The resolved username, without the leading '@'.
+ */
+function persistBotUsername(username: string): void {
+  if (STATIC || !username) return
+  const access = readAccessFile()
+  if (access.botUsername === username) return
+  access.botUsername = username
+  try {
+    saveAccess(access)
+  } catch (err) {
+    process.stderr.write(`telegram channel: failed to record botUsername: ${err}\n`)
+  }
+}
+
+// Both kinds of garbage collection ride the same inbound hook — no extra timer.
+function pruneStale(a: Access): boolean {
+  const prunedPending = pruneExpired(a)
+  const prunedInvites = a.invites
+    ? pruneRevoked(a.invites, Date.now(), REVOKED_RETENTION_MS)
+    : false
+  return prunedPending || prunedInvites
+}
+
 type GateResult =
   | { action: 'deliver'; access: Access }
   | { action: 'drop' }
@@ -253,7 +241,7 @@ type GateResult =
 
 function gate(ctx: Context): GateResult {
   const access = loadAccess()
-  const pruned = pruneExpired(access)
+  const pruned = pruneStale(access)
   if (pruned) saveAccess(access)
 
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
@@ -317,7 +305,7 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
   if (!ctx.from) return null
   const senderId = String(ctx.from.id)
   const access = loadAccess()
-  const pruned = pruneExpired(access)
+  const pruned = pruneStale(access)
   if (pruned) saveAccess(access)
   if (access.dmPolicy === 'disabled') return null
   if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
@@ -537,6 +525,7 @@ createServer((req, res) => {
         if (body.me && !bot.isInited()) {
           bot.botInfo = body.me as typeof bot.botInfo
           botUsername = body.me.username
+          persistBotUsername(botUsername)
         }
         try {
           await bot.handleUpdate(body.update as Parameters<typeof bot.handleUpdate>[0])
@@ -817,7 +806,97 @@ setInterval(() => {
 // groups, (3) spam channels the operator never approved. Silent drop matches
 // the gate's behavior for unrecognized groups.
 
+/**
+ * Redeem `/start <token>` if it carries a valid invite.
+ *
+ * Runs BEFORE dmCommandGate: under dmPolicy 'allowlist' the gate drops every
+ * stranger, which is exactly who an invite is for — gating first would make
+ * redemption impossible in that policy.
+ *
+ * Every failure is a silent drop. A bad token gets no reply at all, so the
+ * endpoint can't be used to probe which tokens exist. The token is never
+ * logged and never reaches handleInbound, so it stays out of stderr and out of
+ * the agent's session context.
+ *
+ * @param ctx The /start update.
+ * @param token The command payload, already trimmed and known non-empty.
+ * @returns Whether the sender was bound (i.e. a welcome should be sent).
+ */
+function redeemInvite(ctx: Context, token: string): boolean {
+  // Static mode never writes access.json, so a "bound" sender would be blocked
+  // on their very next message. Dropping is the honest outcome.
+  if (STATIC) {
+    // Log only where there are invites to fail — that's the case worth
+    // warning about: an admin minted a token after boot and it silently
+    // cannot work. With none configured this is just a stranger typing
+    // /start <anything>, and the branch is reachable without dmCommandGate
+    // (A2), so an unconditional write would be a cheap log-flood surface
+    // that reads like a security event. Never log the token itself (A3).
+    if (Object.keys(BOOT_ACCESS?.invites ?? {}).length > 0) {
+      process.stderr.write(
+        'telegram channel: static mode — ignoring an invite redemption attempt\n',
+      )
+    }
+    return false
+  }
+  if (!ctx.from) return false
+  const senderId = String(ctx.from.id)
+
+  // Re-read rather than reusing any caller's copy: the im-invite skill is a
+  // separate process writing the same file, and a stale object would clobber
+  // a token it minted seconds ago.
+  const access = readAccessFile()
+  // 'disabled' means the bot does nothing in DMs, so the token's validity must
+  // not even be evaluated. Skipping this check would still write the sender
+  // into allowFrom: harmless while the policy holds, but the moment an
+  // operator switches back to pairing/allowlist that person is already on the
+  // list, admitted without review and with nothing in the record to show it.
+  if (access.dmPolicy === 'disabled') return false
+  const invites = access.invites ?? {}
+  if (!checkInvite(invites, token, Date.now()).ok) return false
+
+  let changed = applyBind(invites[token], 'telegram', senderId)
+  if (!access.allowFrom.includes(senderId)) {
+    access.allowFrom.push(senderId)
+    changed = true
+  }
+  // Any pairing code this sender was waiting on is now dead weight.
+  for (const [code, p] of Object.entries(access.pending)) {
+    if (p.senderId !== senderId) continue
+    delete access.pending[code]
+    changed = true
+  }
+
+  // Persist before replying: a failed write plus a sent welcome would leave
+  // someone believing they have access they don't have. Re-redeeming an
+  // already-redeemed token changes nothing and still gets the welcome.
+  if (!changed) return true
+  try {
+    saveAccess(access)
+  } catch (err) {
+    process.stderr.write(`telegram channel: invite bind failed to save: ${err}\n`)
+    return false
+  }
+  return true
+}
+
 bot.command('start', async ctx => {
+  // A bare /start is the Telegram client's own "Start" button — it keeps the
+  // existing pairing blurb. Only /start <payload> is treated as a redemption
+  // attempt, and only that path can drop silently.
+  const token = (ctx.match ?? '').trim()
+  if (token) {
+    // NOT redundant with dmCommandGate's identical check — this branch
+    // deliberately never reaches dmCommandGate (see redeemInvite). grammy's
+    // bot.command() fires in groups too, so this is the only thing stopping
+    // any group member from redeeming a token in-channel. Do not delete it as
+    // dead defensive code.
+    if (ctx.chat?.type !== 'private') return
+    if (!redeemInvite(ctx, token)) return
+    await ctx.reply(`You're in. Just message me here and Claude will pick it up.`)
+    return
+  }
+
   if (!dmCommandGate(ctx)) return
   await ctx.reply(
     `This bot bridges Telegram to a Claude Code session.\n\n` +
@@ -1247,6 +1326,7 @@ if (POLL_MODE === 'builtin') {
   try {
     await bot.init()
     botUsername = bot.botInfo.username
+    persistBotUsername(botUsername)
   } catch (err) {
     process.stderr.write(
       `telegram channel: bot.init() failed — check TELEGRAM_BOT_TOKEN and network: ${err}\n`,
