@@ -93,7 +93,8 @@ channel server 是**另一個 process**，也在寫同一個檔。所以：
 之後被重新建立。server 端 30 天後自動清掉墓碑。
 
 回覆時必須提醒 admin：**撤銷 token 不等於踢人**。已經用這張 token 進來的人仍在
-`allowFrom` 裡，照樣能對話。要移除他們是另一個動作（`/telegram:access remove <id>`），
+`allowFrom` 裡，照樣能對話。要移除他們是另一個動作（`/<platform>:access remove <id>`，
+即 `/telegram:access remove <id>` 或 `/discord:access remove <id>`），
 本 skill 不代勞 —— 兩件事混在一起會造成誤傷。`usedBy` 裡列的就是受影響的 id，可直接告訴 admin。
 
 ### list
