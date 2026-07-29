@@ -833,6 +833,12 @@ function redeemInvite(ctx: Context, token: string): boolean {
   // separate process writing the same file, and a stale object would clobber
   // a token it minted seconds ago.
   const access = readAccessFile()
+  // 'disabled' means the bot does nothing in DMs, so the token's validity must
+  // not even be evaluated. Skipping this check would still write the sender
+  // into allowFrom: harmless while the policy holds, but the moment an
+  // operator switches back to pairing/allowlist that person is already on the
+  // list, admitted without review and with nothing in the record to show it.
+  if (access.dmPolicy === 'disabled') return false
   const invites = access.invites ?? {}
   if (!checkInvite(invites, token, Date.now()).ok) return false
 
