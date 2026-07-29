@@ -17,6 +17,10 @@ export type RedeemDeps = {
    *  im-invite skill minted seconds ago from its own process. */
   readAccess: () => Access
   saveAccess: (access: Access) => void
+  /** Must re-read the shared invites file, for the same reason as readAccess —
+   *  and here the other channel's server is a writer too. */
+  readInvites: () => Record<string, Invite>
+  saveInvites: (invites: Record<string, Invite>) => void
   now: () => number
   /** DISCORD_ACCESS_MODE === 'static' */
   isStatic: boolean
@@ -84,25 +88,40 @@ export function redeemInvite(deps: RedeemDeps, senderId: string, token: string):
   // already on the list, admitted without review and with nothing in the
   // record to show it.
   if (access.dmPolicy === 'disabled') return false
-  const invites = access.invites ?? {}
+  const invites = deps.readInvites()
   if (!checkInvite(invites, token, deps.now()).ok) return false
 
-  let changed = applyBind(invites[token], 'discord', senderId)
+  const bound = applyBind(invites[token], 'discord', senderId)
+  let accessChanged = false
   if (!access.allowFrom.includes(senderId)) {
     access.allowFrom.push(senderId)
-    changed = true
+    accessChanged = true
   }
   // Any pairing code this sender was waiting on is now dead weight.
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId !== senderId) continue
     delete access.pending[code]
-    changed = true
+    accessChanged = true
   }
 
   // Persist before replying: a failed write plus a sent welcome would leave
   // someone believing they have access they don't have. Re-redeeming an
   // already-redeemed token changes nothing and still gets the welcome.
-  if (!changed) return true
+  //
+  // Two files now, and the order is load-bearing. usedBy first: if the second
+  // write then fails the sender is not in allowFrom but the redemption is on
+  // record, and redeeming again fixes it (applyBind returns false, allowFrom
+  // still gets written). The reverse order would admit someone with no
+  // redemption record — an audit gap that never self-heals.
+  if (bound) {
+    try {
+      deps.saveInvites(invites)
+    } catch (err) {
+      deps.warn(`discord channel: invite bind failed to save: ${err}\n`)
+      return false
+    }
+  }
+  if (!accessChanged) return true
   try {
     deps.saveAccess(access)
   } catch (err) {

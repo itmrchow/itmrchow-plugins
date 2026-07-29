@@ -20,14 +20,22 @@ function makeInvite(overrides: Partial<Invite> = {}): Invite {
 }
 
 function makeAccess(overrides: Partial<Access> = {}): Access {
-  return { ...defaultAccess(), invites: { [TOKEN]: makeInvite() }, ...overrides }
+  return { ...defaultAccess(), ...overrides }
+}
+
+/** Invites live in the shared cross-platform file now, not in access.json. */
+function makeInvites(overrides?: Invite): Record<string, Invite> {
+  return { [TOKEN]: overrides ?? makeInvite() }
 }
 
 type Harness = {
   deps: RedeemDeps
   /** The object readAccess() hands out — assert on it after redemption. */
   access: Access
+  /** The object readInvites() hands out — assert on usedBy after redemption. */
+  invites: Record<string, Invite>
   saved: Access[]
+  savedInvites: Record<string, Invite>[]
   warnings: string[]
   readCount: () => number
 }
@@ -35,20 +43,24 @@ type Harness = {
 function makeHarness(
   access: Access = makeAccess(),
   overrides: Partial<RedeemDeps> = {},
+  invites: Record<string, Invite> = makeInvites(),
 ): Harness {
   const saved: Access[] = []
+  const savedInvites: Record<string, Invite>[] = []
   const warnings: string[] = []
   let reads = 0
   const deps: RedeemDeps = {
     readAccess: () => { reads += 1; return access },
     saveAccess: a => { saved.push(a) },
+    readInvites: () => invites,
+    saveInvites: i => { savedInvites.push(i) },
     now: () => NOW,
     isStatic: false,
     bootInvites: undefined,
     warn: m => { warnings.push(m) },
     ...overrides,
   }
-  return { deps, access, saved, warnings, readCount: () => reads }
+  return { deps, access, invites, saved, savedInvites, warnings, readCount: () => reads }
 }
 
 describe('parseStartToken', () => {
@@ -90,7 +102,8 @@ describe('redeemInvite', () => {
     expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(true)
     expect(h.saved).toHaveLength(1)
     expect(h.access.allowFrom).toEqual([SENDER])
-    expect(h.access.invites?.[TOKEN].usedBy).toEqual({ discord: [SENDER] })
+    expect(h.savedInvites).toHaveLength(1)
+    expect(h.invites[TOKEN].usedBy).toEqual({ discord: [SENDER] })
   })
 
   test('drops an unknown token without writing', () => {
@@ -101,17 +114,13 @@ describe('redeemInvite', () => {
   })
 
   test('drops an expired token without writing', () => {
-    const h = makeHarness(makeAccess({
-      invites: { [TOKEN]: makeInvite({ expiresAt: NOW - 1 }) },
-    }))
+    const h = makeHarness(makeAccess(), {}, makeInvites(makeInvite({ expiresAt: NOW - 1 })))
     expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(false)
     expect(h.saved).toHaveLength(0)
   })
 
   test('drops a revoked token without writing', () => {
-    const h = makeHarness(makeAccess({
-      invites: { [TOKEN]: makeInvite({ revokedAt: NOW - 1 }) },
-    }))
+    const h = makeHarness(makeAccess(), {}, makeInvites(makeInvite({ revokedAt: NOW - 1 })))
     expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(false)
     expect(h.saved).toHaveLength(0)
   })
@@ -121,7 +130,8 @@ describe('redeemInvite', () => {
     expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(false)
     expect(h.saved).toHaveLength(0)
     expect(h.access.allowFrom).toEqual([])
-    expect(h.access.invites?.[TOKEN].usedBy).toEqual({})
+    expect(h.savedInvites).toHaveLength(0)
+    expect(h.invites[TOKEN].usedBy).toEqual({})
   })
 
   test('in static mode with invites configured, warns once without the token', () => {
@@ -142,20 +152,24 @@ describe('redeemInvite', () => {
   })
 
   test('re-redeeming the same token still welcomes but writes nothing', () => {
-    const h = makeHarness(makeAccess({
-      allowFrom: [SENDER],
-      invites: { [TOKEN]: makeInvite({ usedBy: { discord: [SENDER] } }) },
-    }))
+    const h = makeHarness(
+      makeAccess({ allowFrom: [SENDER] }),
+      {},
+      makeInvites(makeInvite({ usedBy: { discord: [SENDER] } })),
+    )
     expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(true)
     expect(h.saved).toHaveLength(0)
+    expect(h.savedInvites).toHaveLength(0)
   })
 
   test('keeps the telegram bucket intact when redeeming on discord', () => {
-    const h = makeHarness(makeAccess({
-      invites: { [TOKEN]: makeInvite({ usedBy: { telegram: ['tg-user'] } }) },
-    }))
+    const h = makeHarness(
+      makeAccess(),
+      {},
+      makeInvites(makeInvite({ usedBy: { telegram: ['tg-user'] } })),
+    )
     expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(true)
-    expect(h.access.invites?.[TOKEN].usedBy).toEqual({
+    expect(h.invites[TOKEN].usedBy).toEqual({
       telegram: ['tg-user'],
       discord: [SENDER],
     })
@@ -187,5 +201,43 @@ describe('redeemInvite', () => {
     redeemInvite(h.deps, 'another-user', TOKEN)
     expect(h.readCount()).toBe(2)
     expect(h.access.allowFrom).toEqual([SENDER, 'another-user'])
+  })
+
+  test('redeems a token minted on telegram — the shared file is the point', () => {
+    const h = makeHarness(
+      makeAccess(),
+      {},
+      makeInvites(makeInvite({
+        createdBy: 'telegram:admin',
+        usedBy: { telegram: ['tg-user'] },
+      })),
+    )
+    expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(true)
+    expect(h.invites[TOKEN].usedBy).toEqual({
+      telegram: ['tg-user'],
+      discord: [SENDER],
+    })
+    expect(h.access.allowFrom).toEqual([SENDER])
+  })
+
+  test('writes usedBy before allowFrom, so a half-failure is self-healing', () => {
+    // Order matters: a redemption on record with no allowFrom is fixed by
+    // redeeming again. The reverse — access with no record — never self-heals.
+    const order: string[] = []
+    const h = makeHarness(makeAccess(), {
+      saveInvites: () => { order.push('invites') },
+      saveAccess: () => { order.push('access') },
+    })
+    expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(true)
+    expect(order).toEqual(['invites', 'access'])
+  })
+
+  test('refuses to welcome when the invites write fails', () => {
+    const h = makeHarness(makeAccess(), {
+      saveInvites: () => { throw new Error('disk full') },
+    })
+    expect(redeemInvite(h.deps, SENDER, TOKEN)).toBe(false)
+    expect(h.saved).toHaveLength(0)
+    expect(h.warnings[0]).not.toContain(TOKEN)
   })
 })
