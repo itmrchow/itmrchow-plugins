@@ -7,8 +7,6 @@
 // comment. Same shape as the other extracted modules here (meta-text.ts,
 // inject-port.ts, poll-mode.ts): pure logic plus a matching .test.ts.
 
-import type { Invite } from './invite'
-
 export type PendingEntry = {
   senderId: string
   chatId: string
@@ -41,9 +39,10 @@ export type Access = {
    *  process only ever reads it. There is deliberately no code path that adds
    *  an admin. */
   admins?: Record<string, string[]>
-  /** Invite tickets, keyed by token. Minted by the im-invite skill, redeemed
-   *  via /start <token>. */
-  invites?: Record<string, Invite>
+  // Invite tickets used to live here. They moved to the shared, cross-platform
+  // ~/.claude/channels/invites.json — see invites-file.ts. Do not add the field
+  // back: two homes for one token is what made a Telegram-minted invite
+  // invisible to Discord.
   /** The bot's @username, backfilled once known so the im-invite skill can
    *  build t.me deep-links without reading the bot token. */
   botUsername?: string
@@ -54,12 +53,12 @@ export type Access = {
  *
  * Single source of truth: this list drives the rebuild, the exhaustiveness
  * guard below, and the unit tests. A field absent here is silently dropped the
- * next time the file is written — which is how invites minted by the im-invite
- * skill would vanish without a trace.
+ * next time the file is written — which is how a hand-added `admins` entry
+ * would vanish without a trace.
  */
 export const ACCESS_FIELDS = [
   'dmPolicy', 'allowFrom', 'groups', 'pending', 'mentionPatterns', 'ackReaction',
-  'replyToMode', 'textChunkLimit', 'chunkMode', 'admins', 'invites', 'botUsername',
+  'replyToMode', 'textChunkLimit', 'chunkMode', 'admins', 'botUsername',
 ] as const satisfies readonly (keyof Access)[]
 
 // Add a field to Access without adding it to ACCESS_FIELDS and this stops

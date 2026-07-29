@@ -97,6 +97,8 @@ Redemption is `/start <token>` sent as a DM to the bot. Discord has no deep-link
 
 Every failure is a **silent drop** — unknown, expired, and revoked tokens all get no reply, so this cannot be used to probe which tokens exist. Redemption in a guild channel is refused outright; only DMs count. It is also disabled entirely under `DISCORD_ACCESS_MODE=static`, since static mode never writes `access.json` and an admitted sender would be blocked on their next message; the server logs a warning when invites are configured.
 
+Tokens are stored in a file shared by every channel, not in `access.json` — see [Invite file](#invite-file-shared-across-channels) below.
+
 Tokens are managed from an admin's DM via the `im-invite` skill (`im-session-ops` plugin): `create` / `revoke` / `list`. Three properties are deliberate and permanent:
 
 - **`admins` is read-only to every program.** The first admin is set by editing `access.json` by hand. No code path and no skill adds one, so a redeemed invite can never be escalated into admin rights through conversation.
@@ -156,21 +158,45 @@ Tokens are managed from an admin's DM via the `im-invite` skill (`im-session-ops
 
   // Admin user snowflakes, per platform. Hand-edited only — no code path
   // and no skill ever adds an entry here.
-  "admins": { "discord": ["184695080709324800"] },
+  "admins": { "discord": ["184695080709324800"] }
+}
+```
 
-  // Invite tickets, keyed by token. Written by the im-invite skill.
+## Invite file (shared across channels)
+
+Invite tokens do **not** live in `access.json`. They live in one file shared by every IM channel:
+
+`~/.claude/channels/invites.json` (override with the `INVITES_FILE` env var).
+
+That is deliberate. A token is platform-agnostic by design — `usedBy` buckets redemptions per platform precisely so the same ticket works everywhere — so a token minted on Telegram must be redeemable on Discord. While each channel kept its own copy inside its own state directory, the other channel simply could not see it and the redemption was dropped as an unknown token.
+
+The file is not under any platform subdirectory, because it belongs to none of them:
+
+```jsonc
+{
+  // Bumped only if the on-disk shape ever changes incompatibly.
+  "version": 1,
+  // Invite tickets, keyed by token. Written by the im-invite skill and by each
+  // channel server when a token is redeemed.
   "invites": {
     "a1b2c3d4e5f60718293a4b5c6d7e8f90": {
       "note": "for Bob",
       "createdAt": 1700000000000,
-      "createdBy": "discord:184695080709324800",
+      "createdBy": "telegram:412587349",
       // Required, epoch ms. There is no never-expiring invite.
       "expiresAt": 1700604800000,
-      // Who redeemed it, bucketed by platform.
-      "usedBy": { "discord": ["987654321098765432"] },
+      // Who redeemed it, bucketed by platform. One ticket, every channel.
+      "usedBy": { "telegram": ["987654321"], "discord": ["246813579"] },
       // Tombstone. Non-null blocks redemption; the key is kept for 30 days.
       "revokedAt": null
     }
   }
 }
 ```
+
+Deployments that predate this move keep their tokens: on boot each channel server lifts any `invites` still in its own `access.json` into the shared file (merging, never overwriting an existing token) and rewrites `access.json` without the field. Running it twice, or on both channels, changes nothing further.
+
+Two consequences worth knowing:
+
+- The file holds bearer tokens. It is written `0600` and, like the contents of the state directory, the server refuses to send it as a reply attachment.
+- There is no lock. Three processes (both channel servers and the `im-invite` skill) read-modify-write it. Minting and redeeming are human-paced and writes are atomic, so this is an accepted trade-off rather than an oversight.

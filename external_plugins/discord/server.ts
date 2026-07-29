@@ -49,6 +49,13 @@ import { sanitizeMetaText } from './meta-text'
 import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
 import { resolveInjectPort } from './inject-port'
 import { pruneRevoked, REVOKED_RETENTION_MS } from './invite'
+import {
+  migrateInvitesFromAccess,
+  readInvites,
+  readLegacyAccessInvites,
+  resolveInvitesFile,
+  saveInvites,
+} from './invites-file'
 import { defaultAccess, pickAccessFields, type Access } from './access-schema'
 import { parseStartToken, redeemInvite, type RedeemDeps } from './invite-redeem'
 
@@ -80,6 +87,10 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+// Invites are shared with every other channel, so this deliberately sits
+// outside STATE_DIR — see invites-file.ts. Resolved after the state .env load
+// above so an INVITES_FILE override set there is honoured.
+const INVITES_FILE = resolveInvitesFile(process.env, homedir())
 // Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
 // every channel plugin is spawned by the same Claude Code process and inherits
 // one env, so a shared key would override both defaults to the same value and
@@ -123,12 +134,26 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 // upload. Claude can already Read+paste file contents, so this isn't a new
 // exfil channel for arbitrary paths — but the server's own state is the one
 // thing Claude has no reason to ever send.
-function assertSendable(f: string): void {
-  let real, stateReal: string
+function realpathOrNull(p: string): string | null {
   try {
-    real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return } // statSync will fail properly; or STATE_DIR absent → nothing to leak
+    return realpathSync(p)
+  } catch {
+    return null
+  }
+}
+
+function assertSendable(f: string): void {
+  const real = realpathOrNull(f)
+  if (real === null) return // statSync will fail properly
+  // The shared invites file is NOT under STATE_DIR — it belongs to no single
+  // platform (invites-file.ts) — so the prefix test below cannot cover it. Its
+  // contents are bearer tokens, i.e. the same class of secret as .env, so it
+  // gets its own explicit check rather than being left outside the guard.
+  if (real === realpathOrNull(INVITES_FILE)) {
+    throw new Error(`refusing to send channel state: ${f}`)
+  }
+  const stateReal = realpathOrNull(STATE_DIR)
+  if (stateReal === null) return // STATE_DIR absent → nothing to leak
   const inbox = join(stateReal, 'inbox')
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
@@ -180,6 +205,22 @@ function saveAccess(a: Access): void {
   renameSync(tmp, ACCESS_FILE)
 }
 
+// Invites used to live inside access.json. ACCESS_FIELDS no longer lists the
+// field, so anything left there would be dropped by the first saveAccess() —
+// silently and permanently. Hence a boot-time move rather than a deployment
+// checklist step. It must sit above every saveAccess() caller, and it is
+// idempotent, so whichever channel starts first does the work.
+migrateInvitesFromAccess({
+  isStatic: STATIC,
+  readLegacy: () => readLegacyAccessInvites(ACCESS_FILE),
+  readShared: () => readInvites(INVITES_FILE),
+  saveShared: invites => { saveInvites(INVITES_FILE, invites) },
+  // Rewriting through the whitelist is what drops the field: pickAccessFields
+  // no longer keeps `invites`, so the round-trip removes it.
+  stripLegacy: () => { saveAccess(readAccessFile()) },
+  warn: m => { process.stderr.write(m) },
+})
+
 function pruneExpired(a: Access): boolean {
   const now = Date.now()
   let changed = false
@@ -192,21 +233,36 @@ function pruneExpired(a: Access): boolean {
   return changed
 }
 
+// Revoked tombstones live in the shared invites file, so this persists itself
+// rather than reporting up to the caller's saveAccess() — the two halves of the
+// old pruneStale() now write different files.
+function pruneStaleInvites(): void {
+  if (STATIC) return
+  const invites = readInvites(INVITES_FILE)
+  if (!pruneRevoked(invites, Date.now(), REVOKED_RETENTION_MS)) return
+  try {
+    saveInvites(INVITES_FILE, invites)
+  } catch (err) {
+    process.stderr.write(`discord channel: failed to prune revoked invites: ${err}\n`)
+  }
+}
+
 // Both kinds of garbage collection ride the same inbound hook — no extra timer.
 function pruneStale(a: Access): boolean {
-  const prunedPending = pruneExpired(a)
-  const prunedInvites = a.invites
-    ? pruneRevoked(a.invites, Date.now(), REVOKED_RETENTION_MS)
-    : false
-  return prunedPending || prunedInvites
+  pruneStaleInvites()
+  return pruneExpired(a)
 }
 
 const REDEEM_DEPS: RedeemDeps = {
   readAccess: readAccessFile,
   saveAccess,
+  readInvites: () => readInvites(INVITES_FILE),
+  saveInvites: invites => { saveInvites(INVITES_FILE, invites) },
   now: Date.now,
   isStatic: STATIC,
-  bootInvites: BOOT_ACCESS?.invites,
+  // Boot snapshot of the shared file, used only to decide whether static mode
+  // is worth warning about.
+  bootInvites: STATIC ? readInvites(INVITES_FILE) : undefined,
   warn: m => { process.stderr.write(m) },
 }
 
