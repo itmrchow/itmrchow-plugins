@@ -83,6 +83,10 @@ channel server 是**另一個 process**，也在寫同一個檔。所以：
    **讀不到 `botUsername` 就只給 raw token**，並說明「bot 尚未回填 username（通常是 server
    還沒啟動過），對方請手動傳 `/start <token>` 給 bot」。**不要用其他來源猜 username。**
 
+   platform 為 discord 時沒有 deep-link 可組（Discord 無此機制），`access.json` 也
+   **不會**有 `botUsername`。直接給 raw token，請對方在 DM 手打 `/start <token>`，
+   **不要**套用上面那句 username 說明 —— 那對 Discord 是錯的診斷。
+
 ### revoke `<token>`
 
 把該 token 的 `revokedAt` 設為現在時間戳。**不刪 key** —— 墓碑保留供稽核，也防同一組 token
