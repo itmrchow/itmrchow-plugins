@@ -18,7 +18,8 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { request } from 'node:http'
 import { resolveInjectPort } from './inject-port'
-import { BOT_COMMANDS } from './bot-commands'
+import { buildBotCommands } from './bot-commands'
+import { resolveControlCommands } from './control-plane'
 
 const STATE_DIR =
   process.env.TELEGRAM_STATE_DIR ||
@@ -43,6 +44,13 @@ const TELEGRAM_INJECT_PORT = resolveInjectPort(
   process.env.TELEGRAM_INJECT_PORT,
   7842,
   'TELEGRAM_INJECT_PORT',
+)
+
+// Same reason as the port above: read after the .env load so the menu this
+// process advertises matches the one server.ts actually handles.
+const CONTROL_COMMANDS_ENABLED = resolveControlCommands(
+  process.env.TELEGRAM_CONTROL_COMMANDS,
+  'TELEGRAM_CONTROL_COMMANDS',
 )
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
@@ -106,7 +114,9 @@ async function main() {
   const me = bot.botInfo
   process.stderr.write(`telegram poller: polling as @${me.username}\n`)
   void bot.api
-    .setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
+    .setMyCommands(buildBotCommands(CONTROL_COMMANDS_ENABLED), {
+      scope: { type: 'all_private_chats' },
+    })
     .catch(() => {})
 
   let offset: number | undefined
