@@ -39,6 +39,7 @@ import {
   decideClear,
   getContextPercent,
   parseControlCommand,
+  resolveControlCommands,
   sendClear,
   type ControlCommand,
 } from './control-plane'
@@ -77,6 +78,12 @@ try {
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
+
+// Which /commands the bot layer keeps for itself; the rest reach the agent.
+const CONTROL_COMMANDS_ENABLED = resolveControlCommands(
+  process.env.DISCORD_CONTROL_COMMANDS,
+  'DISCORD_CONTROL_COMMANDS',
+)
 
 if (!TOKEN) {
   process.stderr.write(
@@ -1107,7 +1114,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // Control-command intercept (JP-38): /ctx /clear /restart operate the agent
   // directly via tmux/systemctl. DM + paired owner only; bypasses the chat path.
   // discord has no native command router, so we prefix-match here.
-  const control = parseControlCommand(msg.content)
+  const control = parseControlCommand(msg.content, CONTROL_COMMANDS_ENABLED)
   if (
     control &&
     msg.channel.type === ChannelType.DM &&

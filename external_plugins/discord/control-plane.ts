@@ -28,25 +28,81 @@ export const CONTROL_COMMANDS = ['ctx', 'clear', 'restart'] as const
 export type ControlCommand = (typeof CONTROL_COMMANDS)[number]
 
 /**
+ * Resolve which control commands the bot layer intercepts, from a raw env value.
+ *
+ * Commands NOT in the resolved set are never handled here — they fall through
+ * to the chat path and reach the agent, which can then give them its own
+ * meaning (e.g. a `/clear` skill that starts a fresh session). Unset or blank
+ * means "all of them", so an existing deployment that sets nothing behaves
+ * exactly as before.
+ *
+ * Tolerant by design (mirrors resolveInjectPort / resolvePollMode): unknown
+ * names are warned about and skipped, and a value with no recognized name at
+ * all falls back to the full set rather than silently disabling the control
+ * plane — a typo must not strand the operator without /restart.
+ *
+ * @param rawEnv - Raw comma-separated env value, or undefined when unset.
+ * @param envName - Env var name, used in warnings only.
+ * @returns The control commands to intercept; never empty.
+ */
+export function resolveControlCommands(
+  rawEnv: string | undefined,
+  envName: string,
+): readonly ControlCommand[] {
+  if (rawEnv === undefined) return CONTROL_COMMANDS
+  const normalized = rawEnv.trim().toLowerCase()
+  if (normalized === '') return CONTROL_COMMANDS
+
+  const enabled: ControlCommand[] = []
+  const unknown: string[] = []
+  for (const token of normalized.split(',')) {
+    const name = token.trim()
+    if (name === '') continue
+    if (!(CONTROL_COMMANDS as readonly string[]).includes(name)) {
+      unknown.push(name)
+      continue
+    }
+    if (!enabled.includes(name as ControlCommand)) enabled.push(name as ControlCommand)
+  }
+
+  if (unknown.length > 0) {
+    process.stderr.write(
+      `control plane: ${envName} lists unknown command(s) ${JSON.stringify(unknown.join(','))}; ` +
+      `known commands are ${CONTROL_COMMANDS.join(', ')}\n`,
+    )
+  }
+  if (enabled.length === 0) {
+    process.stderr.write(
+      `control plane: ${envName}=${JSON.stringify(rawEnv)} names no known command; ` +
+      `falling back to ${CONTROL_COMMANDS.join(', ')}\n`,
+    )
+    return CONTROL_COMMANDS
+  }
+  return enabled
+}
+
+/**
  * Parse a raw inbound message into a control command, if it is one.
  *
  * Used by channels without a native command router (discord) to split control
  * commands from chat. Matches a leading `/<cmd>` exactly (case-insensitive);
- * trailing arguments are ignored. Returns null for anything that is not a
- * recognized control command so the caller falls through to the chat path.
+ * trailing arguments are ignored. Returns null for anything that is not an
+ * enabled control command so the caller falls through to the chat path.
  *
  * Args:
  *   text: raw inbound message content.
+ *   enabled: control commands to intercept. Defaults to all of them.
  * Returns:
  *   The matched ControlCommand, or null when not a control command.
  */
-export function parseControlCommand(text: string): ControlCommand | null {
+export function parseControlCommand(
+  text: string,
+  enabled: readonly ControlCommand[] = CONTROL_COMMANDS,
+): ControlCommand | null {
   const trimmed = text.trim()
   if (!trimmed.startsWith('/')) return null
   const word = trimmed.slice(1).split(/\s+/)[0]?.toLowerCase() ?? ''
-  return (CONTROL_COMMANDS as readonly string[]).includes(word)
-    ? (word as ControlCommand)
-    : null
+  return (enabled as readonly string[]).includes(word) ? (word as ControlCommand) : null
 }
 
 /** Result of reading the context gauge from the TUI footer. */

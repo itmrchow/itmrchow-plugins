@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import {
   CLEAR_CONFIRM_WINDOW_MS,
+  CONTROL_COMMANDS,
   decideClear,
   parseContextPercent,
   parseControlCommand,
+  resolveControlCommands,
 } from './control-plane'
 
 const T0 = 1_000_000_000_000
@@ -74,5 +76,44 @@ describe('parseContextPercent', () => {
     const r = parseContextPercent(pane)
     expect(r.raw).toContain('line 19')
     expect(r.raw).not.toContain('line 0')
+  })
+})
+
+describe('resolveControlCommands', () => {
+  test('defaults to every control command when unset or blank', () => {
+    expect(resolveControlCommands(undefined, 'X')).toEqual(CONTROL_COMMANDS)
+    expect(resolveControlCommands('', 'X')).toEqual(CONTROL_COMMANDS)
+    expect(resolveControlCommands('   ', 'X')).toEqual(CONTROL_COMMANDS)
+  })
+
+  test('keeps only the listed commands', () => {
+    expect(resolveControlCommands('ctx', 'X')).toEqual(['ctx'])
+    expect(resolveControlCommands('ctx,restart', 'X')).toEqual(['ctx', 'restart'])
+  })
+
+  test('tolerates spacing, casing, and duplicates', () => {
+    expect(resolveControlCommands(' CTX , clear , ctx ,, ', 'X')).toEqual(['ctx', 'clear'])
+  })
+
+  test('skips unknown names but keeps the known ones', () => {
+    expect(resolveControlCommands('ctx,bogus', 'X')).toEqual(['ctx'])
+  })
+
+  test('falls back to every command when nothing recognized', () => {
+    expect(resolveControlCommands('bogus,none', 'X')).toEqual(CONTROL_COMMANDS)
+  })
+})
+
+describe('parseControlCommand (enabled subset)', () => {
+  test('matches only enabled commands', () => {
+    expect(parseControlCommand('/ctx', ['ctx'])).toBe('ctx')
+    expect(parseControlCommand('/clear', ['ctx'])).toBeNull()
+    expect(parseControlCommand('/restart', ['ctx'])).toBeNull()
+  })
+
+  test('an omitted enabled list still matches everything', () => {
+    for (const cmd of CONTROL_COMMANDS) {
+      expect(parseControlCommand(`/${cmd}`)).toBe(cmd)
+    }
   })
 })

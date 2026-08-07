@@ -95,7 +95,7 @@ Claude Code 用上一步方式跑起來後，在 Discord DM 你的 bot — 它�
 本 fork 在 upstream plugin 之上加了常駐 agent（例如跑在 VM tmux session 內）需要的運維功能：
 
 - **`/inject` HTTP endpoint** — `POST /inject` 到 `127.0.0.1:7843`（可用 `DISCORD_INJECT_PORT` 覆寫），把排程器或其他本機程序的文字以合成 channel 訊息注入 session。Body：`{"text": "...", "chat_id": "..."}`。僅綁定 loopback。
-- **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。
+- **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。可用 `DISCORD_CONTROL_COMMANDS`（逗號分隔，例 `ctx,restart`）縮小 bot 層攔截的範圍 —— 未列入的指令會當成一般訊息轉給 agent，讓 skill 自行定義語意。未設 = 三個全攔，與先前行為相同。
 - **啟動通知** — 重啟後 bot 會通知已配對 owner「agent 回來了」，列出載入的 plugin 版本並標記跨重啟有變動的項目。通知採原子 claim，多 channel 部署也只會發一次。
 - **已讀回應** — inbound 訊息會收到 emoji reaction（預設 👀）作為「已讀」確認。在 `access.json` 用 `ackReaction` 設定（見 [ACCESS.md](./ACCESS.md)）。
 - **孤兒看門狗** — 父 agent 程序死亡時 server 自行退出（並處理 SIGHUP），不會殘留霸佔 token 的殭屍 bot 程序。

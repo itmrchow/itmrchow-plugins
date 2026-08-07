@@ -82,7 +82,7 @@ Claude Code 用上一步方式跑起來後，在 Telegram DM 你的 bot — 它�
   - `decoupled`（arm64-linux 預設）— 由獨立的 `poller.ts` long-polling，把原始 update 轉發到 inject port 的 `POST /update`；server 本身不 poll。arm64-linux 必需（同程序 long-poll 迴圈會被 MCP stdio watcher 餓死）。
   - arm64-linux 上設 `builtin` 不支援（證實會餓死），會被 clamp 回 `decoupled` 並警告。
   - launcher（`launch.sh`，由 `.mcp.json` 呼叫）依同一預設選 runtime：arm64-linux 或 decoupled 用 `tsx`(node)，否則用 `bun`。
-- **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。
+- **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。可用 `TELEGRAM_CONTROL_COMMANDS`（逗號分隔，例 `ctx,restart`）縮小 bot 層攔截的範圍 —— 未列入的指令會當成一般訊息轉給 agent，讓 skill 自行定義語意。未設 = 三個全攔，與先前行為相同。
 - **啟動通知** — 重啟後 bot 會通知已配對 owner「agent 回來了」，列出載入的 plugin 版本並標記跨重啟有變動的項目。通知採原子 claim，多 channel 部署也只會發一次。
 - **已讀回應** — inbound 訊息會收到 emoji reaction（預設 👀）作為「已讀」確認。在 `access.json` 用 `ackReaction` 設定（見 [ACCESS.md](./ACCESS.md)）；只接受 Telegram 固定的 emoji 白名單。
 - **孤兒看門狗** — 父 agent 程序死亡時 server 自行退出（並處理 SIGHUP），不會殘留霸佔 token 的殭屍 bot 程序。

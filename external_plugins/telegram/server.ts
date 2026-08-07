@@ -25,7 +25,13 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { capturePaneBusy } from './tmux-pane'
-import { decideClear, getContextPercent, sendClear } from './control-plane'
+import {
+  decideClear,
+  getContextPercent,
+  resolveControlCommands,
+  sendClear,
+  type ControlCommand,
+} from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { sanitizeMetaText } from './meta-text'
@@ -41,7 +47,7 @@ import {
   saveInvites,
 } from './invites-file'
 import { defaultAccess, pickAccessFields, type Access } from './access-schema'
-import { BOT_COMMANDS } from './bot-commands'
+import { buildBotCommands } from './bot-commands'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -120,6 +126,13 @@ let botUsername = ''
 // in-process via bot.start() at the end of this file. Resolved after the state
 // .env load above so TELEGRAM_POLL_MODE set there is honoured.
 const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
+
+// Which /commands the bot layer keeps for itself; the rest fall through to the
+// chat path and reach the agent. Resolved after the state .env load above.
+const CONTROL_COMMANDS_ENABLED = resolveControlCommands(
+  process.env.TELEGRAM_CONTROL_COMMANDS,
+  'TELEGRAM_CONTROL_COMMANDS',
+)
 
 // Invites are shared with every other channel, so this deliberately sits
 // outside STATE_DIR — see invites-file.ts. Resolved after the state .env load
@@ -1026,6 +1039,15 @@ bot.command('status', async ctx => {
 /** Per-sender last /clear warning, for the busy-confirm gate. */
 const clearWarnedAt = new Map<string, number>()
 
+// Unlike discord (one prefix-match in the message handler), telegram routes
+// these through grammy's bot.command(), which runs BEFORE the bot.on('message:text')
+// chat path and swallows the update. So a command handed to the agent must
+// explicitly call next() to reach that path — returning early would drop it.
+/** Whether the bot layer still owns this control command. */
+function ownsControlCommand(cmd: ControlCommand): boolean {
+  return (CONTROL_COMMANDS_ENABLED as readonly string[]).includes(cmd)
+}
+
 /** Gate a control command to a paired owner. Returns the senderId or null. */
 function controlGate(ctx: Context): string | null {
   const gated = dmCommandGate(ctx)
@@ -1034,7 +1056,8 @@ function controlGate(ctx: Context): string | null {
   return gated.senderId
 }
 
-bot.command('ctx', async ctx => {
+bot.command('ctx', async (ctx, next) => {
+  if (!ownsControlCommand('ctx')) return next()
   if (!controlGate(ctx)) return
   const { pct, raw } = await getContextPercent()
   if (pct === null) {
@@ -1048,7 +1071,8 @@ bot.command('ctx', async ctx => {
   await ctx.reply(`Context: ${pct}% used (≈ ${100 - pct}% left)`)
 })
 
-bot.command('clear', async ctx => {
+bot.command('clear', async (ctx, next) => {
+  if (!ownsControlCommand('clear')) return next()
   const senderId = controlGate(ctx)
   if (!senderId) return
   const busy = await capturePaneBusy()
@@ -1067,7 +1091,8 @@ bot.command('clear', async ctx => {
   }
 })
 
-bot.command('restart', async ctx => {
+bot.command('restart', async (ctx, next) => {
+  if (!ownsControlCommand('restart')) return next()
   if (!controlGate(ctx)) return
   // Reply BEFORE restarting: this bot process is killed by the restart, so a
   // post-restart confirmation can never be sent. The freshly started agent
@@ -1414,7 +1439,9 @@ if (POLL_MODE === 'builtin') {
   // from), so guard with bot.isInited() — same API as the /update guard (R3).
   if (bot.isInited()) {
     try {
-      await bot.api.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_private_chats' } })
+      await bot.api.setMyCommands(buildBotCommands(CONTROL_COMMANDS_ENABLED), {
+        scope: { type: 'all_private_chats' },
+      })
     } catch (err) {
       process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`)
     }
