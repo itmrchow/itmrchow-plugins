@@ -76,12 +76,12 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 
 This fork extends the upstream plugin with operational features for running the bot as an always-on agent (e.g. inside a tmux session on a VM):
 
-- **`/inject` HTTP endpoint** — `POST /inject` on `127.0.0.1:7842` (override with `TELEGRAM_INJECT_PORT`) delivers text from schedulers or other local processes into the session as a synthetic channel message. Body: `{"text": "...", "chat_id": "..."}`. Bound to loopback only.
-- **Dual poll mode (`TELEGRAM_POLL_MODE`)** — the server picks how it consumes updates by platform, overridable via `TELEGRAM_POLL_MODE=builtin|decoupled`:
-  - `builtin` (default on x86 and macOS) — single-process in-process `bot.start()`, like upstream. No external poller needed.
-  - `decoupled` (default on arm64-linux) — the standalone `poller.ts` long-polls and forwards raw updates to `POST /update` on the inject port; the server does not poll itself. Required on arm64-linux, where the in-process long-poll loop starves under the MCP stdio watcher.
-  - `builtin` on arm64-linux is not supported (proven to starve) and is clamped back to `decoupled` with a warning.
-  - The launcher (`launch.sh`, invoked from `.mcp.json`) mirrors this default to pick the runtime: `tsx`(node) on arm64-linux or when decoupled, `bun` otherwise.
+- **Subscription-based inbound (`poller.ts`)** — the standalone poller is the token's only `getUpdates` consumer. It works out which conversation each update belongs to, and pushes it over Server-Sent Events to whichever server process serves that conversation. The server binds no port of its own; it connects out to `127.0.0.1:7852` (override with `TELEGRAM_POLLER_PORT`) and reconnects with exponential backoff, so several conversations can each run their own agent session against one bot token.
+  - `AGENT_SCOPE` names the conversation this process serves (e.g. `telegram-dm-12345`). Without a valid value the server still serves its MCP tools but receives no messages, and says so on stderr.
+  - `MAX_SCOPES` (default 10) caps how many sessions may exist at once; over the cap, new senders get a "capacity full" reply rather than starting another agent.
+  - `SCOPE_SPAWN_BIN` points at the host script that starts a session for a conversation that has none. Unset means no session is ever started, and senders are told the service is not fully configured.
+  - The launcher (`launch.sh`, invoked from `.mcp.json`) picks the runtime: `tsx`(node) on arm64-linux, `bun` elsewhere.
+  - Scheduled/synthetic message injection now belongs to the separate `internal-inject` channel; this plugin no longer listens on an inject port.
 - **Bot-layer control commands** — `/ctx` (context usage), `/clear` (clear context), `/restart` (restart the agent). The bot process drives these directly via tmux, so they keep working even when the agent is wedged or dead. Restricted to paired owners. Set `TELEGRAM_CONTROL_COMMANDS` (comma-separated, e.g. `ctx,restart`) to narrow which of them the bot layer intercepts — the rest are relayed to the agent as ordinary messages, so a skill can give them its own meaning. Unset means all three, matching earlier behaviour.
 - **Startup notice** — after a restart, the bot messages the paired owner(s) that the agent is back, listing loaded plugin versions and flagging any that changed across the restart. Claimed atomically, so multi-channel setups send exactly one notice.
 - **Read receipt** — inbound messages get an emoji reaction (default 👀) as a "seen" ack. Configure via `ackReaction` in `access.json` (see [ACCESS.md](./ACCESS.md)); only Telegram's fixed emoji whitelist is accepted.

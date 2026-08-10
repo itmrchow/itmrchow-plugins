@@ -20,7 +20,6 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -36,8 +35,10 @@ import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { sanitizeMetaText } from './meta-text'
 import { buildReplyMeta } from './reply-meta'
-import { resolveInjectPort } from './inject-port'
-import { resolvePollMode } from './poll-mode'
+import { resolvePort } from './resolve-port'
+import { isValidScopeId } from './scope-id'
+import { startSubscribeClient } from './subscribe-client'
+import type { InboundEnvelope } from './subscribe-protocol'
 import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS, type Invite } from './invite'
 import {
   migrateInvitesFromAccess,
@@ -77,31 +78,27 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-// Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
-// every channel plugin is spawned by the same Claude Code process and inherits
-// one env, so a shared key would override both defaults to the same value and
-// make the second binder die with EADDRINUSE. Default 7842; discord uses 7843.
-const TELEGRAM_INJECT_PORT = resolveInjectPort(
-  process.env.TELEGRAM_INJECT_PORT,
-  7842,
-  'TELEGRAM_INJECT_PORT',
-)
-const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// The platform poller's subscription port. This process is a CLIENT of it: it
+// binds nothing itself, so several scopes can run side by side without the
+// per-scope port arithmetic the fixed-scope design needed.
+const TELEGRAM_POLLER_PORT = resolvePort(
+  process.env.TELEGRAM_POLLER_PORT,
+  7852,
+  'TELEGRAM_POLLER_PORT',
+)
+const POLLER_HOST = '127.0.0.1'
+
+// Which conversation this process serves — set by the carrier's launcher. It is
+// the subscription key, so a wrong or missing value means this process receives
+// nothing at all; validate loudly rather than subscribing to garbage.
+const AGENT_SCOPE = process.env.AGENT_SCOPE ?? ''
+
+// No stale-PID takeover here any more: this process never calls getUpdates (the
+// poller is the token's sole consumer), and under the per-platform state dir all
+// scopes would share one bot.pid — so each new scope would SIGTERM the previous
+// one.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -120,12 +117,9 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
-
-// How this process consumes updates. decoupled (arm64-linux): rely on the
-// external poller + /update. builtin (x86 / non-starving platforms): poll
-// in-process via bot.start() at the end of this file. Resolved after the state
-// .env load above so TELEGRAM_POLL_MODE set there is honoured.
-const POLL_MODE = resolvePollMode(process.arch, process.platform, process.env.TELEGRAM_POLL_MODE)
+// Assigned at the bottom of this file, once every handler is registered.
+// Declared here so shutdown() can stop it.
+let subscription: { stop: () => void } | undefined
 
 // Which /commands the bot layer keeps for itself; the rest fall through to the
 // chat path and reach the agent. Resolved after the state .env load above.
@@ -564,84 +558,6 @@ mcp.setNotificationHandler(
   },
 )
 
-// node http (was Bun.serve) — runtime is node via tsx, not bun, to avoid the
-// bun (aarch64) event-loop starvation where the MCP stdin watcher freezes the
-// grammy poll. node's libuv loop schedules stdin, timers and HTTP fairly.
-createServer((req, res) => {
-  const path = req.url ?? ''
-  if (req.method !== 'POST' || (path !== '/inject' && path !== '/update')) {
-    res.writeHead(404)
-    res.end('not found')
-    return
-  }
-  let raw = ''
-  req.on('data', chunk => { raw += chunk })
-  req.on('end', () => {
-    void (async () => {
-      // /update: a raw Telegram update forwarded by the external poller process.
-      // The poller runs standalone (idle stdin), so its grammy long-poll is not
-      // starved by the MCP StdioServerTransport stdin watcher — a bun/node
-      // aarch64 issue where an in-process poll loop never fires once Claude
-      // drives the MCP connection. Feeding the update through bot.handleUpdate
-      // here reuses ALL gate / pairing / command logic and channel delivery
-      // (mcp.notification) unchanged.
-      if (path === '/update') {
-        let body: { update: unknown; me?: { id: number; is_bot: boolean; first_name: string; username: string } }
-        try {
-          body = JSON.parse(raw)
-        } catch {
-          res.writeHead(400)
-          res.end('invalid json')
-          return
-        }
-        // The poller already called getMe; set botInfo so handleUpdate works
-        // without an in-process bot.init() (whose getMe would starve under the
-        // MCP stdin watcher).
-        if (body.me && !bot.isInited()) {
-          bot.botInfo = body.me as typeof bot.botInfo
-          botUsername = body.me.username
-          persistBotUsername(botUsername)
-        }
-        try {
-          await bot.handleUpdate(body.update as Parameters<typeof bot.handleUpdate>[0])
-        } catch (err) {
-          process.stderr.write(`telegram channel: handleUpdate error: ${err}\n`)
-        }
-        res.writeHead(200)
-        res.end('ok')
-        return
-      }
-      // /inject: scheduler text delivered as a synthetic channel message.
-      let body: { text: string; chat_id: string }
-      try {
-        body = JSON.parse(raw)
-      } catch {
-        res.writeHead(400)
-        res.end('invalid json')
-        return
-      }
-      if (!body.text || !body.chat_id) {
-        res.writeHead(400)
-        res.end('missing text or chat_id')
-        return
-      }
-      void deliverToChannel({
-        content: body.text,
-        meta: {
-          chat_id: body.chat_id,
-          user: 'scheduler',
-          user_id: 'scheduler',
-          ts: new Date().toISOString(),
-        },
-      })
-      process.stderr.write(`telegram channel: injected via HTTP for chat_id=${body.chat_id}\n`)
-      res.writeHead(200)
-      res.end('ok')
-    })()
-  })
-}).listen(TELEGRAM_INJECT_PORT, '127.0.0.1')
-process.stderr.write(`telegram channel: inject endpoint listening on 127.0.0.1:${TELEGRAM_INJECT_PORT}\n`)
-
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -842,21 +758,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
-// When Claude Code closes the MCP connection, stdin gets EOF. Without this
-// the bot keeps polling forever as a zombie, holding the token and blocking
-// the next session with 409 Conflict.
+// When Claude Code closes the MCP connection, stdin gets EOF. Without this the
+// process lingers as a zombie holding a subscription, and the poller keeps
+// writing this scope's messages into a socket nobody reads.
 let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
-  // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  subscription?.stop()
+  process.exit(0)
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -1396,66 +1307,41 @@ async function handleInbound(
   })
 }
 
-// Without this, any throw in a message handler stops polling permanently
+// Without this, any throw in a message handler propagates out of handleUpdate
 // (grammy's default error handler calls bot.stop() and rethrows).
 bot.catch(err => {
-  process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
+  process.stderr.write(`telegram channel: handler error (subscription continues): ${err.error}\n`)
 })
 
-// Polling strategy depends on POLL_MODE (resolved above; see poll-mode.ts).
-//
-// decoupled (arm64-linux): NO in-process polling here. The MCP
-// StdioServerTransport stdin watcher starves an in-process grammy poll loop once
-// Claude drives the MCP connection — the loop silently never fires (even
-// setTimeout timers stall), so inbound updates are never consumed. Polling is
-// delegated to the standalone `poller.ts` process (idle stdin → unaffected),
-// which forwards each update to the /update HTTP endpoint above; bot.handleUpdate
-// runs there, network-driven, which is serviced normally. setMyCommands is done
-// by the poller. In this mode the block below does not run — behaviour is
-// identical to before JP-76.
-//
-// builtin (x86 / non-starving platforms): poll in-process via bot.start(), like
-// upstream. No external poller, no /update traffic. init() must precede start()
-// so botInfo/botUsername are set before the first update is handled (isMentioned
-// depends on botUsername), and setMyCommands mirrors the poller's menu.
-if (POLL_MODE === 'builtin') {
-  // init() is the most misconfig-prone step (bad token / no network 401s here).
-  // Give it an explicit diagnostic rather than letting it fall to the generic
-  // top-level unhandledRejection handler, which would leave botUsername='' and
-  // silently skip setMyCommands + polling with no actionable message. The
-  // unhandledRejection handler keeps the process alive on purpose (MCP tools
-  // still serve), so this is an observability fix, not a behaviour change.
-  try {
-    await bot.init()
-    botUsername = bot.botInfo.username
-    persistBotUsername(botUsername)
-  } catch (err) {
-    process.stderr.write(
-      `telegram channel: bot.init() failed — check TELEGRAM_BOT_TOKEN and network: ${err}\n`,
-    )
-  }
-  // Gate the rest on a fully-inited bot: a half-inited bot has no botInfo, so
-  // polling it is meaningless. This is top-level (no function to early-return
-  // from), so guard with bot.isInited() — same API as the /update guard (R3).
-  if (bot.isInited()) {
-    try {
-      await bot.api.setMyCommands(buildBotCommands(CONTROL_COMMANDS_ENABLED), {
-        scope: { type: 'all_private_chats' },
-      })
-    } catch (err) {
-      process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`)
-    }
-    // Not awaited: bot.start()'s promise resolves only once the bot stops, so
-    // awaiting would block the top level forever. bot.catch above keeps polling
-    // alive across handler throws.
-    void bot
-      .start({
-        onStart: me => {
-          process.stderr.write(`telegram channel: builtin polling as @${me.username}\n`)
-        },
-      })
-      .catch(err => {
-        process.stderr.write(`telegram channel: bot.start failed: ${err}\n`)
-      })
-  }
+// Inbound messages arrive over a subscription to the platform poller, which is
+// the token's sole getUpdates consumer. This process binds nothing and polls
+// nothing: on arm64-linux an in-process poll loop is starved by the MCP stdin
+// watcher, and under the dynamic-scope design N sessions share one token, so a
+// second consumer would 409 against the poller anyway.
+if (!isValidScopeId(AGENT_SCOPE)) {
+  // Warn but keep serving MCP tools. Exiting would make a missing env var look
+  // like a crashed channel to the watchdog, which restarts it in a loop — the
+  // same constraint internal-inject follows when its tokens.json is absent.
+  process.stderr.write(
+    `telegram channel: AGENT_SCOPE=${JSON.stringify(AGENT_SCOPE)} is not a valid scope id; ` +
+    `not subscribing (no messages will arrive). Set it in the launcher.\n`,
+  )
+} else {
+  subscription = startSubscribeClient({
+    host: POLLER_HOST,
+    port: TELEGRAM_POLLER_PORT,
+    scopeId: AGENT_SCOPE,
+    onEnvelope: async (envelope: InboundEnvelope) => {
+      // botInfo rides along on every envelope because this process cannot fetch
+      // it: an in-process getMe starves under the MCP stdin watcher. Applying it
+      // before the first update is what makes isMentioned() work in groups.
+      const me = envelope.botInfo as typeof bot.botInfo | undefined
+      if (me && !bot.isInited()) {
+        bot.botInfo = me
+        botUsername = me.username
+        persistBotUsername(botUsername)
+      }
+      await bot.handleUpdate(envelope.payload as Parameters<typeof bot.handleUpdate>[0])
+    },
+  })
 }
