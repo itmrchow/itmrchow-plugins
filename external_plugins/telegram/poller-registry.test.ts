@@ -79,6 +79,24 @@ test('情境 8 全域重啟：poller 不屬於任何 scope，斷線等同情境 
   expect(reg.size()).toBe(1)
 })
 
+test('requeue 把未 ack 的訊息放回佇列前端，維持原順序', () => {
+  const first = env('telegram-dm-9')
+  const second = env('telegram-dm-9')
+  reg.admit('telegram-dm-9', first)
+  reg.onSubscribed('telegram-dm-9')
+  reg.onDisconnected('telegram-dm-9')
+  const later = env('telegram-dm-9')
+  reg.admit('telegram-dm-9', later)
+  reg.requeue('telegram-dm-9', [first, second])
+  // maxQueue=2：先到的兩則留下，後到的 later 被擠掉
+  expect(reg.onSubscribed('telegram-dm-9')).toEqual([first, second])
+})
+
+test('requeue 對不存在的 scope 是 no-op（spawn 失敗後連線才斷）', () => {
+  reg.requeue('telegram-dm-gone', [env('telegram-dm-gone')])
+  expect(reg.size()).toBe(0)
+})
+
 test('容量上限：超過 maxScopes 不再 spawn（假設 A-8）', () => {
   reg.admit('telegram-dm-a', env('telegram-dm-a'))
   reg.admit('telegram-dm-b', env('telegram-dm-b'))

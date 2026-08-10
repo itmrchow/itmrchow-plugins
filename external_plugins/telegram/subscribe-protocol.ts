@@ -15,6 +15,16 @@ export type InboundEnvelope = {
   platform: string
   payload: unknown
   ts: number
+  /**
+   * The bot's own identity, as returned by getMe.
+   *
+   * Carried on the wire because a subscriber cannot obtain it for itself: an
+   * in-process getMe starves under the MCP stdin watcher on arm64-linux, which
+   * is the entire reason the poller exists. Repeating it per message costs a
+   * few bytes and removes a startup ordering dependency; subscribers apply it
+   * once and ignore it thereafter.
+   */
+  botInfo?: unknown
 }
 
 /** SSE comment line. The poller sends one every 20s so a subscriber can tell

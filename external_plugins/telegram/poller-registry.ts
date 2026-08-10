@@ -107,6 +107,25 @@ export class ScopeRegistry {
     return entry.queue
   }
 
+  /**
+   * Put messages that were written to a subscription but never acked back at
+   * the head of the queue, so a socket that dies mid-delivery costs a redelivery
+   * rather than the message. Without this the /ack half of the protocol would
+   * be decorative.
+   *
+   * Over capacity, the newest are dropped and the oldest kept — the same policy
+   * admit() uses, so whatever survives stays causally ordered.
+   *
+   * @param scopeId - The scope whose connection dropped.
+   * @param envelopes - Un-acked messages, oldest first.
+   */
+  requeue(scopeId: string, envelopes: InboundEnvelope[]): void {
+    const entry = this.#entries.get(scopeId)
+    if (!entry || envelopes.length === 0) return
+    entry.queue.unshift(...envelopes)
+    if (entry.queue.length > this.#maxQueue) entry.queue.length = this.#maxQueue
+  }
+
   /** @returns Number of scopes currently tracked, used for the cap check. */
   size(): number {
     return this.#entries.size
