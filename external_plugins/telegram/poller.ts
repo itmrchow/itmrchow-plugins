@@ -26,7 +26,13 @@ import { buildBotCommands } from './bot-commands'
 import { resolveControlCommands } from './control-plane'
 import { ScopeRegistry } from './poller-registry'
 import { createSubscribeServer } from './subscribe-server'
-import { consumeUpdates, routeUpdate, type RouteContext, type SpawnOutcome } from './route-update'
+import {
+  consumeUpdates,
+  routeUpdate,
+  type ConsumeContext,
+  type RouteContext,
+  type SpawnOutcome,
+} from './route-update'
 
 const DEFAULT_POLLER_PORT = 7852
 const DEFAULT_MAX_SCOPES = 10
@@ -174,17 +180,21 @@ async function main(): Promise<void> {
     botInfo: me,
   }
 
+  // Built once, outside the loop: it carries the per-update failure counter,
+  // which has to survive across batches for the poison-pill threshold to be
+  // reachable at all (a poison update returns in a NEW batch every time).
+  const consumeCtx: ConsumeContext = { route: update => routeUpdate(update, ctx) }
+
   let offset: number | undefined
   while (!shuttingDown) {
     try {
       const updates = await bot.api.getUpdates({ offset, timeout: POLL_TIMEOUT_SECONDS })
-      const result = await consumeUpdates(updates, update => routeUpdate(update, ctx), offset)
-      offset = result.offset
-      if (result.error) {
-        // offset still points AT the failed update, so it comes back next poll.
-        process.stderr.write(`telegram poller: route error, will retry: ${result.error}\n`)
-        await new Promise(r => setTimeout(r, POLL_RETRY_MS))
-      }
+      const next = await consumeUpdates(updates, consumeCtx, offset)
+      // A held-back offset makes the next getUpdates return instantly with the
+      // same update, so without this pause the retries burn CPU in a tight loop.
+      const stalled = updates.length > 0 && next === offset
+      offset = next
+      if (stalled) await new Promise(r => setTimeout(r, POLL_RETRY_MS))
     } catch (err) {
       const is409 = (err as { error_code?: number })?.error_code === 409
       const delay = is409 ? CONFLICT_RETRY_MS : POLL_RETRY_MS

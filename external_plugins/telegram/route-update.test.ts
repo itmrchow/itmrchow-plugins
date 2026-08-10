@@ -5,6 +5,7 @@ import {
   consumeUpdates,
   resolveUpdateScope,
   routeUpdate,
+  type ConsumeContext,
   type RouteContext,
   type SpawnOutcome,
 } from './route-update'
@@ -168,38 +169,124 @@ test('spawn 成功且如期訂閱：逾時計時器不誤殺已連上的 scope',
   expect(h.notified).toEqual([])
 })
 
-test('consumeUpdates 全部處理成功時推進到最後一則之後', async () => {
+test('處理成功才推進到最後一則之後', async () => {
   const seen: number[] = []
-  const result = await consumeUpdates(
+  const offset = await consumeUpdates(
     [privateUpdate(10), privateUpdate(11)],
-    async u => void seen.push(u.update_id),
+    { route: async u => void seen.push(u.update_id) },
     undefined,
   )
   expect(seen).toEqual([10, 11])
-  expect(result).toEqual({ offset: 12 })
+  expect(offset).toBe(12)
 })
 
-test('routeUpdate 失敗時 offset 停在該則之前，下次會重新取得（假設 A-9）', async () => {
+test('處理失敗時 offset 不推進，訊息不會永久遺失（A-9 回歸）', async () => {
+  const offset = await consumeUpdates(
+    [privateUpdate(10), privateUpdate(11)],
+    {
+      route: async () => {
+        throw new Error('boom')
+      },
+    },
+    undefined,
+  )
+  expect(offset).toBeUndefined()
+})
+
+test('部分成功時只推進到第一個失敗之前（維持因果順序）', async () => {
   const attempted: number[] = []
-  const route = async (u: Update): Promise<void> => {
-    attempted.push(u.update_id)
-    if (u.update_id === 11) throw new Error('boom')
-  }
-  const result = await consumeUpdates(
+  const offset = await consumeUpdates(
     [privateUpdate(10), privateUpdate(11), privateUpdate(12)],
-    route,
+    {
+      route: async (u: Update) => {
+        attempted.push(u.update_id)
+        if (u.update_id === 11) throw new Error('boom')
+      },
+    },
     10,
   )
-  // 11 沒處理成功，offset 必須仍指向 11，否則這則永久消失
-  expect(result.offset).toBe(11)
-  expect((result.error as Error).message).toBe('boom')
+  expect(offset).toBe(11)
+  // 失敗那則之後的不先跑，否則同一個 chat 的訊息會亂序
   expect(attempted).toEqual([10, 11])
 })
 
-test('consumeUpdates 第一則就失敗時 offset 完全不動', async () => {
-  const route = async (): Promise<void> => {
-    throw new Error('boom')
+test('同一則連續失敗 3 次後跳過並記 log，不讓一則毒訊息弄聾整個平台（§2.5）', async () => {
+  const logged: string[] = []
+  const ctx: ConsumeContext = {
+    route: async () => {
+      throw new Error('boom')
+    },
+    log: line => void logged.push(line),
   }
-  const result = await consumeUpdates([privateUpdate(10)], route, 5)
-  expect(result.offset).toBe(5)
+  let offset: number | undefined
+  for (let i = 0; i < 3; i++) offset = await consumeUpdates([privateUpdate(10)], ctx, offset)
+
+  expect(offset).toBe(11)
+  expect(logged.some(l => l.includes('poison_pill_skipped'))).toBe(true)
+  expect(logged.some(l => l.includes('update_id=10'))).toBe(true)
+  // 事後要找得到「是誰的訊息被丟掉」
+  expect(logged.some(l => l.includes('telegram-dm-555'))).toBe(true)
+})
+
+test('毒丸計數以 update_id 為鍵：不同訊息的失敗不互相累加', async () => {
+  const ctx: ConsumeContext = {
+    route: async () => {
+      throw new Error('boom')
+    },
+  }
+  await consumeUpdates([privateUpdate(10)], ctx, undefined)
+  await consumeUpdates([privateUpdate(11)], ctx, undefined)
+  // 兩則各失敗 1 次；若計數共用，第 3 次呼叫就會誤跳過
+  const offset = await consumeUpdates([privateUpdate(12)], ctx, undefined)
+  expect(offset).toBeUndefined()
+})
+
+test('成功後清除該則的失敗計數：偶發失敗不會累積成毒丸', async () => {
+  let failNext = true
+  const ctx: ConsumeContext = {
+    route: async () => {
+      if (failNext) throw new Error('flaky')
+    },
+  }
+  // 失敗 2 次（差一次就到門檻）
+  await consumeUpdates([privateUpdate(10)], ctx, undefined)
+  await consumeUpdates([privateUpdate(10)], ctx, undefined)
+
+  failNext = false
+  expect(await consumeUpdates([privateUpdate(10)], ctx, undefined)).toBe(11)
+
+  // 計數若沒被成功清掉，接下來這兩次會分別數成第 3、4 次而誤判毒丸
+  failNext = true
+  expect(await consumeUpdates([privateUpdate(10)], ctx, undefined)).toBeUndefined()
+  expect(await consumeUpdates([privateUpdate(10)], ctx, undefined)).toBeUndefined()
+})
+
+test('毒丸跳過後繼續處理同一批的後續訊息', async () => {
+  const attempted: number[] = []
+  const ctx: ConsumeContext = {
+    route: async (u: Update) => {
+      attempted.push(u.update_id)
+      if (u.update_id === 10) throw new Error('boom')
+    },
+  }
+  await consumeUpdates([privateUpdate(10)], ctx, undefined)
+  await consumeUpdates([privateUpdate(10)], ctx, undefined)
+  const offset = await consumeUpdates([privateUpdate(10), privateUpdate(11)], ctx, undefined)
+  expect(offset).toBe(12)
+  expect(attempted.at(-1)).toBe(11)
+})
+
+test('scope-id 算不出來的毒訊息照樣跳得掉，log 標成 unknown', async () => {
+  const logged: string[] = []
+  const noChat = { update_id: 20, poll: { id: 'p' } } as unknown as Update
+  const ctx: ConsumeContext = {
+    route: async () => {
+      throw new Error('boom')
+    },
+    log: line => void logged.push(line),
+  }
+  let offset: number | undefined
+  for (let i = 0; i < 3; i++) offset = await consumeUpdates([noChat], ctx, offset)
+  expect(offset).toBe(21)
+  expect(logged.some(l => l.includes('scope=unknown'))).toBe(true)
 })

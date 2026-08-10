@@ -173,6 +173,37 @@ export async function routeUpdate(update: Update, ctx: RouteContext): Promise<vo
   }, SPAWN_TIMEOUT_MS)
 }
 
+export type ConsumeContext = {
+  route: (update: Update) => Promise<void>
+  /** Defaults to stderr. Injectable so tests can read what was reported. */
+  log?: (line: string) => void
+  /**
+   * Consecutive failures per update_id. Created on first use and stored here
+   * because the count has to survive across getUpdates batches — a poison
+   * update comes back in a NEW batch every time, so a counter scoped to one
+   * call would reset to 1 forever and never reach the threshold.
+   */
+  failures?: Map<number, number>
+}
+
+/** Consecutive failures on one update before it is skipped as a poison pill. */
+export const POISON_PILL_MAX_ATTEMPTS = 3
+
+/**
+ * Best-effort scope-id for logging only.
+ *
+ * Never throws: an update whose scope cannot be computed is itself a likely
+ * poison cause, and the log line explaining that must not be what crashes.
+ */
+function describeScope(update: Update): string {
+  try {
+    const target = resolveUpdateScope(update)
+    return target ? buildScopeId(PLATFORM, target.kind, target.anchorId) : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
 /**
  * Walk a batch of updates, returning the offset for the next getUpdates call.
  *
@@ -182,28 +213,59 @@ export async function routeUpdate(update: Update, ctx: RouteContext): Promise<vo
  * dynamic architecture "cannot deliver yet" is the normal state during a spawn,
  * exactly when messages most need to survive.
  *
- * A failing update stops the walk and is returned rather than thrown, so the
- * caller resumes from an offset that still includes it. Throwing instead would
- * put offset preservation in the caller's hands, where the original bug lived.
+ * A failure stops the walk and is reported through the returned offset rather
+ * than thrown, so offset preservation is a property of this function instead of
+ * its caller — which is where the original bug lived.
+ *
+ * Holding the offset back has its own failure mode, so it is bounded: an update
+ * that fails POISON_PILL_MAX_ATTEMPTS times in a row is logged and skipped.
+ * Without that, one permanently unprocessable update pins the offset forever,
+ * Telegram redelivers it endlessly, and the platform goes deaf to everything
+ * else — strictly worse than losing that one message. Transient failures never
+ * reach the threshold: while a scope is spawning or reconnecting, the registry
+ * already counts the message as queued, i.e. handled.
  *
  * @param updates - Updates from one getUpdates call, in order.
- * @param route - Handler for one update.
+ * @param ctx - Handler, optional log sink, and the cross-batch failure counter.
  * @param currentOffset - Offset used for this batch.
- * @returns The offset to use next, plus the error that stopped the walk.
+ * @returns The offset to use next.
  */
 export async function consumeUpdates(
   updates: readonly Update[],
-  route: (update: Update) => Promise<void>,
+  ctx: ConsumeContext,
   currentOffset: number | undefined,
-): Promise<{ offset: number | undefined; error?: unknown }> {
+): Promise<number | undefined> {
+  const log = ctx.log ?? ((line: string) => void process.stderr.write(`${line}\n`))
+  const failures = (ctx.failures ??= new Map<number, number>())
   let offset = currentOffset
+
   for (const update of updates) {
     try {
-      await route(update)
+      await ctx.route(update)
+      failures.delete(update.update_id)
+      offset = update.update_id + 1
+      continue
     } catch (error) {
-      return { offset, error }
+      const attempts = (failures.get(update.update_id) ?? 0) + 1
+      failures.set(update.update_id, attempts)
+
+      if (attempts < POISON_PILL_MAX_ATTEMPTS) {
+        log(
+          `telegram poller: route failed (attempt ${attempts}/${POISON_PILL_MAX_ATTEMPTS}) ` +
+          `update_id=${update.update_id} scope=${describeScope(update)}: ${error}`,
+        )
+        return offset
+      }
+
+      // Dropping a message must never be silent: this line is the only trace
+      // anyone will ever have that it happened.
+      log(
+        `telegram poller: poison_pill_skipped update_id=${update.update_id} ` +
+        `scope=${describeScope(update)} attempts=${attempts}: ${error}`,
+      )
+      failures.delete(update.update_id)
+      offset = update.update_id + 1
     }
-    offset = update.update_id + 1
   }
-  return { offset }
+  return offset
 }
