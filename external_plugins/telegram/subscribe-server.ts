@@ -87,7 +87,18 @@ export function createSubscribeServer(opts: {
 
     // A second subscription for the same scope means the previous process is
     // gone (or hung) and this one is the real owner — keep the newer socket.
-    connections.get(scopeId)?.res.end()
+    // The takeover is done HERE rather than left to the old socket's 'close'
+    // handler: that handler fires asynchronously, by which time dropConnection's
+    // "still mine?" guard sees the newer connection and returns without ever
+    // requeueing — the old socket's in-flight messages would vanish silently.
+    // Requeue must also land before onSubscribed() below, or the flush it
+    // returns will not include them.
+    const previous = connections.get(scopeId)
+    if (previous) {
+      connections.delete(scopeId)
+      opts.registry.requeue(scopeId, [...previous.inFlight.values()])
+      previous.res.end()
+    }
 
     const conn: Connection = { res, inFlight: new Map() }
     connections.set(scopeId, conn)
@@ -108,17 +119,23 @@ export function createSubscribeServer(opts: {
       if (raw.length > MAX_ACK_BODY_BYTES) req.destroy()
     })
     req.on('end', () => {
-      let envelopeId: unknown
+      let body: { envelopeId?: unknown; scopeId?: unknown }
       try {
-        envelopeId = (JSON.parse(raw) as { envelopeId?: unknown }).envelopeId
+        body = JSON.parse(raw) as { envelopeId?: unknown; scopeId?: unknown }
       } catch {
         res.writeHead(400)
         res.end('invalid json')
         return
       }
-      if (typeof envelopeId === 'string') {
-        for (const conn of connections.values()) conn.inFlight.delete(envelopeId)
+      // Scope-bound on purpose: envelope ids are generated per scope, so acking
+      // by id alone let one scope clear another scope's in-flight entry and lose
+      // that message for good.
+      if (typeof body.envelopeId !== 'string' || typeof body.scopeId !== 'string') {
+        res.writeHead(400)
+        res.end('invalid ack')
+        return
       }
+      connections.get(body.scopeId)?.inFlight.delete(body.envelopeId)
       res.writeHead(200)
       res.end('ok')
     })

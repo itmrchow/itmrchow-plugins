@@ -53,6 +53,27 @@ function collect(
 const closeServer = (server: Server): Promise<void> =>
   new Promise(r => server.close(() => r()))
 
+function ack(port: number, body: { envelopeId?: string; scopeId?: string }): Promise<number> {
+  const raw = JSON.stringify(body)
+  return new Promise<number>((resolve, reject) => {
+    const req = request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/ack',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      },
+      res => {
+        res.resume()
+        res.on('end', () => resolve(res.statusCode ?? 0))
+      },
+    )
+    req.on('error', reject)
+    req.end(raw)
+  })
+}
+
 test('訂閱端連上後，registry 內排隊的訊息會依序補送', async () => {
   const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
   registry.admit('telegram-dm-1', envelope('e1'))
@@ -152,24 +173,7 @@ test('已 ack 的訊息不會在重連後重送', async () => {
   hub.deliver('telegram-dm-4', [envelope('acked', 'telegram-dm-4')])
   await first.done
 
-  const ackBody = JSON.stringify({ envelopeId: 'acked' })
-  await new Promise<void>((resolve, reject) => {
-    const req = request(
-      {
-        host: '127.0.0.1',
-        port,
-        path: '/ack',
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-      },
-      res => {
-        res.resume()
-        res.on('end', () => resolve())
-      },
-    )
-    req.on('error', reject)
-    req.end(ackBody)
-  })
+  await ack(port, { envelopeId: 'acked', scopeId: 'telegram-dm-4' })
 
   first.stop()
   await new Promise(r => setTimeout(r, 100))
@@ -179,6 +183,75 @@ test('已 ack 的訊息不會在重連後重送', async () => {
   expect((await second.done)[0].envelopeId).toBe('fresh')
 
   second.stop()
+  hub.close()
+  await closeServer(hub.server)
+})
+
+test('接管舊連線時，舊連線未 ack 的訊息同步回佇列並補送給新連線（P1-1）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  const hub = createSubscribeServer({ registry })
+  const port = await listen(hub)
+
+  const first = collect(port, 'telegram-dm-9', 1)
+  await new Promise(r => setTimeout(r, 100))
+  hub.deliver('telegram-dm-9', [envelope('in-flight', 'telegram-dm-9')])
+  expect((await first.done)[0].envelopeId).toBe('in-flight')
+
+  // 舊連線還開著就被新連線接管（agent 崩潰重生的情境）。舊連線的 close 事件是
+  // 非同步的，接管若不同步做，requeue 永遠不會執行，這則訊息就靜默消失。
+  const second = collect(port, 'telegram-dm-9', 1)
+  expect((await second.done)[0].envelopeId).toBe('in-flight')
+
+  first.stop()
+  second.stop()
+  hub.close()
+  await closeServer(hub.server)
+})
+
+test('ack 只清掉自己 scope 的 in-flight，不會誤刪別的 scope（P2-1）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  const hub = createSubscribeServer({ registry })
+  const port = await listen(hub)
+
+  const a = collect(port, 'telegram-dm-a', 1)
+  const b = collect(port, 'telegram-dm-b', 1)
+  await new Promise(r => setTimeout(r, 100))
+  hub.deliver('telegram-dm-a', [envelope('shared-id', 'telegram-dm-a')])
+  hub.deliver('telegram-dm-b', [envelope('shared-id', 'telegram-dm-b')])
+  await a.done
+  await b.done
+
+  // 只有 A 送出 ack
+  const status = await ack(port, { envelopeId: 'shared-id', scopeId: 'telegram-dm-a' })
+  expect(status).toBe(200)
+
+  a.stop()
+  b.stop()
+  await new Promise(r => setTimeout(r, 100))
+  // B 沒 ack 過，斷線後那則必須還在佇列裡
+  expect(registry.onSubscribed('telegram-dm-b').map(e => e.envelopeId)).toEqual(['shared-id'])
+  expect(registry.onSubscribed('telegram-dm-a')).toEqual([])
+
+  hub.close()
+  await closeServer(hub.server)
+})
+
+test('ack 缺 scopeId 一律 400，不做任何刪除', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  const hub = createSubscribeServer({ registry })
+  const port = await listen(hub)
+
+  const sub = collect(port, 'telegram-dm-c', 1)
+  await new Promise(r => setTimeout(r, 100))
+  hub.deliver('telegram-dm-c', [envelope('kept', 'telegram-dm-c')])
+  await sub.done
+
+  expect(await ack(port, { envelopeId: 'kept' })).toBe(400)
+
+  sub.stop()
+  await new Promise(r => setTimeout(r, 100))
+  expect(registry.onSubscribed('telegram-dm-c').map(e => e.envelopeId)).toEqual(['kept'])
+
   hub.close()
   await closeServer(hub.server)
 })

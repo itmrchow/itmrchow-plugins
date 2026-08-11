@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { nextBackoffMs, startSubscribeClient } from './subscribe-client'
+import { createReconnectScheduler, nextBackoffMs, startSubscribeClient } from './subscribe-client'
 import { ScopeRegistry } from './poller-registry'
 import { createSubscribeServer, type SubscribeHub } from './subscribe-server'
 import type { InboundEnvelope } from './subscribe-protocol'
@@ -41,6 +41,51 @@ test('退避上限 30 秒', () => {
 test('加 ±20% jitter：全域重啟時 N 個 server 不會同時撞上來', () => {
   expect(nextBackoffMs(0, () => 0)).toBe(800)
   expect(nextBackoffMs(0, () => 1)).toBe(1200)
+})
+
+function schedulerHarness(opts?: { stopped?: boolean }): {
+  schedule: (reason: string) => void
+  waits: number[]
+  logged: string[]
+} {
+  const waits: number[] = []
+  const logged: string[] = []
+  let attempt = 0
+  const schedule = createReconnectScheduler({
+    isStopped: () => opts?.stopped ?? false,
+    nextWaitMs: () => nextBackoffMs(attempt++, () => 0.5),
+    reconnect: wait => void waits.push(wait),
+    log: line => void logged.push(line),
+  })
+  return { schedule, waits, logged }
+}
+
+test('同一條連線的兩個事件源只排一次重連（P1-2：node 會兩個都送，bun 只送一個）', () => {
+  const h = schedulerHarness()
+  // 正式環境（node）上這兩個事件對同一條死掉的連線都會觸發
+  h.schedule('Error: socket hang up')
+  h.schedule('stream closed')
+  expect(h.waits).toEqual([1000])
+  // 記下的是第一個原因，後面那個被吃掉
+  expect(h.logged.length).toBe(1)
+  expect(h.logged[0]).toContain('socket hang up')
+})
+
+test('旗標是每條連線各自的：下一條連線仍排得動重連', () => {
+  const first = schedulerHarness()
+  first.schedule('a')
+  first.schedule('b')
+  const second = schedulerHarness()
+  second.schedule('c')
+  expect(first.waits.length).toBe(1)
+  expect(second.waits.length).toBe(1)
+})
+
+test('已 stop 的 client 不排重連、也不記 log', () => {
+  const h = schedulerHarness({ stopped: true })
+  h.schedule('stream closed')
+  expect(h.waits).toEqual([])
+  expect(h.logged).toEqual([])
 })
 
 test('端對端：訂閱收訊並 ack，poller 重啟後自動重連續收', async () => {

@@ -30,6 +30,38 @@ export function nextBackoffMs(attempt: number, random: () => number = Math.rando
 export type SubscribeClient = { stop: () => void }
 
 /**
+ * Build the reconnect scheduler for ONE connection attempt.
+ *
+ * It fires at most once. node emits BOTH `req` 'error' and `res` 'close' when a
+ * connection dies, bun emits only one — so on the production runtime an
+ * unguarded scheduler starts two reconnect loops (two sockets, one of them
+ * orphaned and never acking), and no test running on bun can reproduce it.
+ * Do not remove the flag on the grounds that "it is only called once here".
+ *
+ * @param opts.isStopped - Client shutdown check; a stopped client schedules nothing.
+ * @param opts.nextWaitMs - Backoff for this attempt; called once per connection.
+ * @param opts.reconnect - Performs the delayed reconnect.
+ * @param opts.log - Diagnostics sink; defaults to stderr.
+ * @returns A scheduler taking the reason this connection died.
+ */
+export function createReconnectScheduler(opts: {
+  isStopped: () => boolean
+  nextWaitMs: () => number
+  reconnect: (waitMs: number) => void
+  log?: (line: string) => void
+}): (reason: string) => void {
+  let scheduled = false
+  return (reason: string): void => {
+    if (opts.isStopped() || scheduled) return
+    scheduled = true
+    const wait = opts.nextWaitMs()
+    const log = opts.log ?? ((line: string) => void process.stderr.write(line))
+    log(`telegram channel: subscription lost (${reason}); reconnecting in ${wait}ms\n`)
+    opts.reconnect(wait)
+  }
+}
+
+/**
  * Subscribe to this scope's message stream on the platform poller and keep the
  * connection alive across restarts of either side.
  *
@@ -51,7 +83,7 @@ export function startSubscribeClient(opts: {
   let idleTimer: ReturnType<typeof setTimeout> | undefined
 
   const ack = (envelopeId: string): void => {
-    const body = JSON.stringify({ envelopeId })
+    const body = JSON.stringify({ envelopeId, scopeId: opts.scopeId })
     const req = request({
       host: opts.host,
       port: opts.port,
@@ -65,17 +97,6 @@ export function startSubscribeClient(opts: {
     req.end(body)
   }
 
-  const scheduleReconnect = (reason: string): void => {
-    if (stopped) return
-    if (idleTimer) clearTimeout(idleTimer)
-    const wait = nextBackoffMs(attempt)
-    attempt += 1
-    process.stderr.write(
-      `telegram channel: subscription lost (${reason}); reconnecting in ${wait}ms\n`,
-    )
-    setTimeout(connect, wait).unref?.()
-  }
-
   const armIdleTimer = (res: IncomingMessage): void => {
     if (idleTimer) clearTimeout(idleTimer)
     // Keepalives arrive well inside this window, so silence past it means the
@@ -87,6 +108,20 @@ export function startSubscribeClient(opts: {
 
   const connect = (): void => {
     if (stopped) return
+    // Per connection, not per client: each attempt gets its own once-flag so a
+    // later connection can still reconnect.
+    const scheduleReconnect = createReconnectScheduler({
+      isStopped: () => stopped,
+      nextWaitMs: () => {
+        const wait = nextBackoffMs(attempt)
+        attempt += 1
+        return wait
+      },
+      reconnect: wait => {
+        if (idleTimer) clearTimeout(idleTimer)
+        setTimeout(connect, wait).unref?.()
+      },
+    })
     const req = request(
       {
         host: opts.host,
