@@ -22,6 +22,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { spawn as spawnProcess } from 'node:child_process'
 import { resolveCount, resolvePort } from './resolve-port'
+import { resolveStateDir } from './state-dir'
 import { buildBotCommands } from './bot-commands'
 import { resolveControlCommands } from './control-plane'
 import { ScopeRegistry } from './poller-registry'
@@ -48,9 +49,15 @@ const SPAWN_EXIT_OK = 0
 const SPAWN_EXIT_CAP_REACHED = 2
 const SPAWN_EXIT_INVALID_SCOPE = 3
 
-const STATE_DIR =
-  process.env.TELEGRAM_STATE_DIR ||
-  join(process.env.HOME || '', '.claude', 'channels', 'telegram')
+// Fail-closed, no default path: see resolveStateDir for why.
+const STATE_DIR = resolveStateDir(process.env)
+if (!STATE_DIR) {
+  process.stderr.write(
+    'telegram poller: TELEGRAM_STATE_DIR required (no default, so a stray run cannot read the live token)\n',
+  )
+  process.exit(1)
+}
+
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
 

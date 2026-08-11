@@ -5,7 +5,7 @@
 // rebuild below is the single highest-risk piece of this file — see
 // pickAccessFields — and leaving it untestable meant its only guard was a
 // comment. Same shape as the other extracted modules here (meta-text.ts,
-// inject-port.ts, poll-mode.ts): pure logic plus a matching .test.ts.
+// scope-id.ts, resolve-port.ts): pure logic plus a matching .test.ts.
 
 export type PendingEntry = {
   senderId: string

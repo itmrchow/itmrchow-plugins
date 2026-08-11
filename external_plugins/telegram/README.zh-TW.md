@@ -77,6 +77,7 @@ Claude Code 用上一步方式跑起來後，在 Telegram DM 你的 bot — 它�
 本 fork 在 upstream plugin 之上加了常駐 agent（例如跑在 VM tmux session 內）需要的運維功能：
 
 - **訂閱式收訊（`poller.ts`）** — 獨立的 poller 是該 token 唯一的 `getUpdates` 消費者。它判斷每則 update 屬於哪個對話，再以 Server-Sent Events 推給服務該對話的 server 程序。server 本身不綁任何 port，改為主動連到 `127.0.0.1:7852`（可用 `TELEGRAM_POLLER_PORT` 覆寫）並以指數退避自動重連 —— 因此同一個 bot token 底下，多個對話可以各自跑自己的 agent session。
+  - `TELEGRAM_STATE_DIR` 是 **poller 的必填項**且沒有預設值：未設就直接結束，避免測試或誤啟動的 process 繼承到預設路徑、用正式 bot token 長輪詢。server 程序仍維持預設 `~/.claude/channels/telegram`。
   - `AGENT_SCOPE` 指明本程序服務哪個對話（例：`telegram-dm-12345`）。值不合法時 server 仍照常提供 MCP 工具，但收不到任何訊息，並於 stderr 明講。
   - `MAX_SCOPES`（預設 10）限制同時存在的 session 數；超過上限時新的發話者會收到「目前容量已滿」，而不是再開一個 agent。
   - `SCOPE_SPAWN_BIN` 指向 host 端用來替尚無 session 的對話開 session 的腳本。未設則永遠不開新 session，並回覆發話者服務未完整設定。

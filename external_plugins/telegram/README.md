@@ -77,6 +77,7 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 This fork extends the upstream plugin with operational features for running the bot as an always-on agent (e.g. inside a tmux session on a VM):
 
 - **Subscription-based inbound (`poller.ts`)** — the standalone poller is the token's only `getUpdates` consumer. It works out which conversation each update belongs to, and pushes it over Server-Sent Events to whichever server process serves that conversation. The server binds no port of its own; it connects out to `127.0.0.1:7852` (override with `TELEGRAM_POLLER_PORT`) and reconnects with exponential backoff, so several conversations can each run their own agent session against one bot token.
+  - `TELEGRAM_STATE_DIR` is **required by the poller** and has no default: it exits immediately when unset, so a stray or test run cannot inherit the default path and long-poll with the live bot token. The server process still defaults to `~/.claude/channels/telegram`.
   - `AGENT_SCOPE` names the conversation this process serves (e.g. `telegram-dm-12345`). Without a valid value the server still serves its MCP tools but receives no messages, and says so on stderr.
   - `MAX_SCOPES` (default 10) caps how many sessions may exist at once; over the cap, new senders get a "capacity full" reply rather than starting another agent.
   - `SCOPE_SPAWN_BIN` points at the host script that starts a session for a conversation that has none. Unset means no session is ever started, and senders are told the service is not fully configured.
