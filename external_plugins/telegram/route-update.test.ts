@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import type { Update } from 'grammy/types'
 import { ScopeRegistry } from './poller-registry'
 import {
-  consumeUpdates,
+  createUpdateConsumer,
   resolveUpdateScope,
   routeUpdate,
   type ConsumeContext,
@@ -171,40 +171,31 @@ test('spawn 成功且如期訂閱：逾時計時器不誤殺已連上的 scope',
 
 test('處理成功才推進到最後一則之後', async () => {
   const seen: number[] = []
-  const offset = await consumeUpdates(
-    [privateUpdate(10), privateUpdate(11)],
-    { route: async u => void seen.push(u.update_id) },
-    undefined,
-  )
+  const consume = createUpdateConsumer({ route: async u => void seen.push(u.update_id) })
+  const offset = await consume([privateUpdate(10), privateUpdate(11)], undefined)
   expect(seen).toEqual([10, 11])
   expect(offset).toBe(12)
 })
 
 test('處理失敗時 offset 不推進，訊息不會永久遺失（A-9 回歸）', async () => {
-  const offset = await consumeUpdates(
-    [privateUpdate(10), privateUpdate(11)],
-    {
-      route: async () => {
-        throw new Error('boom')
-      },
+  const consume = createUpdateConsumer({
+    route: async () => {
+      throw new Error('boom')
     },
-    undefined,
-  )
+  })
+  const offset = await consume([privateUpdate(10), privateUpdate(11)], undefined)
   expect(offset).toBeUndefined()
 })
 
 test('部分成功時只推進到第一個失敗之前（維持因果順序）', async () => {
   const attempted: number[] = []
-  const offset = await consumeUpdates(
-    [privateUpdate(10), privateUpdate(11), privateUpdate(12)],
-    {
-      route: async (u: Update) => {
-        attempted.push(u.update_id)
-        if (u.update_id === 11) throw new Error('boom')
-      },
+  const consume = createUpdateConsumer({
+    route: async (u: Update) => {
+      attempted.push(u.update_id)
+      if (u.update_id === 11) throw new Error('boom')
     },
-    10,
-  )
+  })
+  const offset = await consume([privateUpdate(10), privateUpdate(11), privateUpdate(12)], 10)
   expect(offset).toBe(11)
   // 失敗那則之後的不先跑，否則同一個 chat 的訊息會亂序
   expect(attempted).toEqual([10, 11])
@@ -212,14 +203,14 @@ test('部分成功時只推進到第一個失敗之前（維持因果順序）',
 
 test('同一則連續失敗 3 次後跳過並記 log，不讓一則毒訊息弄聾整個平台（§2.5）', async () => {
   const logged: string[] = []
-  const ctx: ConsumeContext = {
+  const consume = createUpdateConsumer({
     route: async () => {
       throw new Error('boom')
     },
     log: line => void logged.push(line),
-  }
+  })
   let offset: number | undefined
-  for (let i = 0; i < 3; i++) offset = await consumeUpdates([privateUpdate(10)], ctx, offset)
+  for (let i = 0; i < 3; i++) offset = await consume([privateUpdate(10)], offset)
 
   expect(offset).toBe(11)
   expect(logged.some(l => l.includes('poison_pill_skipped'))).toBe(true)
@@ -229,49 +220,49 @@ test('同一則連續失敗 3 次後跳過並記 log，不讓一則毒訊息弄�
 })
 
 test('毒丸計數以 update_id 為鍵：不同訊息的失敗不互相累加', async () => {
-  const ctx: ConsumeContext = {
+  const consume = createUpdateConsumer({
     route: async () => {
       throw new Error('boom')
     },
-  }
-  await consumeUpdates([privateUpdate(10)], ctx, undefined)
-  await consumeUpdates([privateUpdate(11)], ctx, undefined)
+  })
+  await consume([privateUpdate(10)], undefined)
+  await consume([privateUpdate(11)], undefined)
   // 兩則各失敗 1 次；若計數共用，第 3 次呼叫就會誤跳過
-  const offset = await consumeUpdates([privateUpdate(12)], ctx, undefined)
+  const offset = await consume([privateUpdate(12)], undefined)
   expect(offset).toBeUndefined()
 })
 
 test('成功後清除該則的失敗計數：偶發失敗不會累積成毒丸', async () => {
   let failNext = true
-  const ctx: ConsumeContext = {
+  const consume = createUpdateConsumer({
     route: async () => {
       if (failNext) throw new Error('flaky')
     },
-  }
+  })
   // 失敗 2 次（差一次就到門檻）
-  await consumeUpdates([privateUpdate(10)], ctx, undefined)
-  await consumeUpdates([privateUpdate(10)], ctx, undefined)
+  await consume([privateUpdate(10)], undefined)
+  await consume([privateUpdate(10)], undefined)
 
   failNext = false
-  expect(await consumeUpdates([privateUpdate(10)], ctx, undefined)).toBe(11)
+  expect(await consume([privateUpdate(10)], undefined)).toBe(11)
 
   // 計數若沒被成功清掉，接下來這兩次會分別數成第 3、4 次而誤判毒丸
   failNext = true
-  expect(await consumeUpdates([privateUpdate(10)], ctx, undefined)).toBeUndefined()
-  expect(await consumeUpdates([privateUpdate(10)], ctx, undefined)).toBeUndefined()
+  expect(await consume([privateUpdate(10)], undefined)).toBeUndefined()
+  expect(await consume([privateUpdate(10)], undefined)).toBeUndefined()
 })
 
 test('毒丸跳過後繼續處理同一批的後續訊息', async () => {
   const attempted: number[] = []
-  const ctx: ConsumeContext = {
+  const consume = createUpdateConsumer({
     route: async (u: Update) => {
       attempted.push(u.update_id)
       if (u.update_id === 10) throw new Error('boom')
     },
-  }
-  await consumeUpdates([privateUpdate(10)], ctx, undefined)
-  await consumeUpdates([privateUpdate(10)], ctx, undefined)
-  const offset = await consumeUpdates([privateUpdate(10), privateUpdate(11)], ctx, undefined)
+  })
+  await consume([privateUpdate(10)], undefined)
+  await consume([privateUpdate(10)], undefined)
+  const offset = await consume([privateUpdate(10), privateUpdate(11)], undefined)
   expect(offset).toBe(12)
   expect(attempted.at(-1)).toBe(11)
 })
@@ -279,14 +270,33 @@ test('毒丸跳過後繼續處理同一批的後續訊息', async () => {
 test('scope-id 算不出來的毒訊息照樣跳得掉，log 標成 unknown', async () => {
   const logged: string[] = []
   const noChat = { update_id: 20, poll: { id: 'p' } } as unknown as Update
-  const ctx: ConsumeContext = {
+  const consume = createUpdateConsumer({
     route: async () => {
       throw new Error('boom')
     },
     log: line => void logged.push(line),
-  }
+  })
   let offset: number | undefined
-  for (let i = 0; i < 3; i++) offset = await consumeUpdates([noChat], ctx, offset)
+  for (let i = 0; i < 3; i++) offset = await consume([noChat], offset)
   expect(offset).toBe(21)
   expect(logged.some(l => l.includes('scope=unknown'))).toBe(true)
+})
+
+test('計數器由 consumer 自己持有：跨批次累加不靠呼叫端傳同一個物件（P2-3）', async () => {
+  const ctx: ConsumeContext = {
+    route: async () => {
+      throw new Error('boom')
+    },
+  }
+  // 每一批都用「同一份設定物件」重新建 consumer —— 這是舊 API 最容易被誤用的姿勢：
+  // 計數存在呼叫端物件時它剛好還會累加，存在 consumer 自己身上時則每次歸零。
+  let offset: number | undefined
+  for (let i = 0; i < 5; i++) offset = await createUpdateConsumer(ctx)([privateUpdate(10)], offset)
+  // 各自的計數永遠是 1，因此永遠不會誤判毒丸、offset 一直守住那一則
+  expect(offset).toBeUndefined()
+
+  // 同一個 consumer 才會累加到門檻
+  const consume = createUpdateConsumer(ctx)
+  for (let i = 0; i < 3; i++) offset = await consume([privateUpdate(10)], offset)
+  expect(offset).toBe(11)
 })

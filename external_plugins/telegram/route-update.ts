@@ -177,13 +177,30 @@ export type ConsumeContext = {
   route: (update: Update) => Promise<void>
   /** Defaults to stderr. Injectable so tests can read what was reported. */
   log?: (line: string) => void
-  /**
-   * Consecutive failures per update_id. Created on first use and stored here
-   * because the count has to survive across getUpdates batches — a poison
-   * update comes back in a NEW batch every time, so a counter scoped to one
-   * call would reset to 1 forever and never reach the threshold.
-   */
-  failures?: Map<number, number>
+}
+
+/** Walks one getUpdates batch and returns the offset for the next call. */
+export type UpdateConsumer = (
+  updates: readonly Update[],
+  currentOffset: number | undefined,
+) => Promise<number | undefined>
+
+/**
+ * Build the batch consumer for one poller.
+ *
+ * The per-update failure counter lives in this closure rather than in a field
+ * the caller passes in: it has to survive ACROSS getUpdates batches (a poison
+ * update comes back in a new batch every time, so a counter scoped to one call
+ * resets to 1 forever and never reaches the threshold), and a caller-owned
+ * object makes that lifetime an invisible contract — pass a fresh literal per
+ * batch and the poison-pill guard silently stops working, with no type error.
+ *
+ * @param ctx - Handler and optional log sink.
+ * @returns A consumer that owns its own cross-batch state.
+ */
+export function createUpdateConsumer(ctx: ConsumeContext): UpdateConsumer {
+  const failures = new Map<number, number>()
+  return (updates, currentOffset) => consumeUpdates(updates, ctx, currentOffset, failures)
 }
 
 /** Consecutive failures on one update before it is skipped as a poison pill. */
@@ -226,17 +243,18 @@ function describeScope(update: Update): string {
  * already counts the message as queued, i.e. handled.
  *
  * @param updates - Updates from one getUpdates call, in order.
- * @param ctx - Handler, optional log sink, and the cross-batch failure counter.
+ * @param ctx - Handler and optional log sink.
  * @param currentOffset - Offset used for this batch.
+ * @param failures - Cross-batch failure counter, owned by createUpdateConsumer.
  * @returns The offset to use next.
  */
-export async function consumeUpdates(
+async function consumeUpdates(
   updates: readonly Update[],
   ctx: ConsumeContext,
   currentOffset: number | undefined,
+  failures: Map<number, number>,
 ): Promise<number | undefined> {
   const log = ctx.log ?? ((line: string) => void process.stderr.write(`${line}\n`))
-  const failures = (ctx.failures ??= new Map<number, number>())
   let offset = currentOffset
 
   for (const update of updates) {

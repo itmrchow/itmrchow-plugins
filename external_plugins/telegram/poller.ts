@@ -27,9 +27,8 @@ import { resolveControlCommands } from './control-plane'
 import { ScopeRegistry } from './poller-registry'
 import { createSubscribeServer } from './subscribe-server'
 import {
-  consumeUpdates,
+  createUpdateConsumer,
   routeUpdate,
-  type ConsumeContext,
   type RouteContext,
   type SpawnOutcome,
 } from './route-update'
@@ -180,16 +179,16 @@ async function main(): Promise<void> {
     botInfo: me,
   }
 
-  // Built once, outside the loop: it carries the per-update failure counter,
-  // which has to survive across batches for the poison-pill threshold to be
-  // reachable at all (a poison update returns in a NEW batch every time).
-  const consumeCtx: ConsumeContext = { route: update => routeUpdate(update, ctx) }
+  // Built once, outside the loop: it owns the per-update failure counter, which
+  // has to survive across batches for the poison-pill threshold to be reachable
+  // at all (a poison update returns in a NEW batch every time).
+  const consume = createUpdateConsumer({ route: update => routeUpdate(update, ctx) })
 
   let offset: number | undefined
   while (!shuttingDown) {
     try {
       const updates = await bot.api.getUpdates({ offset, timeout: POLL_TIMEOUT_SECONDS })
-      const next = await consumeUpdates(updates, consumeCtx, offset)
+      const next = await consume(updates, offset)
       // A held-back offset makes the next getUpdates return instantly with the
       // same update, so without this pause the retries burn CPU in a tight loop.
       const stalled = updates.length > 0 && next === offset
