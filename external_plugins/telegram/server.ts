@@ -51,6 +51,7 @@ import {
 import { defaultAccess, pickAccessFields, type Access } from './access-schema'
 import { buildBotCommands } from './bot-commands'
 import { setDefaultResultOrder } from 'node:dns'
+import { setDefaultAutoSelectFamily } from 'node:net'
 
 // Hosts whose IPv6 route is blackholed (OCI a1-b) time out every
 // api.telegram.org call: the connect stack races both families and the dead
@@ -60,6 +61,14 @@ import { setDefaultResultOrder } from 'node:dns'
 // IPv6 works. Imports are hoisted, so this is the first statement the module
 // body runs, well before `new Bot()` or any outbound request. (JP-191)
 setDefaultResultOrder('ipv4first')
+
+// ipv4first alone is not enough: it only reorders what dns.lookup() returns.
+// Node 20+ defaults net.connect() to Happy Eyeballs (autoSelectFamily), which
+// still dials the AAAA address in parallel regardless of that order — on a1-b
+// that path blackholes and the request fails at ~300ms instead of connecting.
+// Turning it off makes the stack use the first (now IPv4) address only, which
+// measured the same as `curl -4` on that host. (JP-193)
+setDefaultAutoSelectFamily(false)
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
