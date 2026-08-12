@@ -37,6 +37,7 @@ import { sanitizeMetaText } from './meta-text'
 import { buildReplyMeta } from './reply-meta'
 import { resolvePort } from './resolve-port'
 import { isValidScopeId } from './scope-id'
+import { createReadyGate } from './channel-ready'
 import { startSubscribeClient } from './subscribe-client'
 import type { InboundEnvelope } from './subscribe-protocol'
 import { applyBind, checkInvite, pruneRevoked, REVOKED_RETENTION_MS, type Invite } from './invite'
@@ -756,6 +757,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
+// Armed before connect(): the client's `initialized` can arrive as soon as we
+// answer its initialize request, and a callback installed afterwards would miss
+// it and leave the subscription waiting on the fallback timer instead.
+const readyGate = createReadyGate()
+mcp.oninitialized = () => readyGate.markInitialized()
+
 await mcp.connect(new StdioServerTransport())
 
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this the
@@ -1327,6 +1334,11 @@ if (!isValidScopeId(AGENT_SCOPE)) {
     `not subscribing (no messages will arrive). Set it in the launcher.\n`,
   )
 } else {
+  // Subscribing is what makes the poller flush this scope's queue, so it must
+  // not happen until the client can receive channel notifications — for a newly
+  // spawned scope that queue holds the sender's first message, and a flush that
+  // lands early is dropped silently (channel-ready.ts has the measurements).
+  await readyGate.ready
   subscription = startSubscribeClient({
     host: POLLER_HOST,
     port: TELEGRAM_POLLER_PORT,
