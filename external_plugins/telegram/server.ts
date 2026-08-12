@@ -50,6 +50,16 @@ import {
 } from './invites-file'
 import { defaultAccess, pickAccessFields, type Access } from './access-schema'
 import { buildBotCommands } from './bot-commands'
+import { setDefaultResultOrder } from 'node:dns'
+
+// Hosts whose IPv6 route is blackholed (OCI a1-b) time out every
+// api.telegram.org call: the connect stack races both families and the dead
+// AAAA attempt drags the working A one into ETIMEDOUT. Ordering IPv4 first is
+// the programmatic form of --dns-result-order=ipv4first — unlike pinning
+// connect.localAddress it hardcodes no host's IP, so it stays correct where
+// IPv6 works. Imports are hoisted, so this is the first statement the module
+// body runs, well before `new Bot()` or any outbound request. (JP-191)
+setDefaultResultOrder('ipv4first')
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')

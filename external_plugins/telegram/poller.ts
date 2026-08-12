@@ -33,6 +33,13 @@ import {
   type RouteContext,
   type SpawnOutcome,
 } from './route-update'
+import { setDefaultResultOrder } from 'node:dns'
+
+// Same IPv6-blackhole timeout server.ts guards against (JP-191). The carrier's
+// systemd unit already passes --dns-result-order=ipv4first, but that drop-in is
+// per-host config in another repo — setting it here means the plugin carries its
+// own fix to any host. Both paths set the same value; they do not conflict.
+setDefaultResultOrder('ipv4first')
 
 const DEFAULT_POLLER_PORT = 7852
 const DEFAULT_MAX_SCOPES = 10
