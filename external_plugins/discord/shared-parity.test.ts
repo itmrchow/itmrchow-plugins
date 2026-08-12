@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const DUPLICATED = [
+  'channel-ready',
   'scope-id',
   'subscribe-protocol',
   'poller-registry',

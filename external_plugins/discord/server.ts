@@ -47,6 +47,7 @@ import { sanitizeMetaText } from './meta-text'
 import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
 import { resolvePort } from './resolve-port'
 import { isValidScopeId } from './scope-id'
+import { createReadyGate } from './channel-ready'
 import { startSubscribeClient, type SubscribeClient } from './subscribe-client'
 import type { InboundEnvelope } from './subscribe-protocol'
 import type { DiscordPayload } from './route-message'
@@ -617,6 +618,11 @@ async function deliverToChannel({ content, meta }: ChannelDelivery): Promise<voi
       method: 'notifications/claude/channel',
       params: { content, meta },
     })
+    // Without this line "sent but the session never saw it" (JP-190's failure
+    // mode) and "never sent at all" look identical in the logs.
+    process.stderr.write(
+      `discord channel: delivered (scope=${AGENT_SCOPE} chat_id=${meta.chat_id} message_id=${meta.message_id ?? '-'})\n`,
+    )
   } catch (err) {
     process.stderr.write(`discord channel: deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
   }
@@ -955,6 +961,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   }
 })
+
+// Armed before connect(): the client's `initialized` can arrive as soon as we
+// answer its initialize request, and a callback installed afterwards would miss
+// it and leave the subscription waiting on the fallback timer instead.
+const readyGate = createReadyGate()
+mcp.oninitialized = () => readyGate.markInitialized()
 
 await mcp.connect(new StdioServerTransport())
 
@@ -1328,6 +1340,11 @@ if (!isValidScopeId(AGENT_SCOPE)) {
     `not subscribing (no messages will arrive). Set it in the launcher.\n`,
   )
 } else {
+  // Subscribing is what makes the poller flush this scope's queue, so it must
+  // not happen until the client can receive channel notifications — for a newly
+  // spawned scope that queue holds the sender's first message, and a flush that
+  // lands early is dropped silently (channel-ready.ts has the measurements).
+  await readyGate.ready
   subscription = startSubscribeClient({
     host: POLLER_HOST,
     port: DISCORD_POLLER_PORT,
