@@ -63,8 +63,11 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 In channels with `requireMention: true`, any of the following triggers the bot:
 
 - A structured `@botname` mention (typed via Discord's autocomplete)
+- An `@everyone` / `@here` mention
 - A reply to one of the bot's recent messages
 - A match against any regex in `mentionPatterns`
+
+Role mentions do **not** trigger the bot — mentioning a role the bot belongs to is ignored. Mention the bot directly, or add a `mentionPatterns` regex.
 
 Example regex setup for a nickname trigger:
 

@@ -65,10 +65,10 @@ import {
   INTERACTION_CALLBACK_MESSAGE,
   INTERACTION_CALLBACK_UPDATE_MESSAGE,
   MESSAGE_FLAG_EPHEMERAL,
+  normalizeAttachment,
   respondInteraction,
   sendMessage,
   triggerTyping,
-  type RawAttachment,
   type RawChannel,
 } from './rest-actions'
 import { pruneRevoked, REVOKED_RETENTION_MS } from './invite'
@@ -538,27 +538,6 @@ async function fetchAllowedChannel(id: string): Promise<RawChannel> {
     if (key in access.groups) return ch
   }
   throw new Error(`channel ${id} is not allowlisted — add via /discord:access`)
-}
-
-/**
- * Put a REST attachment into the one attachment shape used downstream.
- *
- * The API says `filename` / `content_type`; discord.js said `name` /
- * `contentType`, and the inbound wire shape kept the latter. Translating in
- * exactly one place is what stops `content_type` from being read as `contentType`
- * and silently coming back undefined.
- *
- * @param raw - The attachment as the REST API returned it.
- * @returns The normalized attachment.
- */
-function normalizeAttachment(raw: RawAttachment): InboundAttachment {
-  return {
-    id: raw.id,
-    name: raw.filename,
-    size: raw.size,
-    url: raw.url,
-    contentType: raw.content_type ?? null,
-  }
 }
 
 async function downloadAttachment(att: InboundAttachment): Promise<string> {

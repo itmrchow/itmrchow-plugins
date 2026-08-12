@@ -8,6 +8,7 @@ import {
   fetchMessage,
   fetchMessages,
   INTERACTION_CALLBACK_UPDATE_MESSAGE,
+  normalizeAttachment,
   respondInteraction,
   sendMessage,
   triggerTyping,
@@ -124,4 +125,42 @@ test('respondInteraction 打 callback route，token 走 URL 編碼', async () =>
     route: `/interactions/9/${encodeURIComponent('tok/en')}/callback`,
     options: { body: { type: 7, data: { content: 'done', components: [] } } },
   })
+})
+
+test('normalizeAttachment 換名：filename -> name、content_type -> contentType', () => {
+  const att = normalizeAttachment({
+    id: 'a1',
+    filename: 'photo.png',
+    size: 2048,
+    url: 'https://cdn.example/photo.png',
+    content_type: 'image/png',
+  })
+  expect(att).toEqual({
+    id: 'a1',
+    name: 'photo.png',
+    size: 2048,
+    url: 'https://cdn.example/photo.png',
+    contentType: 'image/png',
+  })
+})
+
+test('normalizeAttachment 缺 content_type 時 contentType 為 null（非 undefined）', () => {
+  const att = normalizeAttachment({
+    id: 'a2',
+    filename: 'blob.bin',
+    size: 1,
+    url: 'https://cdn.example/blob.bin',
+  })
+  expect(att.contentType).toBeNull()
+})
+
+test('normalizeAttachment content_type 為 null 時 contentType 仍為 null', () => {
+  const att = normalizeAttachment({
+    id: 'a3',
+    filename: 'blob.bin',
+    size: 1,
+    url: 'https://cdn.example/blob.bin',
+    content_type: null,
+  })
+  expect(att.contentType).toBeNull()
 })

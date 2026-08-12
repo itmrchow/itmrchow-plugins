@@ -13,9 +13,11 @@
  *
  * Return types are RAW Discord API JSON (snake_case: `channel_id`, `content_type`,
  * `filename`), NOT discord.js's camelCase view of it. Callers must not assume the
- * discord.js names — see `normalizeAttachment` in server.ts for the one place
- * that translation happens.
+ * discord.js names — see `normalizeAttachment` below for the one place that
+ * translation happens.
  */
+
+import type { InboundAttachment } from './inbound-message'
 
 /** A REST path, always absolute — matches @discordjs/rest's `RouteLike`. */
 export type RestRoute = `/${string}`
@@ -58,6 +60,27 @@ export type RawAttachment = {
   size: number
   url: string
   content_type?: string | null
+}
+
+/**
+ * Put a REST attachment into the one attachment shape used downstream.
+ *
+ * The API says `filename` / `content_type`; discord.js said `name` /
+ * `contentType`, and the inbound wire shape kept the latter. Translating in
+ * exactly one place is what stops `content_type` from being read as `contentType`
+ * and silently coming back undefined.
+ *
+ * @param raw - The attachment as the REST API returned it.
+ * @returns The normalized attachment.
+ */
+export function normalizeAttachment(raw: RawAttachment): InboundAttachment {
+  return {
+    id: raw.id,
+    name: raw.filename,
+    size: raw.size,
+    url: raw.url,
+    contentType: raw.content_type ?? null,
+  }
 }
 
 /** A message as the API returns it. */
