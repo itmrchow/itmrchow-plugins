@@ -6,6 +6,10 @@
  * guild-channel support with mention-triggering. State lives in
  * ~/.claude/channels/discord/access.json — managed by the /discord:access skill.
  *
+ * Holds no gateway connection: a bot token allows exactly one gateway session,
+ * and one runs per scope. The poller owns it and pushes events here over an SSE
+ * subscription; everything outbound goes out over REST (rest-actions.ts).
+ *
  * Discord's search API isn't exposed to bots — fetch_messages is the only
  * lookback, and the instructions tell the model this.
  */
@@ -18,22 +22,16 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import {
-  Client,
-  GatewayIntentBits,
-  Partials,
   ChannelType,
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
-  type Message,
-  type Attachment,
-  type Interaction,
+  REST,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { basename, join, sep } from 'path'
 import { capturePaneBusy } from './tmux-pane'
 import {
   decideClear,
@@ -45,10 +43,34 @@ import {
 } from './control-plane'
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
-import { parseInjectBody, type ChannelDelivery } from './inject'
 import { sanitizeMetaText } from './meta-text'
 import { formatMessageDetail, formatMessageUnavailable, validateMessageId, type MessageDetail } from './get-message'
-import { resolveInjectPort } from './inject-port'
+import { resolvePort } from './resolve-port'
+import { isValidScopeId } from './scope-id'
+import { startSubscribeClient, type SubscribeClient } from './subscribe-client'
+import type { InboundEnvelope } from './subscribe-protocol'
+import type { DiscordPayload } from './route-message'
+import type {
+  InboundAttachment,
+  InboundInteraction,
+  InboundMessage,
+} from './inbound-message'
+import {
+  addReaction,
+  createDmChannel,
+  editMessage,
+  fetchChannel,
+  fetchMessage,
+  fetchMessages,
+  INTERACTION_CALLBACK_MESSAGE,
+  INTERACTION_CALLBACK_UPDATE_MESSAGE,
+  MESSAGE_FLAG_EPHEMERAL,
+  normalizeAttachment,
+  respondInteraction,
+  sendMessage,
+  triggerTyping,
+  type RawChannel,
+} from './rest-actions'
 import { pruneRevoked, REVOKED_RETENTION_MS } from './invite'
 import {
   migrateInvitesFromAccess,
@@ -98,15 +120,23 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // outside STATE_DIR — see invites-file.ts. Resolved after the state .env load
 // above so an INVITES_FILE override set there is honoured.
 const INVITES_FILE = resolveInvitesFile(process.env, homedir())
-// Scheduler-inject HTTP port. Per-plugin env key (not a shared INJECT_PORT):
-// every channel plugin is spawned by the same Claude Code process and inherits
-// one env, so a shared key would override both defaults to the same value and
-// make the second binder die with EADDRINUSE. Default 7843; telegram uses 7842.
-const DISCORD_INJECT_PORT = resolveInjectPort(
-  process.env.DISCORD_INJECT_PORT,
-  7843,
-  'DISCORD_INJECT_PORT',
+
+// The platform poller's subscription port. This process is a CLIENT of it: it
+// binds nothing itself, so several scopes can run side by side without the
+// per-scope port arithmetic the fixed-scope design needed. The old
+// DISCORD_INJECT_PORT server is gone with it — scheduler injection is the
+// internal-inject channel's job now.
+const DISCORD_POLLER_PORT = resolvePort(
+  process.env.DISCORD_POLLER_PORT,
+  7853,
+  'DISCORD_POLLER_PORT',
 )
+const POLLER_HOST = '127.0.0.1'
+
+// Which conversation this process serves — set by the carrier's launcher. It is
+// the subscription key, so a wrong or missing value means this process receives
+// nothing at all; validate loudly rather than subscribing to garbage.
+const AGENT_SCOPE = process.env.AGENT_SCOPE ?? ''
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -123,16 +153,43 @@ process.on('uncaughtException', err => {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-  // DMs arrive as partial channels — messageCreate never fires without this.
-  partials: [Partials.Channel],
-})
+// REST only — the gateway belongs to the poller, which is the single holder for
+// the whole platform. Every outbound action is an explicit route in rest-actions.ts.
+const rest = new REST({ version: '10' }).setToken(TOKEN)
+
+// Assigned at the bottom of this file, once every handler is registered.
+let subscription: SubscribeClient | undefined
+
+// The bot's own identity, applied from the first envelope. Without a gateway
+// this process has no other source for it, and mention-detection in guilds
+// depends on it — see the botInfo note in subscribe-protocol.ts.
+let botUser: { id: string; username: string } | undefined
+
+/** Channel types this server is willing to read from or write to. */
+const TEXT_CHANNEL_TYPES = new Set<number>([
+  ChannelType.GuildText,
+  ChannelType.DM,
+  ChannelType.GuildVoice,
+  ChannelType.GroupDM,
+  ChannelType.GuildAnnouncement,
+  ChannelType.AnnouncementThread,
+  ChannelType.PublicThread,
+  ChannelType.PrivateThread,
+  ChannelType.GuildStageVoice,
+])
+
+/** Channel types whose opt-in is inherited from a parent channel. */
+const THREAD_TYPES = new Set<number>([
+  ChannelType.AnnouncementThread,
+  ChannelType.PublicThread,
+  ChannelType.PrivateThread,
+])
+
+/** Synthetic channel message handed to the channel delivery path. */
+type ChannelDelivery = {
+  content: string
+  meta: Record<string, string>
+}
 
 const MAX_CHUNK_LIMIT = 2000
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -294,7 +351,7 @@ function noteSent(id: string): void {
   }
 }
 
-async function gate(msg: Message): Promise<GateResult> {
+async function gate(msg: InboundMessage): Promise<GateResult> {
   const access = loadAccess()
   const pruned = pruneStale(access)
   if (pruned) saveAccess(access)
@@ -302,7 +359,7 @@ async function gate(msg: Message): Promise<GateResult> {
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
 
   const senderId = msg.author.id
-  const isDM = msg.channel.type === ChannelType.DM
+  const isDM = msg.isDm
 
   if (isDM) {
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
@@ -338,9 +395,7 @@ async function gate(msg: Message): Promise<GateResult> {
   // opt in per-channel rather than per-server. Threads inherit their
   // parent channel's opt-in; the reply still goes to msg.channelId
   // (the thread), this is only the gate lookup.
-  const channelId = msg.channel.isThread()
-    ? msg.channel.parentId ?? msg.channelId
-    : msg.channelId
+  const channelId = msg.parentId ?? msg.channelId
   const policy = access.groups[channelId]
   if (!policy) return { action: 'drop' }
   const groupAllowFrom = policy.allowFrom ?? []
@@ -354,19 +409,29 @@ async function gate(msg: Message): Promise<GateResult> {
   return { action: 'deliver', access }
 }
 
-async function isMentioned(msg: Message, extraPatterns?: string[]): Promise<boolean> {
-  if (client.user && msg.mentions.has(client.user)) return true
+async function isMentioned(msg: InboundMessage, extraPatterns?: string[]): Promise<boolean> {
+  // Role mentions are not covered: matching one needs the bot's role list in
+  // that guild, which used to come from the gateway's member cache. Direct
+  // mentions and @everyone still count — see toInboundMessage.
+  if (botUser && msg.mentionIds.includes(botUser.id)) return true
+  if (msg.mentionsEveryone) return true
 
   // Reply to one of our messages counts as an implicit mention.
-  const refId = msg.reference?.messageId
+  const refId = msg.replyToMessageId
   if (refId) {
     if (recentSentIds.has(refId)) return true
-    // Fallback: fetch the referenced message and check authorship.
-    // Can fail if the message was deleted or we lack history perms.
-    try {
-      const ref = await msg.fetchReference()
-      if (ref.author.id === client.user?.id) return true
-    } catch {}
+    // Discord embeds the referenced message's author in the gateway payload, so
+    // the common case costs nothing. Only when it did not (deleted, or not
+    // embedded) do we pay a REST round-trip, which can still fail if the message
+    // is gone or we lack history perms.
+    if (msg.replyToUser) {
+      if (msg.replyToUser.id === botUser?.id) return true
+    } else {
+      try {
+        const ref = await fetchMessage(rest, msg.channelId, refId)
+        if (ref.author.id === botUser?.id) return true
+      } catch {}
+    }
   }
 
   const text = msg.content
@@ -411,10 +476,7 @@ function checkApprovals(): void {
 
     void (async () => {
       try {
-        const ch = await fetchTextChannel(dmChannelId)
-        if ('send' in ch) {
-          await ch.send("Paired! Say hi to Claude.")
-        }
+        await sendMessage(rest, dmChannelId, { content: 'Paired! Say hi to Claude.' })
         rmSync(file, { force: true })
       } catch (err) {
         process.stderr.write(`discord channel: failed to send approval confirm: ${err}\n`)
@@ -452,9 +514,9 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   return out
 }
 
-async function fetchTextChannel(id: string) {
-  const ch = await client.channels.fetch(id)
-  if (!ch || !ch.isTextBased()) {
+async function fetchTextChannel(id: string): Promise<RawChannel> {
+  const ch = await fetchChannel(rest, id)
+  if (!TEXT_CHANNEL_TYPES.has(ch.type)) {
     throw new Error(`channel ${id} not found or not text-based`)
   }
   return ch
@@ -463,26 +525,28 @@ async function fetchTextChannel(id: string) {
 // Outbound gate — tools can only target chats the inbound gate would deliver
 // from. DM channel ID ≠ user ID, so we inspect the fetched channel's type.
 // Thread → parent lookup mirrors the inbound gate.
-async function fetchAllowedChannel(id: string) {
+async function fetchAllowedChannel(id: string): Promise<RawChannel> {
   const ch = await fetchTextChannel(id)
   const access = loadAccess()
   if (ch.type === ChannelType.DM) {
-    const userId = ch.recipientId ?? dmChannelUsers.get(id)
+    // Raw JSON lists the other party under `recipients` (discord.js exposed it
+    // as `recipientId`); the bot itself is not in that list.
+    const userId = ch.recipients?.[0]?.id ?? dmChannelUsers.get(id)
     if (userId && access.allowFrom.includes(userId)) return ch
   } else {
-    const key = ch.isThread() ? ch.parentId ?? ch.id : ch.id
+    const key = THREAD_TYPES.has(ch.type) ? ch.parent_id ?? ch.id : ch.id
     if (key in access.groups) return ch
   }
   throw new Error(`channel ${id} is not allowlisted — add via /discord:access`)
 }
 
-async function downloadAttachment(att: Attachment): Promise<string> {
+async function downloadAttachment(att: InboundAttachment): Promise<string> {
   if (att.size > MAX_ATTACHMENT_BYTES) {
     throw new Error(`attachment too large: ${(att.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
   }
   const res = await fetch(att.url)
   const buf = Buffer.from(await res.arrayBuffer())
-  const name = att.name ?? `${att.id}`
+  const name = att.name
   const rawExt = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
   const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
   const path = join(INBOX_DIR, `${Date.now()}-${att.id}.${ext}`)
@@ -494,8 +558,8 @@ async function downloadAttachment(att: Attachment): Promise<string> {
 // att.name is uploader-controlled. It lands inside a [...] annotation in the
 // notification body and inside a newline-joined tool result — both are places
 // where delimiter chars let the attacker break out of the untrusted frame.
-function safeAttName(att: Attachment): string {
-  return (att.name ?? att.id).replace(/[\[\]\r\n;]/g, '_')
+function safeAttName(att: InboundAttachment): string {
+  return att.name.replace(/[\[\]\r\n;]/g, '_')
 }
 
 const mcp = new Server(
@@ -528,10 +592,11 @@ const mcp = new Server(
 )
 
 /**
- * Deliver one inbound/scheduler payload to the agent as a channel notification.
+ * Deliver one inbound payload to the agent as a channel notification.
  *
- * Inbound gateway messages and the /inject scheduler endpoint both funnel here;
- * permission relays and button interactions do not pass through.
+ * Subscribed chat messages funnel here; permission relays and button
+ * interactions do not pass through. The /inject scheduler endpoint that used to
+ * share this path is gone — that job belongs to the internal-inject channel.
  *
  * Fired immediately — no queue. This used to run through a busy-gate (JP-44):
  * notifications/claude/channel does not enroll in Claude's pty type-ahead
@@ -595,11 +660,11 @@ mcp.setNotificationHandler(
         .setEmoji('❌')
         .setStyle(ButtonStyle.Danger),
     )
+    const components = [row.toJSON()]
     for (const userId of access.allowFrom) {
       void (async () => {
         try {
-          const user = await client.users.fetch(userId)
-          await user.send({ content: text, components: [row] })
+          await sendDirectMessage(userId, { content: text, components })
         } catch (e) {
           process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
         }
@@ -608,36 +673,20 @@ mcp.setNotificationHandler(
   },
 )
 
-// node http (mirrors telegram's /inject) — bound to loopback only. The
-// scheduler POSTs report text here; we wrap it as a synthetic channel message
-// and funnel it down the same delivery path as inbound gateway messages, so it
-// reaches the agent as if it came from Discord. Telegram also exposes /update
-// for its external poller; Discord runs on the gateway, so /inject is the only
-// route.
-createServer((req, res) => {
-  const path = req.url ?? ''
-  if (req.method !== 'POST' || path !== '/inject') {
-    res.writeHead(404)
-    res.end('not found')
-    return
-  }
-  let raw = ''
-  req.on('data', chunk => { raw += chunk })
-  req.on('end', () => {
-    // /inject: scheduler text delivered as a synthetic channel message.
-    const parsed = parseInjectBody(raw)
-    if (!parsed.ok) {
-      res.writeHead(parsed.status)
-      res.end(parsed.message)
-      return
-    }
-    void deliverToChannel(parsed.delivery)
-    process.stderr.write(`discord channel: injected via HTTP for chat_id=${parsed.delivery.meta.chat_id}\n`)
-    res.writeHead(200)
-    res.end('ok')
-  })
-}).listen(DISCORD_INJECT_PORT, '127.0.0.1')
-process.stderr.write(`discord channel: inject endpoint listening on 127.0.0.1:${DISCORD_INJECT_PORT}\n`)
+/**
+ * Send a DM to one user.
+ *
+ * Opening the DM channel is a REST call the gateway client used to hide behind
+ * `user.send()`. Discord returns the existing channel when there is one, so this
+ * does not accumulate channels.
+ *
+ * @param userId - Recipient.
+ * @param body - Raw message payload.
+ */
+async function sendDirectMessage(userId: string, body: Record<string, unknown>): Promise<void> {
+  const dm = await createDmChannel(rest, userId)
+  await sendMessage(rest, dm.id, body)
+}
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -744,7 +793,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const files = (args.files as string[] | undefined) ?? []
 
         const ch = await fetchAllowedChannel(chat_id)
-        if (!('send' in ch)) throw new Error('channel is not sendable')
 
         for (const f of files) {
           assertSendable(f)
@@ -768,13 +816,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await ch.send({
-              content: chunks[i],
-              ...(i === 0 && files.length > 0 ? { files } : {}),
-              ...(shouldReplyTo
-                ? { reply: { messageReference: reply_to, failIfNotExists: false } }
-                : {}),
-            })
+            // discord.js read the paths for us; the raw route wants the bytes.
+            // Only the first chunk carries them, as before.
+            const uploads =
+              i === 0 && files.length > 0
+                ? files.map(f => ({ name: basename(f), data: readFileSync(f) }))
+                : undefined
+            const sent = await sendMessage(
+              rest,
+              ch.id,
+              {
+                content: chunks[i],
+                ...(shouldReplyTo
+                  ? { message_reference: { message_id: reply_to, fail_if_not_exists: false } }
+                  : {}),
+              },
+              uploads,
+            )
             noteSent(sent.id)
             sentIds.push(sent.id)
           }
@@ -792,16 +850,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'fetch_messages': {
         const ch = await fetchAllowedChannel(args.channel as string)
         const limit = Math.min((args.limit as number) ?? 20, 100)
-        const msgs = await ch.messages.fetch({ limit })
-        const me = client.user?.id
-        const arr = [...msgs.values()].reverse()
+        // The route returns newest-first, same as the old Collection did.
+        const msgs = await fetchMessages(rest, ch.id, limit)
+        const me = botUser?.id
+        const arr = [...msgs].reverse()
         const out =
           arr.length === 0
             ? '(no messages)'
             : arr
                 .map(m => {
                   const who = m.author.id === me ? 'me' : m.author.username
-                  const atts = m.attachments.size > 0 ? ` +${m.attachments.size}att` : ''
+                  const atts = m.attachments.length > 0 ? ` +${m.attachments.length}att` : ''
                   // Tool result is newline-joined; multi-line content forges
                   // adjacent rows. History includes ungated senders (no-@mention
                   // messages in an opted-in channel never hit the gate but
@@ -810,32 +869,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   // ID only — no preview fetch. N referenced-message fetches per
                   // page would be N extra API round-trips; the quoted rows are
                   // usually in the same page anyway.
-                  const replyTo = m.reference?.messageId ? `, reply_to: ${m.reference.messageId}` : ''
-                  return `[${m.createdAt.toISOString()}] ${who}: ${text}  (id: ${m.id}${atts}${replyTo})`
+                  const refId = m.message_reference?.message_id
+                  const replyTo = refId ? `, reply_to: ${refId}` : ''
+                  // Raw timestamps carry an offset rather than the Z form; the
+                  // Date round-trip keeps the rendered column stable.
+                  return `[${new Date(m.timestamp).toISOString()}] ${who}: ${text}  (id: ${m.id}${atts}${replyTo})`
                 })
                 .join('\n')
         return { content: [{ type: 'text', text: out }] }
       }
       case 'react': {
+        // No message fetch first: the reaction route takes ids, and the old
+        // fetch existed only to obtain a Message object to call .react() on.
         const ch = await fetchAllowedChannel(args.chat_id as string)
-        const msg = await ch.messages.fetch(args.message_id as string)
-        await msg.react(args.emoji as string)
+        await addReaction(rest, ch.id, args.message_id as string, args.emoji as string)
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'edit_message': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
-        const msg = await ch.messages.fetch(args.message_id as string)
-        const edited = await msg.edit(args.text as string)
+        const edited = await editMessage(rest, ch.id, args.message_id as string, {
+          content: args.text as string,
+        })
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
       case 'download_attachment': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
-        const msg = await ch.messages.fetch(args.message_id as string)
-        if (msg.attachments.size === 0) {
+        const msg = await fetchMessage(rest, ch.id, args.message_id as string)
+        const attachments = msg.attachments.map(normalizeAttachment)
+        if (attachments.length === 0) {
           return { content: [{ type: 'text', text: 'message has no attachments' }] }
         }
         const lines: string[] = []
-        for (const att of msg.attachments.values()) {
+        for (const att of attachments) {
           const path = await downloadAttachment(att)
           const kb = (att.size / 1024).toFixed(0)
           lines.push(`  ${path}  (${safeAttName(att)}, ${att.contentType ?? 'unknown'}, ${kb}KB)`)
@@ -845,9 +910,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
       case 'get_message': {
-        // Guard the id first: an empty/undefined message_id would degrade
-        // ch.messages.fetch() into a batch fetch of recent history instead of
-        // erroring. Fail fast before any gateway round-trip.
+        // Guard the id first: an empty message_id would build
+        // /channels/<id>/messages/ — the list route — returning a page of recent
+        // history instead of erroring. Fail fast before any REST round-trip.
         const idError = validateMessageId(args.message_id)
         if (idError) {
           return { content: [{ type: 'text', text: idError }], isError: true }
@@ -855,12 +920,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const message_id = args.message_id as string
         const ch = await fetchAllowedChannel(args.chat_id as string)
         try {
-          const msg = await ch.messages.fetch(message_id)
+          const msg = await fetchMessage(rest, ch.id, message_id)
           const detail: MessageDetail = {
-            author: msg.author.id === client.user?.id ? 'me' : msg.author.username,
-            timestamp: msg.createdAt.toISOString(),
+            author: msg.author.id === botUser?.id ? 'me' : msg.author.username,
+            timestamp: new Date(msg.timestamp).toISOString(),
             content: msg.content,
-            attachments: [...msg.attachments.values()].map(att => ({
+            attachments: msg.attachments.map(normalizeAttachment).map(att => ({
               // safeAttName: uploader-controlled name lands in a newline-joined
               // tool result — strip delimiter chars that could forge rows.
               name: safeAttName(att),
@@ -893,15 +958,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
-// When Claude Code closes the MCP connection, stdin gets EOF. Without this
-// the gateway stays connected as a zombie holding resources.
+// When Claude Code closes the MCP connection, stdin gets EOF. Without this the
+// subscription keeps reconnecting to the poller as a zombie, and the poller keeps
+// routing this scope's messages to a process nobody is reading.
 let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(client.destroy()).finally(() => process.exit(0))
+  subscription?.stop()
+  process.exit(0)
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -923,20 +989,34 @@ setInterval(() => {
   if (orphaned) shutdown()
 }, 5000).unref()
 
-client.on('error', err => {
-  process.stderr.write(`discord channel: client error: ${err}\n`)
-})
+/**
+ * Answer one permission button click, relayed from the poller.
+ *
+ * customId is `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`. Security
+ * mirrors the text-reply path: allowFrom must contain the clicker.
+ *
+ * The click is answered with an interaction callback rather than a channel
+ * message: the token is single-use and expires in 3 seconds, and only a callback
+ * can edit the prompt in place to retire its buttons.
+ *
+ * @param interaction - The click, reduced to the fields needed to answer it.
+ */
+async function handleInteraction(interaction: InboundInteraction): Promise<void> {
+  const respond = (body: Record<string, unknown>): Promise<void> =>
+    respondInteraction(rest, interaction.id, interaction.token, body).catch(err => {
+      process.stderr.write(`discord channel: interaction callback failed: ${err}\n`)
+    })
+  const ephemeral = (content: string): Promise<void> =>
+    respond({
+      type: INTERACTION_CALLBACK_MESSAGE,
+      data: { content, flags: MESSAGE_FLAG_EPHEMERAL },
+    })
 
-// Button-click handler for permission requests. customId is
-// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
-// Security mirrors the text-reply path: allowFrom must contain the sender.
-client.on('interactionCreate', async (interaction: Interaction) => {
-  if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
   const access = loadAccess()
-  if (!access.allowFrom.includes(interaction.user.id)) {
-    await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+  if (!access.allowFrom.includes(interaction.userId)) {
+    await ephemeral('Not authorized.')
     return
   }
   const [, behavior, request_id] = m
@@ -944,7 +1024,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   if (behavior === 'more') {
     const details = pendingPermissions.get(request_id)
     if (!details) {
-      await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
+      await ephemeral('Details no longer available.')
       return
     }
     const { tool_name, description, input_preview } = details
@@ -971,7 +1051,10 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         .setEmoji('❌')
         .setStyle(ButtonStyle.Danger),
     )
-    await interaction.update({ content: expanded, components: [row] }).catch(() => {})
+    await respond({
+      type: INTERACTION_CALLBACK_UPDATE_MESSAGE,
+      data: { content: expanded, components: [row.toJSON()] },
+    })
     return
   }
 
@@ -982,16 +1065,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   // Replace buttons with the outcome so the same request can't be answered
-  // twice and the chat history shows what was chosen.
-  await interaction
-    .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
-    .catch(() => {})
-})
-
-client.on('messageCreate', msg => {
-  if (msg.author.bot) return
-  handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
-})
+  // twice and the chat history shows what was chosen. messageContent is carried
+  // on the wire precisely so this does not need a REST read-back first.
+  await respond({
+    type: INTERACTION_CALLBACK_UPDATE_MESSAGE,
+    data: { content: `${interaction.messageContent}\n\n${label}`, components: [] },
+  })
+}
 
 // --- JP-38 bot-layer control plane (survives agent death) ---------------------
 // Per-sender last /clear warning, for the busy-confirm gate.
@@ -1010,12 +1090,13 @@ const clearWarnedAt = new Map<string, number>()
  * Returns:
  *   Promise that resolves once the command has run and a reply was attempted.
  */
-async function handleControlCommand(cmd: ControlCommand, msg: Message): Promise<void> {
+async function handleControlCommand(cmd: ControlCommand, msg: InboundMessage): Promise<void> {
   const senderId = msg.author.id
 
   if (cmd === 'ctx') {
     const { pct, raw } = await getContextPercent()
-    await msg.reply(
+    await replyTo(
+      msg,
       pct === null
         ? raw
           ? `Context: 無法解析百分比，footer 片段：\n${raw}`
@@ -1030,7 +1111,8 @@ async function handleControlCommand(cmd: ControlCommand, msg: Message): Promise<
     const decision = decideClear(busy, clearWarnedAt.get(senderId) ?? null, Date.now())
     if (decision === 'warn') {
       clearWarnedAt.set(senderId, Date.now())
-      await msg.reply(
+      await replyTo(
+        msg,
         'agent 忙碌中，/clear 會打斷當前任務並清空 context。確認請在 30 秒內再送一次 /clear。',
       )
       return
@@ -1038,24 +1120,41 @@ async function handleControlCommand(cmd: ControlCommand, msg: Message): Promise<
     clearWarnedAt.delete(senderId)
     try {
       await sendClear()
-      await msg.reply('已送出 /clear。')
+      await replyTo(msg, '已送出 /clear。')
     } catch (err) {
-      await msg.reply(`/clear 投遞失敗：${err}`)
+      await replyTo(msg, `/clear 投遞失敗：${err}`)
     }
     return
   }
 
   // restart
-  await msg.reply('重啟中…')
+  await replyTo(msg, '重啟中…')
   const result = await restartAgent('manual /restart (discord)', { bypassThrottle: true })
   if (result.status === 'in-progress') {
-    await msg.reply('已有重啟進行中，請稍候。')
+    await replyTo(msg, '已有重啟進行中，請稍候。')
   } else if (result.status === 'failed') {
-    await msg.reply(`重啟失敗：${result.error}`)
+    await replyTo(msg, `重啟失敗：${result.error}`)
   }
 }
 
-async function handleInbound(msg: Message): Promise<void> {
+/**
+ * Quote-reply to an inbound message.
+ *
+ * Replaces discord.js's `msg.reply()`. `fail_if_not_exists: false` keeps a reply
+ * to a since-deleted message from erroring the whole send, matching the old
+ * behaviour.
+ *
+ * @param msg - The message being answered.
+ * @param text - Reply body.
+ */
+async function replyTo(msg: InboundMessage, text: string): Promise<void> {
+  await sendMessage(rest, msg.channelId, {
+    content: text,
+    message_reference: { message_id: msg.id, fail_if_not_exists: false },
+  })
+}
+
+async function handleInbound(msg: InboundMessage): Promise<void> {
   // Invite redemption runs BEFORE gate(): under 'allowlist' the gate drops
   // every stranger, and under 'pairing' it mints them a code to wait on —
   // and a stranger holding a valid token is exactly who this is for.
@@ -1065,9 +1164,9 @@ async function handleInbound(msg: Message): Promise<void> {
     // this branch deliberately never reaches gate(), so this line is the only
     // thing stopping any guild member from redeeming a token in-channel. It
     // also keeps the token out of the agent's session context. Do not delete.
-    if (msg.channel.type !== ChannelType.DM) return
+    if (!msg.isDm) return
     if (!redeemInvite(REDEEM_DEPS, msg.author.id, inviteToken)) return
-    await msg.reply(`You're in. Just message me here and Claude will pick it up.`)
+    await replyTo(msg, `You're in. Just message me here and Claude will pick it up.`)
     return
   }
 
@@ -1078,9 +1177,7 @@ async function handleInbound(msg: Message): Promise<void> {
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
     try {
-      await msg.reply(
-        `${lead} — run in Claude Code:\n\n/discord:access pair ${result.code}`,
-      )
+      await replyTo(msg, `${lead} — run in Claude Code:\n\n/discord:access pair ${result.code}`)
     } catch (err) {
       process.stderr.write(`discord channel: failed to send pairing code: ${err}\n`)
     }
@@ -1089,7 +1186,7 @@ async function handleInbound(msg: Message): Promise<void> {
 
   const chat_id = msg.channelId
 
-  if (msg.channel.type === ChannelType.DM) {
+  if (msg.isDm) {
     dmChannelUsers.set(chat_id, msg.author.id)
   }
 
@@ -1107,7 +1204,7 @@ async function handleInbound(msg: Message): Promise<void> {
       },
     })
     const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
-    void msg.react(emoji).catch(() => {})
+    void addReaction(rest, msg.channelId, msg.id, emoji).catch(() => {})
     return
   }
 
@@ -1115,31 +1212,25 @@ async function handleInbound(msg: Message): Promise<void> {
   // directly via tmux/systemctl. DM + paired owner only; bypasses the chat path.
   // discord has no native command router, so we prefix-match here.
   const control = parseControlCommand(msg.content, CONTROL_COMMANDS_ENABLED)
-  if (
-    control &&
-    msg.channel.type === ChannelType.DM &&
-    result.access.allowFrom.includes(msg.author.id)
-  ) {
+  if (control && msg.isDm && result.access.allowFrom.includes(msg.author.id)) {
     await handleControlCommand(control, msg)
     return
   }
 
   // Typing indicator — signals "processing" until we reply (or ~10s elapses).
-  if ('sendTyping' in msg.channel) {
-    void msg.channel.sendTyping().catch(() => {})
-  }
+  void triggerTyping(rest, chat_id).catch(() => {})
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   const access = result.access
   if (access.ackReaction) {
-    void msg.react(access.ackReaction).catch(() => {})
+    void addReaction(rest, chat_id, msg.id, access.ackReaction).catch(() => {})
   }
 
   // Attachments are listed (name/type/size) but not downloaded — the model
   // calls download_attachment when it wants them. Keeps the notification
   // fast and avoids filling inbox/ with images nobody looked at.
   const atts: string[] = []
-  for (const att of msg.attachments.values()) {
+  for (const att of msg.attachments) {
     const kb = (att.size / 1024).toFixed(0)
     atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
   }
@@ -1163,16 +1254,16 @@ async function handleInbound(msg: Message): Promise<void> {
   // referenced message was deleted or wasn't embedded — the ID alone survives
   // and the model can still call get_message.
   const replyMeta: Record<string, string> = {}
-  const refId = msg.reference?.messageId
+  const refId = msg.replyToMessageId
   if (refId) {
     replyMeta.reply_to_message_id = refId
-    const repliedUser = msg.mentions.repliedUser
+    const repliedUser = msg.replyToUser
     if (repliedUser) {
       // sanitizeMetaText: webhook/app display names allow arbitrary chars
       // (incl. `"` and newlines), unlike regular usernames — meta-attribute
       // injection surface.
       replyMeta.reply_to_user =
-        repliedUser.id === client.user?.id ? 'me' : sanitizeMetaText(repliedUser.username)
+        repliedUser.id === botUser?.id ? 'me' : sanitizeMetaText(repliedUser.username)
     }
   }
 
@@ -1186,7 +1277,7 @@ async function handleInbound(msg: Message): Promise<void> {
       // meta-attribute-breaking chars before it lands in the <channel> tag.
       user: sanitizeMetaText(msg.author.username),
       user_id: msg.author.id,
-      ts: msg.createdAt.toISOString(),
+      ts: msg.timestamp,
       ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       ...replyMeta,
     },
@@ -1196,11 +1287,12 @@ async function handleInbound(msg: Message): Promise<void> {
 /**
  * Announce "the agent is back" after a bot-initiated restart (JP-38).
  *
- * Runs once when the gateway is ready. Claims the shared restart marker
- * (atomic — a boot race with the telegram server yields exactly one notice)
- * and DMs the paired owner(s) the plugin versions now loaded, flagging
- * changes across the restart. Silent on a clean boot (no marker) or when
- * nobody is paired.
+ * Runs once at boot. There is no longer a gateway `ready` to hang it on, and it
+ * needs none: the marker and the DM are both plain REST/file work. Claims the
+ * shared restart marker (atomic — a boot race with the telegram server yields
+ * exactly one notice) and DMs the paired owner(s) the plugin versions now
+ * loaded, flagging changes across the restart. Silent on a clean boot (no
+ * marker) or when nobody is paired.
  *
  * Returns:
  *   None.
@@ -1213,8 +1305,7 @@ function announceStartup(): void {
   for (const userId of access.allowFrom) {
     void (async () => {
       try {
-        const user = await client.users.fetch(userId)
-        await user.send(notice)
+        await sendDirectMessage(userId, { content: notice })
       } catch (err) {
         process.stderr.write(`discord channel: startup notice to ${userId} failed: ${err}\n`)
       }
@@ -1222,12 +1313,45 @@ function announceStartup(): void {
   }
 }
 
-client.once('ready', c => {
-  process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-  announceStartup()
-})
+announceStartup()
 
-client.login(TOKEN).catch(err => {
-  process.stderr.write(`discord channel: login failed: ${err}\n`)
-  process.exit(1)
-})
+// Inbound events arrive over a subscription to the platform poller, which is the
+// token's sole gateway holder. This process binds nothing and connects to no
+// gateway: a bot token allows exactly one gateway session, and under the
+// dynamic-scope design N scopes share one token.
+if (!isValidScopeId(AGENT_SCOPE)) {
+  // Warn but keep serving MCP tools. Exiting would make a missing env var look
+  // like a crashed channel to the watchdog, which restarts it in a loop — the
+  // same constraint internal-inject follows when its tokens.json is absent.
+  process.stderr.write(
+    `discord channel: AGENT_SCOPE=${JSON.stringify(AGENT_SCOPE)} is not a valid scope id; ` +
+    `not subscribing (no messages will arrive). Set it in the launcher.\n`,
+  )
+} else {
+  subscription = startSubscribeClient({
+    host: POLLER_HOST,
+    port: DISCORD_POLLER_PORT,
+    scopeId: AGENT_SCOPE,
+    onEnvelope: async (envelope: InboundEnvelope) => {
+      // botInfo rides along on every envelope because this process has no
+      // gateway to learn its own identity from. Applying it before the first
+      // event is what makes isMentioned() work in guild channels.
+      const me = envelope.botInfo as { id?: string; username?: string } | undefined
+      if (me?.id && !botUser) botUser = { id: me.id, username: me.username ?? '' }
+
+      const payload = envelope.payload as DiscordPayload
+      // Swallow rather than rethrow: a throw here withholds the ack, and the
+      // poller would redeliver on reconnect — replaying a chat message whose
+      // side effects (ack reaction, notification, pairing state) already landed.
+      try {
+        if (payload.kind === 'messageCreate') {
+          await handleInbound(payload.data as InboundMessage)
+        } else {
+          await handleInteraction(payload.data as InboundInteraction)
+        }
+      } catch (err) {
+        process.stderr.write(`discord channel: handling ${payload.kind} failed: ${err}\n`)
+      }
+    },
+  })
+}

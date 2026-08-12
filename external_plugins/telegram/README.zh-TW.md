@@ -76,12 +76,13 @@ Claude Code 用上一步方式跑起來後，在 Telegram DM 你的 bot — 它�
 
 本 fork 在 upstream plugin 之上加了常駐 agent（例如跑在 VM tmux session 內）需要的運維功能：
 
-- **`/inject` HTTP endpoint** — `POST /inject` 到 `127.0.0.1:7842`（可用 `TELEGRAM_INJECT_PORT` 覆寫），把排程器或其他本機程序的文字以合成 channel 訊息注入 session。Body：`{"text": "...", "chat_id": "..."}`。僅綁定 loopback。
-- **雙 poll 模式（`TELEGRAM_POLL_MODE`）** — server 依平台自動決定如何收 update，可用 `TELEGRAM_POLL_MODE=builtin|decoupled` 覆寫：
-  - `builtin`（x86 與 macOS 預設）— 單程序內建 `bot.start()`，等同 upstream，不需外部 poller。
-  - `decoupled`（arm64-linux 預設）— 由獨立的 `poller.ts` long-polling，把原始 update 轉發到 inject port 的 `POST /update`；server 本身不 poll。arm64-linux 必需（同程序 long-poll 迴圈會被 MCP stdio watcher 餓死）。
-  - arm64-linux 上設 `builtin` 不支援（證實會餓死），會被 clamp 回 `decoupled` 並警告。
-  - launcher（`launch.sh`，由 `.mcp.json` 呼叫）依同一預設選 runtime：arm64-linux 或 decoupled 用 `tsx`(node)，否則用 `bun`。
+- **訂閱式收訊（`poller.ts`）** — 獨立的 poller 是該 token 唯一的 `getUpdates` 消費者。它判斷每則 update 屬於哪個對話，再以 Server-Sent Events 推給服務該對話的 server 程序。server 本身不綁任何 port，改為主動連到 `127.0.0.1:7852`（可用 `TELEGRAM_POLLER_PORT` 覆寫）並以指數退避自動重連 —— 因此同一個 bot token 底下，多個對話可以各自跑自己的 agent session。
+  - `TELEGRAM_STATE_DIR` 是 **poller 的必填項**且沒有預設值：未設就直接結束，避免測試或誤啟動的 process 繼承到預設路徑、用正式 bot token 長輪詢。server 程序仍維持預設 `~/.claude/channels/telegram`。
+  - `AGENT_SCOPE` 指明本程序服務哪個對話（例：`telegram-dm-12345`）。值不合法時 server 仍照常提供 MCP 工具，但收不到任何訊息，並於 stderr 明講。
+  - `MAX_SCOPES`（預設 10）限制同時存在的 session 數；超過上限時新的發話者會收到「目前容量已滿」，而不是再開一個 agent。
+  - `SCOPE_SPAWN_BIN` 指向 host 端用來替尚無 session 的對話開 session 的腳本。未設則永遠不開新 session，並回覆發話者服務未完整設定。
+  - launcher（`launch.sh`，由 `.mcp.json` 呼叫）選 runtime：arm64-linux 用 `tsx`(node)，其餘用 `bun`。
+  - 排程 / 合成訊息注入已改由獨立的 `internal-inject` channel 負責，本 plugin 不再監聽 inject port。
 - **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。可用 `TELEGRAM_CONTROL_COMMANDS`（逗號分隔，例 `ctx,restart`）縮小 bot 層攔截的範圍 —— 未列入的指令會當成一般訊息轉給 agent，讓 skill 自行定義語意。未設 = 三個全攔，與先前行為相同。
 - **啟動通知** — 重啟後 bot 會通知已配對 owner「agent 回來了」，列出載入的 plugin 版本並標記跨重啟有變動的項目。通知採原子 claim，多 channel 部署也只會發一次。
 - **已讀回應** — inbound 訊息會收到 emoji reaction（預設 👀）作為「已讀」確認。在 `access.json` 用 `ackReaction` 設定（見 [ACCESS.md](./ACCESS.md)）；只接受 Telegram 固定的 emoji 白名單。

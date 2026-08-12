@@ -94,7 +94,12 @@ Claude Code 用上一步方式跑起來後，在 Discord DM 你的 bot — 它�
 
 本 fork 在 upstream plugin 之上加了常駐 agent（例如跑在 VM tmux session 內）需要的運維功能：
 
-- **`/inject` HTTP endpoint** — `POST /inject` 到 `127.0.0.1:7843`（可用 `DISCORD_INJECT_PORT` 覆寫），把排程器或其他本機程序的文字以合成 channel 訊息注入 session。Body：`{"text": "...", "chat_id": "..."}`。僅綁定 loopback。
+- **訂閱式收訊（`discord-poller.ts`）** — 一個 bot token 只允許一條 gateway 連線，所以由獨立的 poller 代表整個平台持有它。它判斷每個事件屬於哪個對話，再以 Server-Sent Events 推給服務該對話的 server 程序。server 本身不綁任何 port、對外一律走 REST —— 因此同一個 bot token 底下，多個對話可以各自跑自己的 agent session。
+  - `DISCORD_STATE_DIR` 是 **poller 的必填項**且沒有預設值：未設就直接結束，避免測試或誤啟動的 process 繼承到預設路徑、用正式 bot token 搶走 gateway。server 程序仍維持預設 `~/.claude/channels/discord`。
+  - `AGENT_SCOPE` 指明本程序服務哪個對話（例：`discord-dm-12345`）。值不合法時 server 仍照常提供 MCP 工具，但收不到任何訊息，並於 stderr 明講。
+  - server 主動連到 `127.0.0.1:7853`（可用 `DISCORD_POLLER_PORT` 覆寫），並以指數退避自動重連。
+  - 原本的 `/inject` HTTP endpoint（`DISCORD_INJECT_PORT`）已移除 —— server 現在不綁任何 port。本機程序要把文字推進 session 改用 `internal-inject` channel。
+  - 提及身分組（role mention）不再觸發 bot：比對 role 需要 gateway 的成員快取，訂閱端沒有。請直接 @ bot，或改用 `mentionPatterns` regex —— 見 `ACCESS.md`。
 - **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。可用 `DISCORD_CONTROL_COMMANDS`（逗號分隔，例 `ctx,restart`）縮小 bot 層攔截的範圍 —— 未列入的指令會當成一般訊息轉給 agent，讓 skill 自行定義語意。未設 = 三個全攔，與先前行為相同。
 - **啟動通知** — 重啟後 bot 會通知已配對 owner「agent 回來了」，列出載入的 plugin 版本並標記跨重啟有變動的項目。通知採原子 claim，多 channel 部署也只會發一次。
 - **已讀回應** — inbound 訊息會收到 emoji reaction（預設 👀）作為「已讀」確認。在 `access.json` 用 `ackReaction` 設定（見 [ACCESS.md](./ACCESS.md)）。
