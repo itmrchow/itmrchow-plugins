@@ -38,6 +38,7 @@ import {
   type RouteInput,
   type SpawnOutcome,
 } from './route-message'
+import { toInboundMessage, type InboundInteraction } from './inbound-message'
 
 // Per-plugin port, like DISCORD_INJECT_PORT: every channel plugin is spawned by
 // the same process and inherits one env, so a shared key would collide.
@@ -176,26 +177,46 @@ function parentOf(channel: Message['channel'] | Interaction['channel']): string 
 }
 
 function messageInput(msg: Message): RouteInput {
+  const isDm = msg.channel.type === ChannelType.DM
+  const parentId = parentOf(msg.channel)
   return {
     kind: 'messageCreate',
-    isDm: msg.channel.type === ChannelType.DM,
+    isDm,
     channelId: msg.channelId,
-    parentId: parentOf(msg.channel),
+    parentId,
     authorId: msg.author.id,
-    data: msg.toJSON(),
+    // NOT msg.toJSON(): discord.js's flatten rewrites `author` to `authorId` and
+    // uses its own camelCase names, so a subscriber reading the payload would
+    // silently get `undefined` for the author. See inbound-message.ts.
+    data: toInboundMessage(msg, { isDm, parentId }),
   }
 }
 
 /**
  * Reduce a button click to routing input.
  *
- * The interaction's own fields are spread over toJSON() rather than trusted to
- * appear inside it: an interaction is answered over REST with `token` +
- * `applicationId`, and both are short-lived properties that a generic flatten
- * has no obligation to emit. A subscriber that receives an interaction it cannot
- * answer leaves the clicked button spinning until it times out.
+ * Every field is named explicitly rather than taken from toJSON(): an interaction
+ * is answered over REST with `token` + `applicationId`, and both are short-lived
+ * properties that discord.js's generic flatten has no obligation to emit. A
+ * subscriber that receives an interaction it cannot answer leaves the clicked
+ * button spinning until it times out.
+ *
+ * `messageContent` rides along because the answer replaces the prompt with
+ * "<original>\n\n✅ Allowed" — without it the subscriber would either lose the
+ * original text or pay a REST round-trip inside the 3-second callback window.
  */
 function interactionInput(interaction: ButtonInteraction): RouteInput {
+  const data: InboundInteraction = {
+    id: interaction.id,
+    token: interaction.token,
+    applicationId: interaction.applicationId,
+    customId: interaction.customId,
+    userId: interaction.user.id,
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+    messageId: interaction.message?.id ?? null,
+    messageContent: interaction.message?.content ?? '',
+  }
   return {
     kind: 'interactionCreate',
     // guildId, not the channel type: a DM button's channel can still be partial
@@ -204,17 +225,7 @@ function interactionInput(interaction: ButtonInteraction): RouteInput {
     channelId: interaction.channelId ?? interaction.user.id,
     parentId: parentOf(interaction.channel),
     authorId: interaction.user.id,
-    data: {
-      ...(interaction.toJSON() as Record<string, unknown>),
-      id: interaction.id,
-      token: interaction.token,
-      applicationId: interaction.applicationId,
-      customId: interaction.customId,
-      userId: interaction.user.id,
-      channelId: interaction.channelId,
-      guildId: interaction.guildId,
-      messageId: interaction.message?.id,
-    },
+    data,
   }
 }
 
