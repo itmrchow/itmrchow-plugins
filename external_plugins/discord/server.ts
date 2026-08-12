@@ -618,6 +618,11 @@ async function deliverToChannel({ content, meta }: ChannelDelivery): Promise<voi
       method: 'notifications/claude/channel',
       params: { content, meta },
     })
+    // Without this line "sent but the session never saw it" (JP-190's failure
+    // mode) and "never sent at all" look identical in the logs.
+    process.stderr.write(
+      `discord channel: delivered (scope=${AGENT_SCOPE} chat_id=${meta.chat_id} message_id=${meta.message_id ?? '-'})\n`,
+    )
   } catch (err) {
     process.stderr.write(`discord channel: deliver failed (chat_id=${meta.chat_id}): ${err}\n`)
   }
