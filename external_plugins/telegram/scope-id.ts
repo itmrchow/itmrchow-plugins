@@ -1,12 +1,12 @@
 /**
  * scope-id: the identity of one isolated Claude session.
  *
- * This file lives inside the telegram plugin rather than a repo-level _shared/
+ * This file lives inside each channel plugin rather than a repo-level _shared/
  * because a plugin is installed as a self-contained directory copy
  * (cache/<marketplace>/<plugin>/<version>/) — a `../_shared` import resolves to
  * nothing once installed and takes the whole MCP server down at startup. The
- * discord plugin gets its own copy; the shape is pinned by identical tests on
- * both sides, and the carrier's lib-scope.sh SCOPE_ID_RE must match too.
+ * telegram and discord copies are byte-identical (pinned by shared-parity.test.ts
+ * on the discord side), and the carrier's lib-scope.sh SCOPE_ID_RE must match too.
  */
 
 /** The legal value space. Anything reaching a tmux target, a file path, or a

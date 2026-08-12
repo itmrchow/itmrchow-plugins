@@ -1,3 +1,11 @@
+/**
+ * SSE subscription client: one scope's server.ts connecting back to its
+ * platform poller.
+ *
+ * Copied byte-identically into the discord plugin (see shared-parity.test.ts
+ * there for why), so nothing here may name a platform. Log lines say "channel:"
+ * and carry the scope-id, which already begins with the platform name.
+ */
 import { request, type ClientRequest, type IncomingMessage } from 'node:http'
 import {
   createSseParser,
@@ -56,7 +64,7 @@ export function createReconnectScheduler(opts: {
     scheduled = true
     const wait = opts.nextWaitMs()
     const log = opts.log ?? ((line: string) => void process.stderr.write(line))
-    log(`telegram channel: subscription lost (${reason}); reconnecting in ${wait}ms\n`)
+    log(`channel: subscription lost (${reason}); reconnecting in ${wait}ms\n`)
     opts.reconnect(wait)
   }
 }
@@ -92,7 +100,7 @@ export function startSubscribeClient(opts: {
       headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
     })
     req.on('error', err => {
-      process.stderr.write(`telegram channel: ack ${envelopeId} failed: ${err}\n`)
+      process.stderr.write(`channel ${opts.scopeId}: ack ${envelopeId} failed: ${err}\n`)
     })
     req.end(body)
   }
@@ -135,13 +143,13 @@ export function startSubscribeClient(opts: {
           return
         }
         attempt = 0
-        process.stderr.write(`telegram channel: subscribed as ${opts.scopeId}\n`)
+        process.stderr.write(`channel: subscribed as ${opts.scopeId}\n`)
         res.setEncoding('utf8')
         armIdleTimer(res)
 
-        // Messages are handled one at a time: grammy's update handling is
-        // stateful (pairing, command routing), and interleaving two updates
-        // from the same chat reorders that state.
+        // Messages are handled one at a time: inbound handling is stateful
+        // (pairing, command routing), and interleaving two messages from the
+        // same chat reorders that state.
         let chain = Promise.resolve()
         const feed = createSseParser(envelope => {
           chain = chain.then(async () => {
@@ -151,7 +159,7 @@ export function startSubscribeClient(opts: {
             } catch (err) {
               // No ack: the poller keeps it in-flight and redelivers on reconnect.
               process.stderr.write(
-                `telegram channel: handling ${envelope.envelopeId} failed: ${err}\n`,
+                `channel ${opts.scopeId}: handling ${envelope.envelopeId} failed: ${err}\n`,
               )
             }
           })

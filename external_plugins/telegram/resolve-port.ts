@@ -7,6 +7,9 @@
  * both is what keeps them from drifting — a duplicated literal in each file
  * would still "work" on the defaults and only break once someone overrides the
  * port, at which point inbound messages vanish silently.
+ *
+ * Copied byte-identically into the discord plugin, so the warnings below name
+ * no platform — the env key in the message already identifies it.
  */
 
 const MIN_PORT = 1
@@ -41,7 +44,7 @@ export function resolvePort(
   const port = Number(rawValue)
   if (!Number.isInteger(port) || port < MIN_PORT || port > MAX_PORT) {
     process.stderr.write(
-      `telegram channel: ${envKey}=${JSON.stringify(rawValue)} is not a valid port ` +
+      `channel: ${envKey}=${JSON.stringify(rawValue)} is not a valid port ` +
       `(${MIN_PORT}-${MAX_PORT}); falling back to ${defaultPort}\n`,
     )
     return defaultPort
@@ -72,7 +75,7 @@ export function resolveCount(
   const count = Number(rawValue)
   if (!Number.isInteger(count) || count < 1) {
     process.stderr.write(
-      `telegram channel: ${envKey}=${JSON.stringify(rawValue)} is not a positive whole ` +
+      `channel: ${envKey}=${JSON.stringify(rawValue)} is not a positive whole ` +
       `number; falling back to ${defaultValue}\n`,
     )
     return defaultValue

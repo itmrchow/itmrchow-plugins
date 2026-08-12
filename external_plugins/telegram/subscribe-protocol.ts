@@ -8,7 +8,8 @@
  */
 
 /** One inbound message pushed to a scope. `payload` keeps its platform-native
- *  shape (a Telegram `Update`) so server.ts can feed it straight to grammy. */
+ *  shape (a Telegram `Update`, a Discord message JSON) so server.ts can feed it
+ *  straight to the platform library. */
 export type InboundEnvelope = {
   envelopeId: string
   scopeId: string
