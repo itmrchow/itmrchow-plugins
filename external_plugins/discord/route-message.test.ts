@@ -158,6 +158,24 @@ test('scope 已連上時逾時計時器不會誤殺', async () => {
   expect(h.notified).toHaveLength(0)
 })
 
+test('agent 重啟後（scope 斷線）再來訊息：重新要求 spawn，不是永遠排隊（JP-198）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  registry.onSubscribed('discord-dm-555')
+  registry.onDisconnected('discord-dm-555')
+  const h = harness({ registry })
+
+  await routeMessage(dmMessage(), h.ctx)
+
+  expect(h.spawned).toEqual(['discord-dm-555'])
+  expect(h.delivered).toEqual([])
+  // spawn 成功後排的逾時計時器只認 connecting，斷線中的 scope 不該被它清掉
+  h.fireTimer()
+  await Promise.resolve()
+  expect(registry.state('discord-dm-555')).toBe('disconnected')
+  expect(h.notified).toEqual([])
+  expect(registry.onSubscribed('discord-dm-555')).toHaveLength(1)
+})
+
 test('佇列滿了只記錄不回覆 —— 對方正在洗版，再回更多訊息只是幫倒忙', async () => {
   const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 1 })
   const h = harness({ registry })

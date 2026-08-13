@@ -169,6 +169,24 @@ test('spawn 成功且如期訂閱：逾時計時器不誤殺已連上的 scope',
   expect(h.notified).toEqual([])
 })
 
+test('agent 重啟後（scope 斷線）再來訊息：重新要求 spawn，不是永遠排隊（JP-198）', async () => {
+  const h = harness()
+  await routeUpdate(privateUpdate(1), h.ctx)
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onDisconnected('telegram-dm-555')
+
+  await routeUpdate(privateUpdate(2), h.ctx)
+
+  expect(h.spawned).toEqual(['telegram-dm-555', 'telegram-dm-555'])
+  expect(h.delivered).toEqual([])
+  // spawn 成功後排的逾時計時器只認 connecting，斷線中的 scope 不該被它清掉
+  h.timers[h.timers.length - 1]()
+  await Promise.resolve()
+  expect(h.ctx.registry.state('telegram-dm-555')).toBe('disconnected')
+  expect(h.notified).toEqual([])
+  expect(h.ctx.registry.onSubscribed('telegram-dm-555').length).toBe(1)
+})
+
 test('處理成功才推進到最後一則之後', async () => {
   const seen: number[] = []
   const consume = createUpdateConsumer({ route: async u => void seen.push(u.update_id) })
