@@ -50,6 +50,24 @@ export type RouteContext = {
   log?: (line: string) => void
 }
 
+/**
+ * Scopes with a spawn call currently awaiting a result.
+ *
+ * A disconnected scope asks for a spawn on EVERY arriving message (that is the
+ * JP-198 fix), and routing is fire-and-forget, so a burst of N messages fires N
+ * concurrent scope-spawn.sh processes onto one box-wide lock. That lock retries
+ * at one-second granularity and gives up after SPAWN_LOCK_TIMEOUT_SECONDS, so
+ * past ~10 competitors the losers exit non-zero — which this file reads as a
+ * failed spawn and answers by dropping the whole queue and telling the user we
+ * cannot respond. Collapsing the burst to one in-flight call per scope keeps
+ * the retry idempotent without adding a second timeout state machine.
+ *
+ * Module-level because it guards a process-wide resource (the spawn lock), not
+ * anything a single route call owns. It is NOT a connection state: the registry
+ * still owns connecting/disconnected, and this set says nothing about them.
+ */
+const spawnsInFlight = new Set<string>()
+
 function textForOutcome(outcome: SpawnOutcome): string {
   if (outcome === 'cap_reached') return CAP_REACHED_TEXT
   if (outcome === 'not_configured') return NOT_CONFIGURED_TEXT
@@ -129,7 +147,18 @@ export async function routeMessage(input: RouteInput, ctx: RouteContext): Promis
     return
   }
 
-  const outcome = await ctx.spawn(scopeId)
+  // The event is already queued by admit(); the pending spawn's subscribe will
+  // flush it along with everything else, so skipping the duplicate call loses
+  // nothing.
+  if (spawnsInFlight.has(scopeId)) return
+  spawnsInFlight.add(scopeId)
+  let outcome: SpawnOutcome
+  try {
+    outcome = await ctx.spawn(scopeId)
+  } finally {
+    spawnsInFlight.delete(scopeId)
+  }
+
   if (outcome !== 'ok') {
     await abandonScope(scopeId, input.channelId, outcome, ctx, log)
     return

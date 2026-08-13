@@ -176,6 +176,70 @@ test('agent 重啟後（scope 斷線）再來訊息：重新要求 spawn，不�
   expect(registry.onSubscribed('discord-dm-555')).toHaveLength(1)
 })
 
+test('斷線中連續來訊只呼叫一次 spawn —— 併發不得把 box-wide 鎖打爆（JP-198）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  registry.onSubscribed('discord-dm-555')
+  registry.onDisconnected('discord-dm-555')
+  const h = harness({ registry })
+  const spawnedWhileDisconnected: string[] = []
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const ctx: RouteContext = {
+    ...h.ctx,
+    spawn: async scopeId => {
+      spawnedWhileDisconnected.push(scopeId)
+      await gate
+      return 'ok'
+    },
+  }
+
+  const inFlight = [
+    routeMessage(dmMessage(), ctx),
+    routeMessage(dmMessage(), ctx),
+    routeMessage(dmMessage(), ctx),
+  ]
+  expect(spawnedWhileDisconnected).toEqual(['discord-dm-555'])
+
+  release()
+  await Promise.all(inFlight)
+
+  expect(spawnedWhileDisconnected).toEqual(['discord-dm-555'])
+  expect(h.notified).toEqual([])
+  // 三則都入列，沒有因為省掉 spawn 而被丟掉
+  expect(registry.onSubscribed('discord-dm-555')).toHaveLength(3)
+})
+
+test('spawn 結束後解除去重，下一則訊息照樣能再要求一次 spawn（JP-198）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  registry.onSubscribed('discord-dm-555')
+  registry.onDisconnected('discord-dm-555')
+  const h = harness({ registry })
+
+  await routeMessage(dmMessage(), h.ctx)
+  await routeMessage(dmMessage(), h.ctx)
+
+  expect(h.spawned).toEqual(['discord-dm-555', 'discord-dm-555'])
+})
+
+test('斷線前的殘留佇列與斷線後的新訊息一起補送，且維持先後順序（JP-198）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  registry.onSubscribed('discord-dm-555')
+  const h = harness({ registry, deliverOk: false })
+
+  // 連上之後寫入失敗：這則退回佇列，成為斷線前的殘留
+  await routeMessage(dmMessage({ data: { content: 'residual' } }), h.ctx)
+  expect(registry.state('discord-dm-555')).toBe('disconnected')
+
+  // 斷線後的新訊息照樣入列，不被拒絕
+  await routeMessage(dmMessage({ data: { content: 'after' } }), h.ctx)
+
+  const pending = registry.onSubscribed('discord-dm-555')
+  expect(pending.map(e => ((e.payload as DiscordPayload).data as { content: string }).content))
+    .toEqual(['residual', 'after'])
+})
+
 test('佇列滿了只記錄不回覆 —— 對方正在洗版，再回更多訊息只是幫倒忙', async () => {
   const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 1 })
   const h = harness({ registry })
