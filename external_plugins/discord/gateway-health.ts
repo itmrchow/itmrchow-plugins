@@ -1,17 +1,22 @@
 // Liveness of the gateway connection, judged by the poller itself.
 //
-// Why the library's own recovery is not enough (JP-195): @discordjs/ws detects a
-// zombie connection (a heartbeat with no ACK) and calls WebSocketShard#destroy,
-// which — when the socket is still OPEN — sends a close frame and then
-// `await`s the `close` event before reconnecting. On a black-holed TCP
-// connection (NAT dropped the flow, no RST) that event never arrives, so the
-// destroy hangs INSIDE the recovery path: the process stays up, the socket stays
-// ESTABLISHED, no shardDisconnect / shardReconnecting is ever emitted, and the
-// bot is silent until someone restarts it.
+// JP-195: the bot went silent for ~10 hours with the socket still ESTABLISHED
+// and nothing in the journal; a restart fixed it. The library's own recovery
+// chain has a bounded worst case — zombie detection at ~41s without a heartbeat
+// ACK, then WebSocketShard#destroy, whose `await` on the `close` event is capped
+// by the `ws` package's own 30s close timer (production runs Node + `ws` via
+// tsx, not Bun's native WebSocket) — roughly 77s end to end including the
+// reconnect. Ten hours of silence therefore means something else failed, and
+// that failure point is still unidentified.
 //
-// So liveness is measured from the outside instead: the newest heartbeat ACK or
-// dispatch the poller has seen. Nothing here talks to discord.js — the poller
-// feeds it timestamps — because the poller cannot be imported by a test.
+// This module does not fix that unknown failure. It is a process-level liveness
+// watchdog: a mitigation that bounds the outage, and — together with the gateway
+// event logging in discord-poller.ts — the instrumentation needed to identify
+// the real cause when it recurs. Liveness is measured from the outside (the
+// newest heartbeat ACK or dispatch the poller has seen) exactly because no
+// particular internal mechanism can be trusted while the root cause is unknown.
+// Nothing here talks to discord.js — the poller feeds it timestamps — because
+// the poller cannot be imported by a test.
 
 /** How often the poller re-evaluates liveness. */
 export const HEALTH_CHECK_INTERVAL_MS = 60_000

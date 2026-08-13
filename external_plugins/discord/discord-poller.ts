@@ -73,9 +73,6 @@ if (!STATE_DIR) {
 
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
-/** Liveness of the gateway, for anything outside this process (the carrier's
- *  watchdog) that wants it without opening a discord connection of its own. */
-const HEALTH_FILE = join(STATE_DIR, 'poller-health.json')
 
 // Load STATE_DIR/.env (real env wins) — same convention as server.ts.
 try {
@@ -256,31 +253,21 @@ function lastAckAt(): number {
 
 const health = createGatewayHealth({ lastAckAt })
 
-function writeHealth(snapshot: GatewayHealthSnapshot): void {
-  // Never fatal: a health file that cannot be written is worth strictly less
-  // than the gateway connection this process exists to hold.
-  try {
-    writeFileSync(HEALTH_FILE, `${JSON.stringify({ pid: process.pid, updatedAt: Date.now(), ...snapshot })}\n`)
-  } catch (err) {
-    process.stderr.write(`discord poller: health file write failed: ${err}\n`)
-  }
-}
-
 /**
  * Give up on a connection that has gone quiet and let systemd rebuild it.
  *
- * Deliberately NOT client.destroy() + login(): destroy is the very call that
- * hangs on a black-holed socket (see gateway-health.ts), so recovering through
- * it would mean asking the wedged code path to unwedge itself. Exiting hands the
- * job to `Restart=always` in claude-discord-poller.service, which rebuilds the
- * process — and with it the socket — in five seconds.
+ * Deliberately NOT client.destroy() + login(): the JP-195 root cause is still
+ * unidentified (see gateway-health.ts), and recovering through an existing code
+ * path that has demonstrably reached an unknown state is more fragile than
+ * rebuilding the process. Exiting hands the job to `Restart=always` in
+ * claude-discord-poller.service, which is the one recovery that works without
+ * knowing what broke.
  */
 function surrenderGateway(snapshot: GatewayHealthSnapshot): void {
   process.stderr.write(
     `discord poller: gateway silent for ${snapshot.ageMs}ms (threshold ${GATEWAY_STALE_AFTER_MS}ms), ` +
       'presuming a zombie connection and exiting for a supervised restart\n',
   )
-  writeHealth(snapshot)
   process.exit(1)
 }
 
@@ -354,7 +341,9 @@ health.markActivity()
 setInterval(() => {
   const snapshot = health.snapshot()
   if (snapshot.stale) return surrenderGateway(snapshot)
-  writeHealth(snapshot)
+  // The verdict goes to the journal, not to a file: while the root cause is
+  // unknown, this timeline is the evidence a recurrence will be diagnosed from.
+  process.stderr.write(`discord poller: gateway alive, silent for ${snapshot.ageMs}ms\n`)
 }, HEALTH_CHECK_INTERVAL_MS)
 
 client.login(TOKEN).catch(err => {
