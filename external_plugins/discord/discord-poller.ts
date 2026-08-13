@@ -272,9 +272,32 @@ function surrenderGateway(snapshot: GatewayHealthSnapshot): void {
 }
 
 client.on('messageCreate', msg => {
+  // JP-197 臨時診斷：DM 完全收不到 messageCreate，需先確認 dispatch 有無抵達 client。
+  // 定位根因後應移除或收斂。
+  process.stderr.write(
+    `discord poller: JP-197 diag messageCreate: channelType=${msg.channel?.type ?? 'undefined'} ` +
+      `channelId=${msg.channelId} authorId=${msg.author?.id ?? 'undefined'} bot=${msg.author?.bot ?? 'undefined'}\n`,
+  )
   health.markActivity()
   if (msg.author.bot) return
   handle(messageInput(msg))
+})
+
+// JP-197 臨時診斷：比 messageCreate 更底層的原始 gateway dispatch，用來區分
+// 「gateway 沒送」與「discord.js 過濾掉了」。定位根因後應移除。
+// `raw` 不在 discord.js 的 ClientEvents 型別內（v14 只有 Events.Raw 常數），故轉型註冊。
+const rawEmitter = client as unknown as {
+  on(event: 'raw', listener: (packet: unknown, shardId: number) => void): void
+}
+rawEmitter.on('raw', (raw: unknown) => {
+  const packet = raw as { t?: string; d?: Record<string, unknown> } | null
+  if (packet?.t !== 'MESSAGE_CREATE') return
+  const d = packet.d ?? {}
+  const author = d.author as { id?: string } | undefined
+  process.stderr.write(
+    `discord poller: JP-197 diag raw MESSAGE_CREATE: channelId=${String(d.channel_id)} ` +
+      `authorId=${author?.id ?? 'undefined'} guildId=${d.guild_id === undefined ? 'absent' : String(d.guild_id)}\n`,
+  )
 })
 
 // Permission buttons only reach the gateway holder, so the poller has to hand
