@@ -99,6 +99,7 @@ Claude Code 用上一步方式跑起來後，在 Discord DM 你的 bot — 它�
   - `AGENT_SCOPE` 指明本程序服務哪個對話（例：`discord-dm-12345`）。值不合法時 server 仍照常提供 MCP 工具，但收不到任何訊息，並於 stderr 明講。
   - server 主動連到 `127.0.0.1:7853`（可用 `DISCORD_POLLER_PORT` 覆寫），並以指數退避自動重連。
   - 原本的 `/inject` HTTP endpoint（`DISCORD_INJECT_PORT`）已移除 —— server 現在不綁任何 port。本機程序要把文字推進 session 改用 `internal-inject` channel。
+  - poller 自行判斷 gateway 是否還活著：連續 5 分鐘既沒收到 heartbeat ACK 也沒收到任何事件，就判定為殭屍連線（socket 還 ESTABLISHED、邏輯層已死 —— 函式庫自己的重連在這種 socket 上會卡住），主動結束程序交由 supervisor 重建。每次檢查都會寫 `<DISCORD_STATE_DIR>/poller-health.json`（`{"pid","updatedAt","lastActivityAt","ageMs","stale"}`，時間為 epoch 毫秒）供外部 watchdog 讀取。
   - 提及身分組（role mention）不再觸發 bot：比對 role 需要 gateway 的成員快取，訂閱端沒有。請直接 @ bot，或改用 `mentionPatterns` regex —— 見 `ACCESS.md`。
 - **Bot 層控制指令** — `/ctx`（context 用量）、`/clear`（清空 context）、`/restart`（重啟 agent）。由 bot 程序直接透過 tmux 驅動，agent 卡死或掛掉時仍然可用。僅限已配對的 owner。可用 `DISCORD_CONTROL_COMMANDS`（逗號分隔，例 `ctx,restart`）縮小 bot 層攔截的範圍 —— 未列入的指令會當成一般訊息轉給 agent，讓 skill 自行定義語意。未設 = 三個全攔，與先前行為相同。
 - **啟動通知** — 重啟後 bot 會通知已配對 owner「agent 回來了」，列出載入的 plugin 版本並標記跨重啟有變動的項目。通知採原子 claim，多 channel 部署也只會發一次。

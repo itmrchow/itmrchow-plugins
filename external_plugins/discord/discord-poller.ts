@@ -39,6 +39,13 @@ import {
   type SpawnOutcome,
 } from './route-message'
 import { toInboundMessage, type InboundInteraction } from './inbound-message'
+import {
+  createGatewayHealth,
+  shouldLogGatewayDebug,
+  GATEWAY_STALE_AFTER_MS,
+  HEALTH_CHECK_INTERVAL_MS,
+  type GatewayHealthSnapshot,
+} from './gateway-health'
 
 // Per-plugin port, like DISCORD_INJECT_PORT: every channel plugin is spawned by
 // the same process and inherits one env, so a shared key would collide.
@@ -66,6 +73,9 @@ if (!STATE_DIR) {
 
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
+/** Liveness of the gateway, for anything outside this process (the carrier's
+ *  watchdog) that wants it without opening a discord connection of its own. */
+const HEALTH_FILE = join(STATE_DIR, 'poller-health.json')
 
 // Load STATE_DIR/.env (real env wins) — same convention as server.ts.
 try {
@@ -235,7 +245,47 @@ function handle(input: RouteInput): void {
   })
 }
 
+/** Newest heartbeat ACK across shards, epoch ms; -1 before the first one. */
+function lastAckAt(): number {
+  let newest = -1
+  for (const shard of client.ws.shards.values()) {
+    if (shard.lastPingTimestamp > newest) newest = shard.lastPingTimestamp
+  }
+  return newest
+}
+
+const health = createGatewayHealth({ lastAckAt })
+
+function writeHealth(snapshot: GatewayHealthSnapshot): void {
+  // Never fatal: a health file that cannot be written is worth strictly less
+  // than the gateway connection this process exists to hold.
+  try {
+    writeFileSync(HEALTH_FILE, `${JSON.stringify({ pid: process.pid, updatedAt: Date.now(), ...snapshot })}\n`)
+  } catch (err) {
+    process.stderr.write(`discord poller: health file write failed: ${err}\n`)
+  }
+}
+
+/**
+ * Give up on a connection that has gone quiet and let systemd rebuild it.
+ *
+ * Deliberately NOT client.destroy() + login(): destroy is the very call that
+ * hangs on a black-holed socket (see gateway-health.ts), so recovering through
+ * it would mean asking the wedged code path to unwedge itself. Exiting hands the
+ * job to `Restart=always` in claude-discord-poller.service, which rebuilds the
+ * process — and with it the socket — in five seconds.
+ */
+function surrenderGateway(snapshot: GatewayHealthSnapshot): void {
+  process.stderr.write(
+    `discord poller: gateway silent for ${snapshot.ageMs}ms (threshold ${GATEWAY_STALE_AFTER_MS}ms), ` +
+      'presuming a zombie connection and exiting for a supervised restart\n',
+  )
+  writeHealth(snapshot)
+  process.exit(1)
+}
+
 client.on('messageCreate', msg => {
+  health.markActivity()
   if (msg.author.bot) return
   handle(messageInput(msg))
 })
@@ -243,6 +293,7 @@ client.on('messageCreate', msg => {
 // Permission buttons only reach the gateway holder, so the poller has to hand
 // them on; server.ts answers them over REST once it receives them.
 client.on('interactionCreate', interaction => {
+  health.markActivity()
   if (!interaction.isButton()) return
   handle(interactionInput(interaction))
 })
@@ -251,8 +302,42 @@ client.on('error', err => {
   process.stderr.write(`discord poller: client error: ${err}\n`)
 })
 
+// Gateway diagnostics. Before JP-195 none of these were listened to, so a
+// connection that died left no trace at all: the incident had to be diagnosed
+// from `ss -tnp` because the journal had nothing between "gateway connected" and
+// the manual restart hours later.
+client.on('shardError', (err, shardId) => {
+  process.stderr.write(`discord poller: shard ${shardId} error: ${err}\n`)
+})
+
+client.on('shardDisconnect', (event, shardId) => {
+  process.stderr.write(
+    `discord poller: shard ${shardId} disconnected, code=${event.code} (not recoverable by the library)\n`,
+  )
+})
+
+client.on('shardReconnecting', shardId => {
+  process.stderr.write(`discord poller: shard ${shardId} reconnecting\n`)
+})
+
+client.on('shardResume', (shardId, replayed) => {
+  health.markActivity()
+  process.stderr.write(`discord poller: shard ${shardId} resumed, replayed ${replayed} events\n`)
+})
+
+client.on('shardReady', shardId => {
+  health.markActivity()
+  process.stderr.write(`discord poller: shard ${shardId} ready\n`)
+})
+
+// The library reports the zombie-connection destroy here and nowhere else.
+client.on('debug', message => {
+  if (shouldLogGatewayDebug(message)) process.stderr.write(`discord poller: gateway: ${message}\n`)
+})
+
 client.once('ready', c => {
   ctx.botInfo = c.user.toJSON()
+  health.markActivity()
   process.stderr.write(`discord poller: gateway connected as ${c.user.tag}\n`)
 })
 
@@ -261,6 +346,16 @@ client.once('ready', c => {
 hub.server.listen(POLLER_PORT, LOOPBACK, () => {
   process.stderr.write(`discord poller: subscriptions on ${LOOPBACK}:${POLLER_PORT}\n`)
 })
+
+// Armed from the login attempt, not from `ready`: a shard that never finishes
+// connecting is just as silent as one that died later, and only the timer can
+// tell the difference between "still connecting" and "never will".
+health.markActivity()
+setInterval(() => {
+  const snapshot = health.snapshot()
+  if (snapshot.stale) return surrenderGateway(snapshot)
+  writeHealth(snapshot)
+}, HEALTH_CHECK_INTERVAL_MS)
 
 client.login(TOKEN).catch(err => {
   process.stderr.write(`discord poller: login failed: ${err}\n`)
