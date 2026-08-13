@@ -39,6 +39,13 @@ import {
   type SpawnOutcome,
 } from './route-message'
 import { toInboundMessage, type InboundInteraction } from './inbound-message'
+import {
+  createGatewayHealth,
+  shouldLogGatewayDebug,
+  GATEWAY_STALE_AFTER_MS,
+  HEALTH_CHECK_INTERVAL_MS,
+  type GatewayHealthSnapshot,
+} from './gateway-health'
 
 // Per-plugin port, like DISCORD_INJECT_PORT: every channel plugin is spawned by
 // the same process and inherits one env, so a shared key would collide.
@@ -235,7 +242,37 @@ function handle(input: RouteInput): void {
   })
 }
 
+/** Newest heartbeat ACK across shards, epoch ms; -1 before the first one. */
+function lastAckAt(): number {
+  let newest = -1
+  for (const shard of client.ws.shards.values()) {
+    if (shard.lastPingTimestamp > newest) newest = shard.lastPingTimestamp
+  }
+  return newest
+}
+
+const health = createGatewayHealth({ lastAckAt })
+
+/**
+ * Give up on a connection that has gone quiet and let systemd rebuild it.
+ *
+ * Deliberately NOT client.destroy() + login(): the JP-195 root cause is still
+ * unidentified (see gateway-health.ts), and recovering through an existing code
+ * path that has demonstrably reached an unknown state is more fragile than
+ * rebuilding the process. Exiting hands the job to `Restart=always` in
+ * claude-discord-poller.service, which is the one recovery that works without
+ * knowing what broke.
+ */
+function surrenderGateway(snapshot: GatewayHealthSnapshot): void {
+  process.stderr.write(
+    `discord poller: gateway silent for ${snapshot.ageMs}ms (threshold ${GATEWAY_STALE_AFTER_MS}ms), ` +
+      'presuming a zombie connection and exiting for a supervised restart\n',
+  )
+  process.exit(1)
+}
+
 client.on('messageCreate', msg => {
+  health.markActivity()
   if (msg.author.bot) return
   handle(messageInput(msg))
 })
@@ -243,6 +280,7 @@ client.on('messageCreate', msg => {
 // Permission buttons only reach the gateway holder, so the poller has to hand
 // them on; server.ts answers them over REST once it receives them.
 client.on('interactionCreate', interaction => {
+  health.markActivity()
   if (!interaction.isButton()) return
   handle(interactionInput(interaction))
 })
@@ -251,8 +289,42 @@ client.on('error', err => {
   process.stderr.write(`discord poller: client error: ${err}\n`)
 })
 
+// Gateway diagnostics. Before JP-195 none of these were listened to, so a
+// connection that died left no trace at all: the incident had to be diagnosed
+// from `ss -tnp` because the journal had nothing between "gateway connected" and
+// the manual restart hours later.
+client.on('shardError', (err, shardId) => {
+  process.stderr.write(`discord poller: shard ${shardId} error: ${err}\n`)
+})
+
+client.on('shardDisconnect', (event, shardId) => {
+  process.stderr.write(
+    `discord poller: shard ${shardId} disconnected, code=${event.code} (not recoverable by the library)\n`,
+  )
+})
+
+client.on('shardReconnecting', shardId => {
+  process.stderr.write(`discord poller: shard ${shardId} reconnecting\n`)
+})
+
+client.on('shardResume', (shardId, replayed) => {
+  health.markActivity()
+  process.stderr.write(`discord poller: shard ${shardId} resumed, replayed ${replayed} events\n`)
+})
+
+client.on('shardReady', shardId => {
+  health.markActivity()
+  process.stderr.write(`discord poller: shard ${shardId} ready\n`)
+})
+
+// The library reports the zombie-connection destroy here and nowhere else.
+client.on('debug', message => {
+  if (shouldLogGatewayDebug(message)) process.stderr.write(`discord poller: gateway: ${message}\n`)
+})
+
 client.once('ready', c => {
   ctx.botInfo = c.user.toJSON()
+  health.markActivity()
   process.stderr.write(`discord poller: gateway connected as ${c.user.tag}\n`)
 })
 
@@ -261,6 +333,18 @@ client.once('ready', c => {
 hub.server.listen(POLLER_PORT, LOOPBACK, () => {
   process.stderr.write(`discord poller: subscriptions on ${LOOPBACK}:${POLLER_PORT}\n`)
 })
+
+// Armed from the login attempt, not from `ready`: a shard that never finishes
+// connecting is just as silent as one that died later, and only the timer can
+// tell the difference between "still connecting" and "never will".
+health.markActivity()
+setInterval(() => {
+  const snapshot = health.snapshot()
+  if (snapshot.stale) return surrenderGateway(snapshot)
+  // The verdict goes to the journal, not to a file: while the root cause is
+  // unknown, this timeline is the evidence a recurrence will be diagnosed from.
+  process.stderr.write(`discord poller: gateway alive, silent for ${snapshot.ageMs}ms\n`)
+}, HEALTH_CHECK_INTERVAL_MS)
 
 client.login(TOKEN).catch(err => {
   process.stderr.write(`discord poller: login failed: ${err}\n`)
