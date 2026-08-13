@@ -169,6 +169,87 @@ test('spawn 成功且如期訂閱：逾時計時器不誤殺已連上的 scope',
   expect(h.notified).toEqual([])
 })
 
+test('agent 重啟後（scope 斷線）再來訊息：重新要求 spawn，不是永遠排隊（JP-198）', async () => {
+  const h = harness()
+  await routeUpdate(privateUpdate(1), h.ctx)
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onDisconnected('telegram-dm-555')
+
+  await routeUpdate(privateUpdate(2), h.ctx)
+
+  expect(h.spawned).toEqual(['telegram-dm-555', 'telegram-dm-555'])
+  expect(h.delivered).toEqual([])
+  // spawn 成功後排的逾時計時器只認 connecting，斷線中的 scope 不該被它清掉
+  h.timers[h.timers.length - 1]()
+  await Promise.resolve()
+  expect(h.ctx.registry.state('telegram-dm-555')).toBe('disconnected')
+  expect(h.notified).toEqual([])
+  expect(h.ctx.registry.onSubscribed('telegram-dm-555').length).toBe(1)
+})
+
+test('斷線中連續來訊只呼叫一次 spawn —— 併發不得把 box-wide 鎖打爆（JP-198）', async () => {
+  const h = harness()
+  await routeUpdate(privateUpdate(1), h.ctx)
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onDisconnected('telegram-dm-555')
+  const spawnedWhileDisconnected: string[] = []
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const ctx: RouteContext = {
+    ...h.ctx,
+    spawn: async scopeId => {
+      spawnedWhileDisconnected.push(scopeId)
+      await gate
+      return 'ok'
+    },
+  }
+
+  const inFlight = [
+    routeUpdate(privateUpdate(2), ctx),
+    routeUpdate(privateUpdate(3), ctx),
+    routeUpdate(privateUpdate(4), ctx),
+  ]
+  expect(spawnedWhileDisconnected).toEqual(['telegram-dm-555'])
+
+  release()
+  await Promise.all(inFlight)
+
+  expect(spawnedWhileDisconnected).toEqual(['telegram-dm-555'])
+  expect(h.notified).toEqual([])
+  // 三則都入列，沒有因為省掉 spawn 而被丟掉
+  expect(h.ctx.registry.onSubscribed('telegram-dm-555').length).toBe(3)
+})
+
+test('spawn 結束後解除去重，下一則訊息照樣能再要求一次 spawn（JP-198）', async () => {
+  const h = harness()
+  await routeUpdate(privateUpdate(1), h.ctx)
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onDisconnected('telegram-dm-555')
+
+  await routeUpdate(privateUpdate(2), h.ctx)
+  await routeUpdate(privateUpdate(3), h.ctx)
+
+  expect(h.spawned).toEqual(['telegram-dm-555', 'telegram-dm-555', 'telegram-dm-555'])
+})
+
+test('斷線前的殘留佇列與斷線後的新訊息一起補送，且維持先後順序（JP-198）', async () => {
+  const h = harness({ deliverOk: false })
+  await routeUpdate(privateUpdate(1), h.ctx)
+  expect(h.ctx.registry.onSubscribed('telegram-dm-555').length).toBe(1)
+
+  // 連上之後寫入失敗：訊息 2 退回佇列，成為斷線前的殘留
+  await routeUpdate(privateUpdate(2), h.ctx)
+  expect(h.ctx.registry.state('telegram-dm-555')).toBe('disconnected')
+
+  // 斷線後的新訊息照樣入列，不被拒絕
+  await routeUpdate(privateUpdate(3), h.ctx)
+
+  const pending = h.ctx.registry.onSubscribed('telegram-dm-555')
+  expect(pending.map(e => (e.payload as Update).update_id)).toEqual([2, 3])
+})
+
 test('處理成功才推進到最後一則之後', async () => {
   const seen: number[] = []
   const consume = createUpdateConsumer({ route: async u => void seen.push(u.update_id) })

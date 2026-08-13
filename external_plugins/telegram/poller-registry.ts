@@ -55,13 +55,26 @@ export class ScopeRegistry {
       return { action: 'spawn' }
     }
     if (entry.state === 'connected') return { action: 'deliver', envelopes: [envelope] }
-    // connecting and disconnected share the queue path. They differ only in that
-    // disconnected must NOT re-trigger a spawn: that process is still alive and
-    // merely reconnecting, and a second one would leave two Claudes fighting
-    // over the same scope's session pointer.
     if (entry.queue.length >= this.#maxQueue) return { action: 'rejected', reason: 'queue_full' }
     entry.queue.push(envelope)
-    return { action: 'queued' }
+    // connecting means a spawn is already in flight, with the caller's
+    // SPAWN_TIMEOUT_MS watchdog behind it — queueing is the whole job.
+    if (entry.state === 'connecting') return { action: 'queued' }
+    // disconnected used to queue as well, on the assumption that the process is
+    // alive and merely reconnecting. That assumption fails for the ordinary
+    // maintenance case: restarting the agent kills every claude, and the poller
+    // is a separate service nobody tells — so the entry sat disconnected
+    // forever and every later message queued into a scope that would never read
+    // it, silently. Asking for a spawn instead is safe because scope-spawn.sh
+    // is idempotent under a box-wide lock (JP-177): an already-live scope exits
+    // 0 without touching tmux, so a process that really is reconnecting costs
+    // one no-op call rather than a second claude on the same session pointer.
+    //
+    // The state stays disconnected on purpose. Flipping it to connecting would
+    // arm that watchdog, and the subscribe client's reconnect backoff maxes out
+    // at exactly SPAWN_TIMEOUT_MS — a slow but healthy reconnect would be
+    // abandoned mid-flight and lose its queue.
+    return { action: 'spawn' }
   }
 
   /**
@@ -83,8 +96,10 @@ export class ScopeRegistry {
   }
 
   /**
-   * The subscription socket dropped. The entry is kept: the process is probably
-   * still alive and reconnecting.
+   * The subscription socket dropped. The entry is kept, queue and all: the
+   * process may be reconnecting, and whether it is gone for good is not
+   * knowable from here — admit() settles that by asking for an (idempotent)
+   * spawn on the next message.
    *
    * @param scopeId - The scope that disconnected.
    */

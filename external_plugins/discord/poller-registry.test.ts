@@ -42,12 +42,35 @@ test('情境 4 啟動中：後續訊息入佇列，訂閱那刻依序 flush（FI
   expect(reg.state('telegram-dm-3')).toBe('connected')
 })
 
-test('情境 5 斷線重連中：入佇列但不再觸發 spawn', () => {
+test('情境 5 斷線後收到新訊息：入佇列並重新要求 spawn（JP-198）', () => {
   reg.admit('telegram-dm-4', env('telegram-dm-4'))
   reg.onSubscribed('telegram-dm-4')
   reg.onDisconnected('telegram-dm-4')
   expect(reg.state('telegram-dm-4')).toBe('disconnected')
-  expect(reg.admit('telegram-dm-4', env('telegram-dm-4'))).toEqual({ action: 'queued' })
+  const late = env('telegram-dm-4')
+  expect(reg.admit('telegram-dm-4', late)).toEqual({ action: 'spawn' })
+  // 訊息沒被 spawn 這條路徑吃掉：重連時仍補得出來
+  expect(reg.onSubscribed('telegram-dm-4')).toEqual([late])
+})
+
+test('情境 5b 斷線後 state 維持 disconnected：不借用 connecting 的 spawn 逾時計時器', () => {
+  reg.admit('telegram-dm-4b', env('telegram-dm-4b'))
+  reg.onSubscribed('telegram-dm-4b')
+  reg.onDisconnected('telegram-dm-4b')
+  reg.admit('telegram-dm-4b', env('telegram-dm-4b'))
+  expect(reg.state('telegram-dm-4b')).toBe('disconnected')
+})
+
+test('情境 5c 斷線且佇列已滿：照舊擋下，不因為要 spawn 就放行超量', () => {
+  reg.admit('telegram-dm-4c', env('telegram-dm-4c'))
+  reg.onSubscribed('telegram-dm-4c')
+  reg.onDisconnected('telegram-dm-4c')
+  reg.admit('telegram-dm-4c', env('telegram-dm-4c'))
+  reg.admit('telegram-dm-4c', env('telegram-dm-4c'))
+  expect(reg.admit('telegram-dm-4c', env('telegram-dm-4c'))).toEqual({
+    action: 'rejected',
+    reason: 'queue_full',
+  })
 })
 
 test('情境 6 spawn 失敗：清空佇列並交還未送出的訊息供回報', () => {
@@ -71,12 +94,18 @@ test('情境 7 佇列爆量：丟新的、保留先到的（維持因果順序�
   expect(flushed[1]).toEqual(kept)
 })
 
-test('情境 8 全域重啟：poller 不屬於任何 scope，斷線等同情境 5', () => {
+test('情境 8 全域重啟：poller 活著、claude 全沒了 -> 下一則訊息把 scope 拉回來', () => {
   reg.admit('telegram-dm-8', env('telegram-dm-8'))
   reg.onSubscribed('telegram-dm-8')
   reg.onDisconnected('telegram-dm-8')
-  expect(reg.admit('telegram-dm-8', env('telegram-dm-8'))).toEqual({ action: 'queued' })
+  expect(reg.admit('telegram-dm-8', env('telegram-dm-8'))).toEqual({ action: 'spawn' })
   expect(reg.size()).toBe(1)
+})
+
+test('啟動中的 scope 不受 JP-198 影響：仍只排隊，不重複要求 spawn', () => {
+  expect(reg.admit('telegram-dm-10', env('telegram-dm-10'))).toEqual({ action: 'spawn' })
+  expect(reg.admit('telegram-dm-10', env('telegram-dm-10'))).toEqual({ action: 'queued' })
+  expect(reg.state('telegram-dm-10')).toBe('connecting')
 })
 
 test('requeue 把未 ack 的訊息放回佇列前端，維持原順序', () => {
