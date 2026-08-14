@@ -3,8 +3,7 @@
 # Channel-agnostic IM sender. Token resolution mirrors the channel plugin
 # server.ts convention: real env var wins, else read <STATE_DIR>/.env.
 # Set IM_SEND_DRY_RUN=1 to print the resolved request as JSON instead of
-# performing the HTTP call (exercised by the co-located im-send.test.sh).
-# JSON bodies are built with python3 (json.dumps) so this script needs no external JSON tool.
+# performing the HTTP call (used by im-send.test.sh).
 set -euo pipefail
 
 SOURCE="${1:?usage: im-send <source> <recipient> <text>}"
@@ -21,27 +20,23 @@ resolve_token() {
   printf '%s' "$val"
 }
 
-# Build a JSON object from key=value pairs passed via environment.
-# Usage: json_obj key1 key2 ...  (values read from J_<key> env vars)
-json_obj() {
-  python3 -c '
-import json, os, sys
-obj = {}
-for key in sys.argv[1:]:
-    obj[key] = os.environ["J_" + key]
-print(json.dumps(obj))
-' "$@"
-}
-
+# The <PLATFORM>_STATE_DIR defaults below are a deliberate divergence from the
+# telegram plugin's resolveStateDir() (telegram/src/state-dir.ts), which is
+# fail-closed and supplies no default -- it once sent to the production bot for
+# 20s after falling back. Here a default is correct: im-send is invoked from
+# skills and watchdog timers that do not inherit the plugin's env, and the
+# blast radius differs -- resolveStateDir picks which bot *receives* polling,
+# while a wrong state_dir here only fails to find a token and exits non-zero.
+# Not an alignment oversight; do not "fix" by removing the defaults.
 case "$SOURCE" in
   telegram)
     state_dir="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
     token="$(resolve_token TELEGRAM_BOT_TOKEN "$state_dir")"
     [ -n "$token" ] || { echo "im-send: TELEGRAM_BOT_TOKEN not found (env or $state_dir/.env)" >&2; exit 1; }
     url="https://api.telegram.org/bot${token}/sendMessage"
-    body="$(J_chat_id="$RECIPIENT" J_text="$TEXT" json_obj chat_id text)"
+    body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t}')"
     if [ "${IM_SEND_DRY_RUN:-}" = "1" ]; then
-      J_channel="telegram" J_method="POST" J_url="$url" J_auth="url" J_body="$body" json_obj channel method url auth body
+      jq -nc --arg url "$url" --arg body "$body" '{channel:"telegram", method:"POST", url:$url, auth:"url", body:$body}'
       exit 0
     fi
     curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null
@@ -51,9 +46,9 @@ case "$SOURCE" in
     token="$(resolve_token DISCORD_BOT_TOKEN "$state_dir")"
     [ -n "$token" ] || { echo "im-send: DISCORD_BOT_TOKEN not found (env or $state_dir/.env)" >&2; exit 1; }
     url="https://discord.com/api/v10/channels/${RECIPIENT}/messages"
-    body="$(J_content="$TEXT" json_obj content)"
+    body="$(jq -nc --arg c "$TEXT" '{content:$c}')"
     if [ "${IM_SEND_DRY_RUN:-}" = "1" ]; then
-      J_channel="discord" J_method="POST" J_url="$url" J_auth="header" J_body="$body" json_obj channel method url auth body
+      jq -nc --arg url "$url" --arg body "$body" '{channel:"discord", method:"POST", url:$url, auth:"header", body:$body}'
       exit 0
     fi
     curl -fsS -X POST "$url" -H "Authorization: Bot ${token}" -H 'Content-Type: application/json' -d "$body" >/dev/null

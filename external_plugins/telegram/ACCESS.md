@@ -102,10 +102,10 @@ Every failure is a **silent drop** — unknown, expired, and revoked tokens all 
 
 Tokens are stored in a file shared by every channel, not in `access.json` — see [Invite file](#invite-file-shared-across-channels) below.
 
-Tokens are managed from an admin's DM via the `im-invite` skill (`im-session-ops` plugin): `create` / `revoke` / `list`. Two properties are deliberate and permanent:
+Tokens are minted from an admin's DM with `/create-token`, handled by the `im-create-token` skill (`im-core` plugin). Minting is the only operation the skill offers — there is no `revoke` and no `list`; anything else means editing the invite file by hand. Two properties are deliberate and permanent:
 
 - **`admins` is read-only to every program.** The first admin is set by editing `access.json` by hand. No code path and no skill adds one, so a redeemed invite can never be escalated into admin rights through conversation.
-- **Revoking a token is not the same as removing the people who used it.** `revoke` stops future redemptions and leaves a tombstone (`revokedAt`, pruned after 30 days); existing members stay in `allowFrom` until removed with `/telegram:access remove <id>`. `usedBy` records who came in on which token.
+- **Revoking a token is not the same as removing the people who used it.** Setting `revokedAt` in the invite file stops future redemptions and leaves a tombstone (pruned after 30 days); existing members stay in `allowFrom` until removed with `/telegram:access remove <id>`. `usedBy` records who came in on which token.
 
 ## Skill reference
 
@@ -144,13 +144,13 @@ Tokens are managed from an admin's DM via the `im-invite` skill (`im-session-ops
     }
   },
 
-  // Per-platform admin user IDs — who may mint invites via the im-invite
-  // skill. Hand-edited only; the server and every skill treat this as
+  // Per-platform admin user IDs — who may mint invites with /create-token.
+  // Hand-edited only; the server and every skill treat this as
   // read-only. Optional; absent = nobody can mint invites.
   "admins": { "telegram": ["412587349"] },
 
-  // The bot's @username, backfilled by the server once known. Lets the
-  // im-invite skill build deep-links without reading the bot token.
+  // The bot's @username, backfilled by the server once known. Lets a skill
+  // or an operator build deep-links without reading the bot token.
   "botUsername": "myclaudebot",
 
   // Case-insensitive regexes that count as a mention.
@@ -184,7 +184,7 @@ The file is not under any platform subdirectory, because it belongs to none of t
 {
   // Bumped only if the on-disk shape ever changes incompatibly.
   "version": 1,
-  // Invite tickets, keyed by token. Written by the im-invite skill and by each
+  // Invite tickets, keyed by token. Written by the im-create-token skill and by each
   // channel server when a token is redeemed.
   "invites": {
     "a1b2c3d4e5f60718293a4b5c6d7e8f90": {
@@ -207,4 +207,4 @@ Deployments that predate this move keep their tokens: on boot each channel serve
 Two consequences worth knowing:
 
 - The file holds bearer tokens. It is written `0600` and, like the contents of the state directory, the server refuses to send it as a reply attachment.
-- There is no lock. Three processes (both channel servers and the `im-invite` skill) read-modify-write it. Minting and redeeming are human-paced and writes are atomic, so this is an accepted trade-off rather than an oversight.
+- There is no lock. Three processes (both channel servers and the `im-create-token` skill) read-modify-write it. Minting and redeeming are human-paced and writes are atomic, so this is an accepted trade-off rather than an oversight.

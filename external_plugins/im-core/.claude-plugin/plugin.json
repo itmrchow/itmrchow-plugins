@@ -1,0 +1,16 @@
+{
+  "name": "im-core",
+  "description": "Shared IM command core for claude-tg-agent — six operator skills (help, restart, create-token, session clear/rename/resume) plus the channel-agnostic im-send sender. Not a channel plugin; requires a carrier repo for its shell libraries.",
+  "version": "0.1.0",
+  "author": {
+    "name": "itmrchow",
+    "email": "itmrchow@gmail.com"
+  },
+  "keywords": [
+    "im",
+    "session",
+    "telegram",
+    "discord",
+    "ops"
+  ]
+}

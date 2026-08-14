@@ -978,6 +978,17 @@
       "homepage": "https://github.com/huggingface/skills.git"
     },
     {
+      "name": "im-core",
+      "description": "Shared IM command core for claude-tg-agent — six operator skills (help, restart, create-token, session clear/rename/resume) plus the channel-agnostic im-send sender. Not a channel plugin; requires a carrier repo for its shell libraries.",
+      "author": {
+        "name": "itmrchow",
+        "email": "itmrchow@gmail.com"
+      },
+      "category": "productivity",
+      "source": "./external_plugins/im-core",
+      "homepage": "https://github.com/itmrchow/itmrchow-plugins/tree/main/external_plugins/im-core"
+    },
+    {
       "name": "imessage",
       "description": "iMessage messaging bridge with built-in access control. Reads chat.db directly, sends via AppleScript. Manage pairing, allowlists, and policy via /imessage:access.",
       "category": "productivity",
@@ -1834,17 +1845,6 @@
         "sha": "06adf37ca78c270a57f93e7b9dfbb7bf16e24611"
       },
       "homepage": "https://servicenow.github.io/sdk/"
-    },
-    {
-      "name": "im-session-ops",
-      "description": "IM session 維運指令：clear / rename / resume / invite 四個 skill 加 im-send 發訊器，多 channel（Telegram / Discord）多 agent 共用。",
-      "author": {
-        "name": "itmrchow",
-        "email": "itmrchow@gmail.com"
-      },
-      "source": "./plugins/im-session-ops",
-      "category": "productivity",
-      "homepage": "https://github.com/itmrchow/itmrchow-plugins/tree/main/plugins/im-session-ops"
     },
     {
       "name": "session-report",

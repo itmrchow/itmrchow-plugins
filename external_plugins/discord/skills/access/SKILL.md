@@ -60,7 +60,9 @@ delivery settings (`ackReaction`, `replyToMode`, `textChunkLimit`,
 here on purpose.
 
 Invite tokens are **not** in this file. They live in the shared, cross-platform
-`~/.claude/channels/invites.json`, managed by the `im-invite` skill. This skill
+`~/.claude/channels/invites.json`, minted by the `im-create-token` skill
+(`im-core` plugin) — minting is its only operation, there is no revoke and no
+list. This skill
 never reads or writes them. An older deployment may still show an `invites` key
 here — leave it exactly as found; the channel server migrates it on its next
 boot.
