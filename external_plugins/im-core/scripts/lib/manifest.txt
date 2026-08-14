@@ -1,0 +1,9 @@
+# im-core shell lib 的載入清單 —— 唯一真相來源。
+#
+# 兩個讀者共用這一份：plugin 的 lib-loader.sh（依序 source）與 carrier 的
+# lib-plugins.sh preflight（依此檢查候選版本齊全）。清單若分裂成兩份，preflight
+# 會放行一個載不起來的版本，而症狀出現在下一次開機、不在更新當下。
+#
+# 順序即 source 順序。函式定義彼此無序，但 im.sh 在 source 時就會計算
+# IM_PROJECTS_DIR，所以它必須排在自己需要的定義之後。
+scope.sh
