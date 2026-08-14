@@ -8,3 +8,4 @@
 # IM_PROJECTS_DIR，所以它必須排在自己需要的定義之後。
 scope.sh
 im.sh
+channels.sh
