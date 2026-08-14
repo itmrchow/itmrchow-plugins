@@ -23,9 +23,10 @@ fi
 # --- 2. 環境齊全時 loader 載齊 manifest 列出的全部 lib ---
 out="$(AGENT_SCOPES_DIR="$TMP/scopes" bash -c "
   source '$LIB/lib-loader.sh' || exit 1
-  for fn in scope_is_valid scope_session_flag; do
+  for fn in scope_session_flag im_is_admin channels_resolve scope_is_valid; do
     declare -F \"\$fn\" >/dev/null || { echo \"missing: \$fn\"; exit 1; }
   done
+  [ \"\${SPAWN_EXIT_INVALID_SCOPE:-}\" = 3 ] || { echo 'missing SPAWN_EXIT_INVALID_SCOPE'; exit 1; }
 " 2>&1)"
 if [ $? -eq 0 ]; then
   ok "loader loads every lib in the manifest"
@@ -50,6 +51,19 @@ if ! grep -qE '^[A-Za-z_]+=\(.*\.sh' "$LIB/lib-loader.sh"; then
   ok "loader keeps no second hardcoded file list"
 else
   bad "loader has a hardcoded file list beside manifest.txt"
+fi
+
+# --- 5. spawn exit code 契約常數齊全且值正確 ---
+# 這四個值是 poller（TS）與 scope-spawn.sh（shell）之間的契約。值寫在這裡、
+# 兩邊都引用，是 parity.test.sh 能比對的前提。
+out="$(AGENT_SCOPES_DIR="$TMP/scopes" bash -c "
+  source '$LIB/lib-loader.sh' || exit 1
+  printf '%s %s %s %s' \"\$SPAWN_EXIT_OK\" \"\$SPAWN_EXIT_TRANSIENT\" \"\$SPAWN_EXIT_CAP_REACHED\" \"\$SPAWN_EXIT_INVALID_SCOPE\"
+" 2>&1)"
+if [ "$out" = "0 1 2 3" ]; then
+  ok "spawn exit code contract constants are loaded with the agreed values"
+else
+  bad "spawn exit code constants wrong or missing: '$out'"
 fi
 
 exit $fail

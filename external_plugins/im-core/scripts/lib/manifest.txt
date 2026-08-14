@@ -9,3 +9,4 @@
 scope.sh
 im.sh
 channels.sh
+spawn-contract.sh
