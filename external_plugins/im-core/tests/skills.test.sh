@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Static hygiene tests for the im-core skills. No network, no agent, no bats.
+# Ported from claude-tg-agent scripts/watchdog/tests/im.bats (JP-202); kept as
+# plain bash so the plugin carries no test-framework dependency.
+# Run: bash tests/skills.test.sh
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SKILLS="$HERE/../skills"
+fail=0
+ok()  { echo "ok:   $1"; }
+bad() { echo "FAIL: $1"; fail=1; }
+
+# The unit string carrier's sudoers authorises, verbatim. sudoers compares argv
+# literally, so appending ".service" makes sudo fall through to a password
+# prompt on a tty that does not exist -- the restart fails silently and the user
+# just sees a bot that never came back. carrier's im.bats pins this same string
+# against deploy/oci/claude-watchdog.sudoers; if either side drifts, that side
+# goes red on its own. Do NOT add ".service".
+RESTART_CMD="sudo systemctl restart claude-tg-agent"
+
+# --- 1. restart skill's sudo line matches carrier's sudoers grant ---
+# Match the executable command line only (line-initial sudo), not the counter
+# example quoted in the skill's 注意 section.
+actual="$(sed -n 's|^\(sudo systemctl restart .*\)$|\1|p' "$SKILLS/im-restart/SKILL.md")"
+if [ "$actual" = "$RESTART_CMD" ]; then
+  ok "restart skill sudo line is the literal sudoers grant"
+else
+  bad "restart skill sudo line drifted: expected '$RESTART_CMD', got '$actual'"
+fi
+
+# --- 2. no skill parks user-controlled state in /tmp ---
+# /tmp is world-writable and these paths are fixed, so any local account could
+# pre-create or overwrite them -- the /resume rows file most of all, since its
+# content decides which session the agent switches to.
+out="$(grep -rn 'file_path`: `/tmp/\|> */tmp/\|cat */tmp/\|rm -f */tmp/' "$SKILLS")"
+if [ -z "$out" ]; then
+  ok "no skill uses a /tmp path for state"
+else
+  bad "skill state found in /tmp:"$'\n'"$out"
+fi
+
+# --- 3. no skill derives the transcripts path from the cwd ---
+# $PWD is whatever directory the model happened to be in; the launcher exports
+# AGENT_WORKSPACE_DIR for exactly this. Getting it wrong points at a directory
+# that does not exist, and the symptom is a command that silently does nothing.
+out="$(grep -rn 'projects/\${PWD' "$SKILLS")"
+if [ -z "$out" ]; then
+  ok "no skill derives the transcripts path from \$PWD"
+else
+  bad "transcripts path derived from \$PWD:"$'\n'"$out"
+fi
+
+exit $fail

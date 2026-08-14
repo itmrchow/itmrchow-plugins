@@ -14,19 +14,21 @@ description: 任一 IM channel 收到 /resume 斜線指令時列出可切換的�
 
 ## 執行步驟
 
-先讀 `.claude/skills/im-common.md`（前置載入、`SRC` / `CID` / `UID` 取法、身分判定）。
+先讀 `$IM_CORE_DIR/skills/im-common.md`（前置載入、`SRC` / `CID` / `UID` 取法、身分判定）。
 
 ### 第一輪：用戶送 /resume
 
 ```bash
-IM_LIB="$(dirname "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}")"
-source "$IM_LIB/lib-channels.sh"; source "$IM_LIB/lib-scope.sh"; source "$IM_LIB/lib-im.sh"
+: "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
+: "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
+: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
+source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
 
 if im_is_admin "<SRC>" "<UID>"; then IS_ADMIN=0; else IS_ADMIN=1; fi
 
 # 第零道：這個場合能不能用這個指令。群組對一般使用者直接不受理，連清單都不算
 if ! im_resume_allowed "$AGENT_SCOPE" "$IS_ADMIN"; then
-  "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "這個指令只能在私訊使用"
+  "$IM_SEND_BIN" "<SRC>" "<CID>" "這個指令只能在私訊使用"
   exit 0
 fi
 
@@ -38,10 +40,10 @@ mkdir -p "$(dirname "$ROWS_FILE")"
 printf '%s' "$ROWS" > "$ROWS_FILE"
 
 if [ -z "$ROWS" ]; then
-  "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "目前沒有可切換的對話"
+  "$IM_SEND_BIN" "<SRC>" "<CID>" "目前沒有可切換的對話"
 else
   LIST="$(im_format_list "$ROWS" 1900 "$IS_ADMIN")"
-  "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "請選擇要切換的對話（回覆編號）：
+  "$IM_SEND_BIN" "<SRC>" "<CID>" "請選擇要切換的對話（回覆編號）：
 
 $LIST"
 fi
@@ -54,9 +56,11 @@ fi
 用戶回覆純數字、且上下文顯示剛才列過清單時：
 
 ```bash
-IM_LIB="$(dirname "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}")"
-source "$IM_LIB/lib-channels.sh"; source "$IM_LIB/lib-scope.sh"; source "$IM_LIB/lib-im.sh"
-SEND="${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}"
+: "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
+: "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
+: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
+source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
+SEND="$IM_SEND_BIN"
 
 ROWS_FILE="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}/${AGENT_SCOPE}.resume-rows"
 ROWS="$(cat "$ROWS_FILE" 2>/dev/null)"

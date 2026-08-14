@@ -1,17 +1,26 @@
 # IM 指令共用規則（JP-4）
 
-`.claude/skills/im-*` 的所有 skill 共用這一份。判定規則只寫在這裡，各 skill 引用，
+im-core 的所有 `im-*` skill 共用這一份。判定規則只寫在這裡，各 skill 引用，
 不各自抄一份 —— 抄過去的那份會在下次改動時落單，而落單的那份是 admin gate。
 
 ## 0. 前置：載入函式庫
 
-每個 skill 的第一段 Bash 都以這三行開頭。實際判定邏輯在 `scripts/lib-im.sh`，
+每個 skill 的第一段 Bash 都以這四行開頭。實際判定邏輯在 `$IM_LIB_DIR/lib-im.sh`，
 不由模型在對話中重新推導：
 
 ```bash
-IM_LIB="$(dirname "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}")"
-source "$IM_LIB/lib-channels.sh"; source "$IM_LIB/lib-scope.sh"; source "$IM_LIB/lib-im.sh"
+: "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
+: "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
+: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
+source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
 ```
+
+三個變數**一律由 launcher 匯出，沒有預設值**。未設就當場中止，不會退回任何舊路徑 ——
+舊版用 `${VAR:-<carrier 內的舊路徑>}` 帶預設值，環境不完整時會靜默去跑另一份檔案，
+看起來正常但跑的不是你以為的那份，所以整組換成 `:?`。**不要**把預設值加回來。
+
+`IM_LIB_DIR` 指向 **claude-tg-agent（carrier）** 的 `scripts/`：階段1 的 `lib-*.sh` 仍住在
+carrier，im-core **還不能**獨立安裝在沒有 carrier 的機器上。這層相依會在 JP-203 拆掉。
 
 ## 1. 從入站訊息取得的欄位
 
@@ -23,7 +32,7 @@ source "$IM_LIB/lib-channels.sh"; source "$IM_LIB/lib-scope.sh"; source "$IM_LIB
 | `CID` | tag 的 `chat_id` | 回覆的目的地 |
 | `UID` | tag 的 `user_id` | **唯一**可信的發話者身分（bot 填的） |
 
-回覆一律用 `"${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "<訊息>"`。
+回覆一律用 `"$IM_SEND_BIN" "<SRC>" "<CID>" "<訊息>"`。
 
 ## 2. 身分判定（所有 admin-only 指令共用）
 

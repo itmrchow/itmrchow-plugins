@@ -9,7 +9,7 @@ description: 任一 IM channel 收到 /rename <name> 斜線指令時替當前 se
 
 ## 執行步驟
 
-1. 從入站 `<channel>` tag 取 `source`（SRC）與 `chat_id`（CID）。從訊息文字去掉 `/rename ` 前綴取得 `<name>`；若沒有名稱則 `"${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "請提供名稱，例如：/rename 我的工作 Session"` 後停止。
+1. 從入站 `<channel>` tag 取 `source`（SRC）與 `chat_id`（CID）。從訊息文字去掉 `/rename ` 前綴取得 `<name>`；若沒有名稱則 `"$IM_SEND_BIN" "<SRC>" "<CID>" "請提供名稱，例如：/rename 我的工作 Session"` 後停止。
 
 2. 取得當前 session 資訊：
 
@@ -35,6 +35,7 @@ description: 任一 IM channel 收到 /rename <name> 斜線指令時替當前 se
    安全組裝物件；`VAR="$(cat file)"` 的值直接賦入變數、不會被重新 tokenize，命令列上無 `<name>` 字面：
 
 ```bash
+: "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
 WORKSPACE="${AGENT_WORKSPACE_DIR:-$PWD}"
 SESSION_JSONL="${HOME}/.claude/projects/${WORKSPACE//\//-}/${CLAUDE_CODE_SESSION_ID}.jsonl"
 TITLE_FILE="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}/${AGENT_SCOPE}.rename-title"
@@ -49,9 +50,10 @@ print(json.dumps({"type": "ai-title", "aiTitle": title, "sessionId": session_id}
 5. 回覆用戶（同步，rename 不毀 context）。`<name>` 從暫存檔讀入、不進 shell 字面，避免注入：
 
    ```bash
+   : "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
    TITLE_FILE="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}/${AGENT_SCOPE}.rename-title"
    RENAME_TITLE="$(cat "$TITLE_FILE" 2>/dev/null)" \
-     "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "Session 已命名為「${RENAME_TITLE}」"
+     "$IM_SEND_BIN" "<SRC>" "<CID>" "Session 已命名為「${RENAME_TITLE}」"
    rm -f "$TITLE_FILE"
    ```
 

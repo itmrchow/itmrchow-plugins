@@ -12,24 +12,26 @@ allowlist。
 
 ## 執行步驟
 
-先讀 `.claude/skills/im-common.md`（前置載入、身分判定、拒絕說法）。
+先讀 `$IM_CORE_DIR/skills/im-common.md`（前置載入、身分判定、拒絕說法）。
 
 ```bash
-IM_LIB="$(dirname "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}")"
-source "$IM_LIB/lib-channels.sh"; source "$IM_LIB/lib-scope.sh"; source "$IM_LIB/lib-im.sh"
+: "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
+: "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
+: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
+source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
 
 if ! im_is_admin "<SRC>" "<UID>"; then
-  "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "這個指令需要管理員權限"
+  "$IM_SEND_BIN" "<SRC>" "<CID>" "這個指令需要管理員權限"
   exit 0
 fi
 if [ "$(scope_kind "$AGENT_SCOPE")" != "dm" ]; then
-  "${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "這個指令只能在私訊使用"
+  "$IM_SEND_BIN" "<SRC>" "<CID>" "這個指令只能在私訊使用"
   exit 0
 fi
 
 NOTE_FILE="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}/${AGENT_SCOPE}.token-note"
 TOKEN="$(im_invite_create "<SRC>" "<UID>" "$(cat "$NOTE_FILE" 2>/dev/null)")"
-"${IM_SEND_BIN:-$HOME/claude-tg-agent/scripts/im-send.sh}" "<SRC>" "<CID>" "邀請碼已產生（7 天內有效），把下面這行轉給對方：
+"$IM_SEND_BIN" "<SRC>" "<CID>" "邀請碼已產生（7 天內有效），把下面這行轉給對方：
 
 /start $TOKEN"
 rm -f "$NOTE_FILE"

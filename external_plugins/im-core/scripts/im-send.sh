@@ -20,6 +20,14 @@ resolve_token() {
   printf '%s' "$val"
 }
 
+# The <PLATFORM>_STATE_DIR defaults below are a deliberate divergence from the
+# telegram plugin's resolveStateDir() (telegram/src/state-dir.ts), which is
+# fail-closed and supplies no default -- it once sent to the production bot for
+# 20s after falling back. Here a default is correct: im-send is invoked from
+# skills and watchdog timers that do not inherit the plugin's env, and the
+# blast radius differs -- resolveStateDir picks which bot *receives* polling,
+# while a wrong state_dir here only fails to find a token and exits non-zero.
+# Not an alignment oversight; do not "fix" by removing the defaults.
 case "$SOURCE" in
   telegram)
     state_dir="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
