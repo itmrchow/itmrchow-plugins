@@ -9,7 +9,13 @@ description: 任一 IM channel 收到 /rename <name> 斜線指令時替當前 se
 
 ## 執行步驟
 
-1. 從入站 `<channel>` tag 取 `source`（SRC）與 `chat_id`（CID）。從訊息文字去掉 `/rename ` 前綴取得 `<name>`；若沒有名稱則 `"$IM_SEND_BIN" "<SRC>" "<CID>" "請提供名稱，例如：/rename 我的工作 Session"` 後停止。
+1. 從入站 `<channel>` tag 取 `source`（SRC）與 `chat_id`（CID）。從訊息文字去掉 `/rename ` 前綴取得
+   `<name>`；若沒有名稱則跑下面這段後停止：
+
+   ```bash
+   : "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
+   "$IM_SEND_BIN" "<SRC>" "<CID>" "請提供名稱，例如：/rename 我的工作 Session"
+   ```
 
 2. 取得當前 session 資訊：
 
