@@ -42,8 +42,7 @@ description: 任一 IM channel 收到 /rename <name> 斜線指令時替當前 se
 ```bash
 : "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
 : "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
-: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
-source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
+source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || exit 1
 
 SESSION_JSONL="${IM_PROJECTS_DIR}/${CLAUDE_CODE_SESSION_ID}.jsonl"
 TITLE_FILE="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}/${AGENT_SCOPE}.rename-title"

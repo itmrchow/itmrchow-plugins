@@ -5,22 +5,24 @@ im-core 的所有 `im-*` skill 共用這一份。判定規則只寫在這裡，�
 
 ## 0. 前置：載入函式庫
 
-每個 skill 的第一段 Bash 都以這四行開頭。實際判定邏輯在 `$IM_LIB_DIR/lib-im.sh`，
-不由模型在對話中重新推導：
+每個 skill 的第一段 Bash 都以這三行開頭。實際判定邏輯在 im-core 自己的
+`scripts/lib/`，不由模型在對話中重新推導：
 
 ```bash
 : "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
 : "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
-: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
-source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
+source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || exit 1
 ```
 
-三個變數**一律由 launcher 匯出，沒有預設值**。未設就當場中止，不會退回任何舊路徑 ——
-舊版用 `${VAR:-<carrier 內的舊路徑>}` 帶預設值，環境不完整時會靜默去跑另一份檔案，
-看起來正常但跑的不是你以為的那份，所以整組換成 `:?`。**不要**把預設值加回來。
+兩個變數**一律由宿主 launcher 匯出，沒有預設值**。未設就當場中止，不會退回任何舊路徑 ——
+舊版用 `${VAR:-<舊路徑>}` 帶預設值，環境不完整時會靜默去跑另一份檔案，看起來正常但
+跑的不是你以為的那份，所以整組用 `:?`。**不要**把預設值加回來。
 
-`IM_LIB_DIR` 指向 **claude-tg-agent（carrier）** 的 `scripts/`：階段1 的 `lib-*.sh` 仍住在
-carrier，im-core **還不能**獨立安裝在沒有 carrier 的機器上。這層相依會在 JP-203 拆掉。
+`lib-loader.sh` 是**唯一**入口：它依 `scripts/lib/manifest.txt` 載齊全部 lib，並驗宿主
+是否設好 `AGENT_SCOPES_DIR`。不要直接 source 個別 lib —— 下次新增一支 lib 時，直接
+source 的那份會靜默漏載。載入失敗一定 `|| exit 1`，不要吞掉。
+
+（`IM_LIB_DIR` 已於 JP-203 退場：lib 現在住在 im-core 內，im-core 不再需要 carrier repo。）
 
 ## 1. 從入站訊息取得的欄位
 
