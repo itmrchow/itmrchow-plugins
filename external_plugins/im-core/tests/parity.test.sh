@@ -42,6 +42,11 @@ else
 fi
 
 # --- 2. port 預設 ---
+# 本段只保證「每個 port 的 shell 值 == TS 值」，不保證兩個不同的 port 不會被同時
+# 改成同一號碼 —— 那條由 channels.bats 的 "no default port is shared between the
+# inject and poller domains" 守（同語言內唯一）。兩條合起來才推得出 TS 側也唯一。
+# 不要把撞號斷言複製到這裡：職責不同，複製後改一個 port 要改兩個檔。
+#
 # 格式：<shell 取值表達式>|<TS 檔>|<TS 內取值的 sed 表達式>|<說明>
 check_port() {
   local label="$1" expr="$2" file="$3" pattern="$4" sh_port ts_port

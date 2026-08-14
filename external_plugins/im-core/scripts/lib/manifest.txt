@@ -4,8 +4,13 @@
 # lib-plugins.sh preflight（依此檢查候選版本齊全）。清單若分裂成兩份，preflight
 # 會放行一個載不起來的版本，而症狀出現在下一次開機、不在更新當下。
 #
-# 順序即 source 順序。函式定義彼此無序，但 im.sh 在 source 時就會計算
-# IM_PROJECTS_DIR，所以它必須排在自己需要的定義之後。
+# 順序即 source 順序。目前四支之間沒有 source 期的相依（im.sh 在 source 當下會算
+# IM_PROJECTS_DIR，但它需要的 im_encode_workspace 就在同一個檔裡），所以本清單的
+# 順序是可讀性排序，不是相依排序。日後若有 lib 在**頂層**用到別支的東西，順序才
+# 會變成硬約束 —— 到時候在這裡寫明是哪一對，不要讓下一個人靠猜。
+#
+# 註解一律頂格：loader 的剝除規則只認第 0 欄的 `#`（刻意保持簡單，開機路徑上能
+# 出錯的東西越少越好），縮排的 `  # ...` 會被當成檔名而 hard fail。
 scope.sh
 im.sh
 channels.sh

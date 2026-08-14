@@ -206,7 +206,7 @@ channels_bootstrap_extra() {
 # channels_bootstrap_guard: 0 when the bootstrap scope is one that can actually
 # be spawned AND every non-platform channel in CHANNELS is one it will load, 1
 # with the reason on stderr otherwise. Checked before the tmux session is
-# created, so a host in this state does not boot at all. Requires lib-scope.sh
+# created, so a host in this state does not boot at all. Requires scope.sh
 # (scope_is_valid / scope_platform) sourced.
 #
 # WHY refuse to boot instead of dropping the channel from the list: the operator
@@ -262,7 +262,7 @@ channels_bootstrap_guard() {
 
 # channels_for_scope <scope-id>: echo the channels THAT scope loads, one per
 # line — its own platform (the one its scope-id names), plus, for the bootstrap
-# scope only, its BOOTSTRAP_EXTRA_CHANNELS. Requires lib-scope.sh
+# scope only, its BOOTSTRAP_EXTRA_CHANNELS. Requires scope.sh
 # (scope_platform) sourced.
 #
 # ONE PLATFORM PER SCOPE: the scope-id already names the platform this process

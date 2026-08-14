@@ -34,7 +34,7 @@
 | `IM_CORE_DIR` | 宿主 | 是 | 本 plugin 根目錄（pinned installPath）。skill 由此定址 `im-common.md` 與 `scripts/lib/lib-loader.sh` |
 | `IM_SEND_BIN` | 宿主 | 是 | `$IM_CORE_DIR/scripts/im-send.sh` |
 | `AGENT_SCOPES_DIR` | 宿主 | 是 | pointer / ledger / intent / admins 四種檔案的根。**本 plugin 刻意不給預設值** |
-| `AGENT_SCOPE` | 宿主 | 是（agent 內） | 本進程服務的 scope-id |
+| `AGENT_SCOPE` | 宿主 | 是（agent 內） | 本進程服務的 scope-id。由 `scope_resolve` 在呼叫時驗，不由 loader 驗 —— 見下方 §3 的守衛對照表 |
 | `AGENT_WORKSPACE_DIR` | 宿主 | 強烈建議 | transcripts 目錄的來源。未設時退回 `$PWD`，而 `$PWD` 不對就等於「沒有任何對話」 |
 | `CHANNELS` / `CHANNEL` | 宿主 | 呼叫 `channels_resolve` 時 | 本機跑哪些 channel。兩者皆未設時 `channels_resolve` 回非 0 |
 | `BOOTSTRAP_SCOPE` / `BOOTSTRAP_EXTRA_CHANNELS` | 宿主 | 否 | 綁定 box-wide port 的 channel 由哪個 scope 承載 |
@@ -62,7 +62,7 @@ claude plugin install im-core@itmrchow-plugins --scope user
 版本化 cache 目錄的路徑不可寫死（含版號，每次 bump 就變），執行時查 `installed_plugins.json`：
 
 ```bash
-IM_CORE_DIR="$(jq -r --arg key "im-core@itmrchow-plugins" '
+export IM_CORE_DIR="$(jq -r --arg key "im-core@itmrchow-plugins" '
     (.plugins[$key] // [])
     | map(select(.scope == "user"))
     | (.[0].installPath // empty)
@@ -70,6 +70,10 @@ IM_CORE_DIR="$(jq -r --arg key "im-core@itmrchow-plugins" '
 ```
 
 拿不到就**當場失敗**，不要退回別的路徑：退回 = 跑到另一份 code，而且看起來一切正常。
+
+`export` 不能省：`IM_CORE_DIR` 要傳進 agent 進程，六個 `im-*` skill 的第一行
+`: "${IM_CORE_DIR:?...}"` 都靠它定址。只在 launcher 的 shell 內賦值，launcher 自己
+跑得起來，但每個指令都會回報「IM_CORE_DIR not set — launcher 未匯出」。
 
 ### 3. 設好環境契約再 source loader
 
@@ -82,7 +86,16 @@ source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || {
 }
 ```
 
-必填變數見上面的環境變數契約表。缺任何一項 loader 都會在 stderr 說明缺什麼。
+必填變數見上面的環境變數契約表。**三種變數由三個不同的關卡守，不是全部由 loader 守**：
+
+| 變數 | 誰在擋 | 何時擋 | 訊息長相 |
+|---|---|---|---|
+| `AGENT_SCOPES_DIR` | `im_core_load`（本檔的 loader） | source loader 當下 | `[im-core/lib-loader] AGENT_SCOPES_DIR 未設 —— ...` |
+| `IM_CORE_DIR` / `IM_SEND_BIN` | 各 skill preamble 的 `: "${VAR:?...}"` | skill 執行第一行 | `IM_CORE_DIR not set — launcher 未匯出...` |
+| `AGENT_SCOPE` | `scope_resolve`（`scripts/lib/scope.sh`） | 呼叫它的時候（launcher 開機即呼叫） | `[lib-scope] AGENT_SCOPE is not set (expected shape: ...)` |
+
+`AGENT_SCOPE` 刻意**不**進 loader：`setup.sh` 這類部署腳本會 source 同一批 lib，但執行時根本
+沒有 scope，強制必填會讓它們開頭就死。它是「呼叫時才用的入參」，守衛待在使用點才對。
 
 ### 4.（建議）更新前先 preflight
 
@@ -95,15 +108,40 @@ CANDIDATE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/marketplaces/itmrchow-plu
 [ -r "$CANDIDATE/scripts/lib/manifest.txt" ] && [ -r "$CANDIDATE/scripts/lib/lib-loader.sh" ] || exit 1
 # 2. manifest 列出的檔案都在，且語法過
 bash -n "$CANDIDATE/scripts/lib/lib-loader.sh" || exit 1
-grep -v '^\s*#' "$CANDIDATE/scripts/lib/manifest.txt" | grep -v '^\s*$' | while read -r f; do
+# while 一定要吃 process substitution，不能掛在 pipe 右側：pipe 右側跑在 subshell，
+# 裡面的 exit 只殺 subshell，外層照樣往下走去呼叫 plugin update —— 這一關等於不存在。
+while read -r f; do
   bash -n "$CANDIDATE/scripts/lib/$f" || exit 1
-done
+done < <(grep -v '^[[:space:]]*#' "$CANDIDATE/scripts/lib/manifest.txt" | grep -v '^[[:space:]]*$')
 # 3. 冒煙載入
 ( AGENT_SCOPES_DIR="$(mktemp -d)" bash -c "source '$CANDIDATE/scripts/lib/lib-loader.sh' && declare -F im_is_admin >/dev/null" ) || exit 1
 ```
 
 驗過才 `claude plugin update`；沒過就跳過更新，pin 留在舊版繼續服務。
 參考實作：claude-tg-agent 的 `scripts/lib-plugins.sh`。
+
+## 5. 故障排除與退版
+
+### 常見失敗
+
+| 症狀 | 原因 | 處置 |
+|---|---|---|
+| `[im-core/lib-loader] AGENT_SCOPES_DIR 未設 ...` | 宿主沒 export 這個變數 | 照 §3 補上；本 plugin 刻意不給預設值 |
+| `[im-core/lib-loader] manifest 列出的 lib 缺檔：...` | 安裝不完整，或 manifest 與實際檔案漂移 | 重跑 `claude plugin update im-core@itmrchow-plugins`；仍缺就是該版本壞了，照下方退版 |
+| skill 回報 `IM_CORE_DIR not set — launcher 未匯出` | §2 的賦值漏了 `export` | 見 §2；只賦值不 export 時 launcher 自己會過、agent 內每個指令都會掛 |
+| `/resume` 找不到任何東西、pointer / ledger 都是空的 | `AGENT_SCOPES_DIR` 指到打錯字的路徑 | loader 只驗非空、不驗路徑是否是你想的那個（那是宿主的設定責任）。用 `ls "$AGENT_SCOPES_DIR"` 對一次 |
+
+### 退版（pin 回舊版）
+
+`installPath` 是版本化 cache 目錄，舊版**不會**被刪，所以退版就是把 `IM_CORE_DIR` 指回去：
+
+```bash
+ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/itmrchow-plugins/im-core/"   # 可用版本
+export IM_CORE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/itmrchow-plugins/im-core/<舊版號>"
+```
+
+宿主重啟後即以舊版服務。這是 §4 preflight「不過就不動 pin」的手動版本 —— 兩者都靠同一件事：
+cache 保留多版本。
 
 ## 測試
 
