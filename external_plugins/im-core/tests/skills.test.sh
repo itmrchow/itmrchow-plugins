@@ -50,4 +50,15 @@ else
   bad "transcripts path derived from \$PWD:"$'\n'"$out"
 fi
 
+# --- 4. no skill builds the transcripts path itself ---
+# JP-199 是同一條路徑公式活在兩處：lib-im.sh 與 /rename skill。修了一邊，另一邊
+# 仍指向不存在的目錄，而且兩次的失敗都是無聲的。skills 一律從 lib-im.sh 取
+# IM_PROJECTS_DIR。carrier 側的同名 bats 測試隨 skills 一起搬走，本條是它的接班人。
+out="$(grep -rn 'claude/projects' "$SKILLS")"
+if [ -z "$out" ]; then
+  ok "no skill builds the transcripts path itself"
+else
+  bad "skill builds the transcripts path itself:"$'\n'"$out"
+fi
+
 exit $fail
