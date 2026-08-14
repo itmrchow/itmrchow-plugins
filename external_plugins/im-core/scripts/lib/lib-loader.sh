@@ -36,14 +36,18 @@ im_core_load() {
   if [ ! -r "$IM_CORE_LIB_MANIFEST_FILE" ]; then
     im_core_lib_fail "載入清單缺檔：$IM_CORE_LIB_MANIFEST_FILE" || return 1
   fi
-  while IFS= read -r name; do
+  # `|| [ -n "$name" ]` 是為了收下沒有結尾換行的最後一行 —— 少了它，一次不小心的
+  # 編輯就會讓最後一支 lib 靜默漏載，而 loader 照樣回 0。
+  while IFS= read -r name || [ -n "$name" ]; do
     case "$name" in ''|'#'*) continue ;; esac
     file="$IM_CORE_LIB_DIR/$name"
     if [ ! -r "$file" ]; then
       im_core_lib_fail "manifest 列出的 lib 缺檔：$file" || return 1
     fi
     # shellcheck disable=SC1090  # 路徑來自 manifest，靜態分析看不到
-    source "$file" || im_core_lib_fail "載入 $name 失敗" || return 1
+    # `</dev/null`：本迴圈的 stdin 就是 manifest 本身，被 source 的 lib 若在頂層讀
+    # stdin 會吃掉 manifest 的下一行 —— 症狀是中間某一支靜默漏載、loader 仍回 0。
+    source "$file" </dev/null || im_core_lib_fail "載入 $name 失敗" || return 1
   done < "$IM_CORE_LIB_MANIFEST_FILE"
 }
 

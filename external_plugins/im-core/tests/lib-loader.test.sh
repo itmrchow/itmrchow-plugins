@@ -66,4 +66,20 @@ else
   bad "spawn exit code constants wrong or missing: '$out'"
 fi
 
+# --- 6. 重複 source 不會改變任何值（冪等） ---
+# loader 是「宿主唯一入口」，而唯一入口在真實環境會被 source 超過一次（launcher 一次、
+# 每個 skill 各一次）。任何 += 或累加式賦值溜進來，症狀是 KNOWN_CHANNELS 越跑越長。
+out="$(AGENT_SCOPES_DIR="$TMP/scopes" bash -c "
+  source '$LIB/lib-loader.sh' || exit 1
+  before=\"\${#KNOWN_CHANNELS[@]}:\$SCOPE_ID_RE:\$IM_PROJECTS_DIR:\$SPAWN_EXIT_CAP_REACHED\"
+  source '$LIB/lib-loader.sh' || exit 1
+  after=\"\${#KNOWN_CHANNELS[@]}:\$SCOPE_ID_RE:\$IM_PROJECTS_DIR:\$SPAWN_EXIT_CAP_REACHED\"
+  [ \"\$before\" = \"\$after\" ] || { echo \"before='\$before' after='\$after'\"; exit 1; }
+" 2>&1)"
+if [ $? -eq 0 ]; then
+  ok "sourcing the loader twice changes nothing"
+else
+  bad "the loader is not idempotent: $out"
+fi
+
 exit $fail

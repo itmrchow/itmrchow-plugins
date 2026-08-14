@@ -223,7 +223,13 @@ setup() {
   # Two things binding one number is the failure that never announces itself: the
   # second one just does not come up. The poller ports sit a decade above the
   # inject ones for exactly that reason.
-  run bash -c 'source '"${BATS_TEST_DIRNAME}"'/../../lib-channels.sh
+  #
+  # status 一定要斷言：這條測試的判準是「輸出裡沒有重複行」，而載入失敗時輸出是
+  # 幾行錯誤訊息，一樣沒有重複行 —— 少了 status 這關，載入壞掉會被讀成通過。
+  #
+  # 這條只看 shell 側；shell 值與 TS 值是否一致由 tests/parity.test.sh 守。
+  run bash -c 'source '"${BATS_TEST_DIRNAME}"'/../scripts/lib/lib-loader.sh >/dev/null
     for c in "${KNOWN_CHANNELS[@]}"; do channel_inject_port "$c"; echo; channel_poller_port "$c"; echo; done | grep .'
+  [ "$status" -eq 0 ]
   [ "$(printf '%s\n' "$output" | sort | uniq -d)" = "" ]
 }
