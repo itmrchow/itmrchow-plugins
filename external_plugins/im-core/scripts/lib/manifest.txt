@@ -7,3 +7,4 @@
 # 順序即 source 順序。函式定義彼此無序，但 im.sh 在 source 時就會計算
 # IM_PROJECTS_DIR，所以它必須排在自己需要的定義之後。
 scope.sh
+im.sh
