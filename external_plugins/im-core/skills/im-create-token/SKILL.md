@@ -47,8 +47,8 @@ rm -f "$NOTE_FILE"
 
 - 回的是**純文字 `/start <token>`**，不組 telegram deep-link：Spec 定案「通用不分平台」，
   deep-link 只有 telegram 有，組了在 discord 是壞連結。
-- token 寫進 `~/.claude/channels/invites.json`，與 channel plugin、`im-invite` skill 是
-  **同一份檔、同一套 schema**，所以三邊產的碼互通、也互相看得到。
+- token 寫進 `~/.claude/channels/invites.json`，與 channel plugin 是
+  **同一份檔、同一套 schema**，所以兩邊產的碼互通、也互相看得到。
 - `im_invite_create` 每次都重新讀整份檔再整份寫回：channel server 隨時可能就地改
   `usedBy` 或清掉過期墓碑，用對話裡稍早讀到的內容寫回去會把那些改動洗掉。
 - **永不寫 `admins`、永不寫 `access.json`**。邀請碼只讓人進得來，不讓人變成管理員 ——
