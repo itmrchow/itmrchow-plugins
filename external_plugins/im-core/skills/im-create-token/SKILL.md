@@ -17,8 +17,7 @@ allowlist。
 ```bash
 : "${IM_CORE_DIR:?IM_CORE_DIR not set — launcher 未匯出，im-core plugin 環境不完整}"
 : "${IM_SEND_BIN:?IM_SEND_BIN not set — 應指向 im-core 的 scripts/im-send.sh}"
-: "${IM_LIB_DIR:?IM_LIB_DIR not set — 需指向 claude-tg-agent 的 scripts 目錄}"
-source "$IM_LIB_DIR/lib-channels.sh"; source "$IM_LIB_DIR/lib-scope.sh"; source "$IM_LIB_DIR/lib-im.sh"
+source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || exit 1
 
 if ! im_is_admin "<SRC>" "<UID>"; then
   "$IM_SEND_BIN" "<SRC>" "<CID>" "這個指令需要管理員權限"
