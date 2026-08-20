@@ -59,6 +59,7 @@ const LOOPBACK = '127.0.0.1'
 
 /** Exit codes of scope-spawn.sh; see the spawn contract in the JP-177 plan. */
 const SPAWN_EXIT_OK = 0
+const SPAWN_EXIT_TRANSIENT = 1
 const SPAWN_EXIT_CAP_REACHED = 2
 const SPAWN_EXIT_INVALID_SCOPE = 3
 
@@ -164,6 +165,7 @@ function spawnScope(scopeId: string): Promise<SpawnOutcome> {
     })
     child.on('close', code => {
       if (code === SPAWN_EXIT_OK) return resolve('ok')
+      if (code === SPAWN_EXIT_TRANSIENT) return resolve('failed')
       if (code === SPAWN_EXIT_CAP_REACHED) return resolve('cap_reached')
       if (code === SPAWN_EXIT_INVALID_SCOPE) return resolve('invalid_scope')
       resolve('failed')
