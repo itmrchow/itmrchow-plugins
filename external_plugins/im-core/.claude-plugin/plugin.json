@@ -1,7 +1,7 @@
 {
   "name": "im-core",
   "description": "Shared IM command core for claude-tg-agent — six operator skills (help, restart, create-token, session clear/rename/resume) plus the channel-agnostic im-send sender. Not a channel plugin; ships its own shell libraries; a host only needs to export the environment contract.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "itmrchow",
     "email": "itmrchow@gmail.com"

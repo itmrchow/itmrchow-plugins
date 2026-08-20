@@ -90,6 +90,7 @@ check_exit() {
 
 for f in "$PLUGINS/telegram/poller.ts" "$PLUGINS/discord/discord-poller.ts"; do
   check_exit SPAWN_EXIT_OK "$f"
+  check_exit SPAWN_EXIT_TRANSIENT "$f"
   check_exit SPAWN_EXIT_CAP_REACHED "$f"
   check_exit SPAWN_EXIT_INVALID_SCOPE "$f"
 done
