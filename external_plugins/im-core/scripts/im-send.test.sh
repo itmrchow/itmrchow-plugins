@@ -14,6 +14,14 @@ check "telegram url has token path" '[[ "$out" == *"api.telegram.org/bottg-test/
 check "telegram chat_id in body"    'echo "$out" | jq -e ".body|fromjson|.chat_id==\"12345\"" >/dev/null'
 check "telegram text field"         'echo "$out" | jq -e ".body|fromjson|.text==\"hi there\"" >/dev/null'
 
+# --- telegram link preview off ---
+out="$(TELEGRAM_BOT_TOKEN=tg-test IM_SEND_NO_LINK_PREVIEW=1 IM_SEND_DRY_RUN=1 "$SEND" telegram 1 'u')"
+check "telegram preview disabled when asked" 'echo "$out" | jq -e ".body|fromjson|.link_preview_options.is_disabled==true" >/dev/null'
+out="$(TELEGRAM_BOT_TOKEN=tg-test IM_SEND_DRY_RUN=1 "$SEND" telegram 1 'u')"
+check "telegram body unchanged by default" 'echo "$out" | jq -e ".body|fromjson|has(\"link_preview_options\")|not" >/dev/null'
+out="$(DISCORD_BOT_TOKEN=dc-test IM_SEND_NO_LINK_PREVIEW=1 IM_SEND_DRY_RUN=1 "$SEND" discord 1 'u')"
+check "discord ignores the preview flag" 'echo "$out" | jq -e ".body|fromjson|keys==[\"content\"]" >/dev/null'
+
 # --- discord dry-run ---
 out="$(DISCORD_BOT_TOKEN=dc-test IM_SEND_DRY_RUN=1 "$SEND" discord 999 'yo')"
 check "discord url has channel path" '[[ "$out" == *"discord.com/api/v10/channels/999/messages"* ]]'

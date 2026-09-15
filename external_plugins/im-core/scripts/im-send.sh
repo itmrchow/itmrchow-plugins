@@ -4,6 +4,8 @@
 # server.ts convention: real env var wins, else read <STATE_DIR>/.env.
 # Set IM_SEND_DRY_RUN=1 to print the resolved request as JSON instead of
 # performing the HTTP call (used by im-send.test.sh).
+# Set IM_SEND_NO_LINK_PREVIEW=1 to disable telegram link previews (links that must
+# not be fetched by a previewer). discord ignores it.
 set -euo pipefail
 
 SOURCE="${1:?usage: im-send <source> <recipient> <text>}"
@@ -34,7 +36,11 @@ case "$SOURCE" in
     token="$(resolve_token TELEGRAM_BOT_TOKEN "$state_dir")"
     [ -n "$token" ] || { echo "im-send: TELEGRAM_BOT_TOKEN not found (env or $state_dir/.env)" >&2; exit 1; }
     url="https://api.telegram.org/bot${token}/sendMessage"
-    body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t}')"
+    if [ "${IM_SEND_NO_LINK_PREVIEW:-}" = "1" ]; then
+      body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t, link_preview_options:{is_disabled:true}}')"
+    else
+      body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t}')"
+    fi
     if [ "${IM_SEND_DRY_RUN:-}" = "1" ]; then
       jq -nc --arg url "$url" --arg body "$body" '{channel:"telegram", method:"POST", url:$url, auth:"url", body:$body}'
       exit 0
