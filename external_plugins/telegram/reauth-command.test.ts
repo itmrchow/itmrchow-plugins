@@ -23,7 +23,15 @@ import {
 
 const DM: ReauthSource = { platform: 'telegram', senderId: '777', chatId: '777', chatType: 'dm', botUsername: 'jr_bot' }
 
-function fakeDeps(exit: number | null, overrides: Partial<ReauthDeps> = {}) {
+type FakeDeps = {
+  deps: ReauthDeps
+  calls: { bin: string; args: readonly string[]; stdin?: string }[]
+  replies: string[]
+  logs: string[]
+  discarded: () => number
+}
+
+function fakeDeps(exit: number | null, overrides: Partial<ReauthDeps> = {}): FakeDeps {
   const calls: { bin: string; args: readonly string[]; stdin?: string }[] = []
   const replies: string[] = []
   const logs: string[] = []
