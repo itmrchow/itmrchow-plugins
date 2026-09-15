@@ -165,8 +165,8 @@ cache 保留多版本。
 ```
 
 - 執行器由 poller 從 **marketplace clone** 呼叫（與 poller 同一份 checkout），不走 pinned installPath。
-- poller 重啟（含 discord gateway 自救退出）會以 SIGTERM 中斷流程；driver 依當下階段還原或回報。
-- 測試：`bats tests/reauth-lib.bats tests/reauth-cli.bats tests/reauth-flow.bats`（flow 需本機 tmux，沒有會 skip —— skip 不等於通過）。
+- poller 重啟（含 discord gateway 自救退出）會以 SIGTERM 中斷流程；driver 依當下階段還原或回報。中斷若發生在 .env 已寫入之後（RESTARTING / VERIFYING），不會寫產生日記錄；確認 agent 正常後請手動 `reauth.sh mark-issued <產生日>`，否則到期提醒會沿用舊的產生日。
+- 測試：`bats tests/reauth-lib.bats tests/reauth-cli.bats tests/reauth-flow.bats`（flow 需本機 tmux，沒有會 skip —— skip 不等於通過）。執行器依賴 `timeout`（GNU coreutils）：Linux 內建；macOS 需 `brew install coreutils`，否則 `check` 會回 `missing: timeout`。
 
 ### CLI
 
@@ -199,7 +199,7 @@ reauth.sh _exec_setup_token <config dir>   # 內部，tmux 內執行
 
 沉默的那幾個值代表「還不知道對方是不是管理員」，回話等於告訴陌生人這個指令存在。
 
-判定順序（start / code 相同前段）：參數（2） -> 載入 admin 判定（4） -> `im_is_admin`（10） -> chat-type=dm（11） -> 設定完整（3） -> start：取鎖（12）；code：有進行中流程且 platform+sender 相符（否則 13） -> phase=WAIT_CODE（否則 12） -> 未過 deadline（否則 13） -> 格式（14） -> 寫入 code 檔（0）。
+判定順序（start / code 相同前段）：參數（2） -> 載入 admin 判定（4） -> `im_is_admin`（10） -> chat-type=dm（11） -> 設定完整（3） -> start：取鎖（12）；code：有進行中流程且 platform+sender 相符（否則 13） -> phase=WAIT_CODE（否則 12） -> 未過 deadline（否則 13） -> 格式（14；多行訊息整則視為格式錯） -> 寫入 code 檔（0）。
 
 ### 環境變數
 
@@ -217,7 +217,8 @@ reauth.sh _exec_setup_token <config dir>   # 內部，tmux 內執行
 | `REAUTH_EXCHANGE_WAIT_SECONDS` | 否 | 預設 60 | |
 | `REAUTH_PROBE_TIMEOUT_SECONDS` | 否 | 預設 90 | |
 | `REAUTH_RESTART_TIMEOUT_SECONDS` | 否 | 預設 480 | 高於 unit `TimeoutStartSec=420` |
-| `REAUTH_FLOW_MAX_SECONDS` | 否 | 預設 1500 | stale 判定上限 |
+| `REAUTH_FLOW_MAX_SECONDS` | 否 | 預設 1800 | stale 判定上限；須大於最慢失敗路徑（約 1600 秒，含通知上限） |
+| `REAUTH_NOTIFY_TIMEOUT_SECONDS` | 否 | 預設 45 | 單則 IM 通知上限（`timeout` 包住 im-send）；須大於 im-send 的 curl 上限（30 秒）；測試調小 |
 | `REAUTH_POLL_INTERVAL_SECONDS` | 否 | 預設 1 | 測試調小 |
 | `IM_SEND_BIN` | 否 | （不設） | 預設同目錄 `im-send.sh`；測試替換為錄製 stub |
 | `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` | 由 poller 行程環境繼承 | — | im-send 送訊用 |
@@ -257,7 +258,7 @@ poller unit **不得**加 `NoNewPrivileges=yes`（driver 需要 `sudo -n systemc
 ## 測試
 
 ```bash
-bash scripts/im-send.test.sh    # im-send dry-run 單元測試（不打網路）
+bash scripts/im-send.test.sh    # im-send dry-run 單元測試（不打網路；curl 以 stub 驗逾時參數）
 bash tests/skills.test.sh       # skill 內容靜態衛生測試
 bash tests/lib-loader.test.sh   # loader 契約
 bash tests/parity.test.sh       # shell 與 TS 的契約 parity（需 sibling plugin 在場）
