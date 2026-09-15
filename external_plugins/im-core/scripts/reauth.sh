@@ -254,7 +254,7 @@ _reauth_cmd_start() {
   _reauth_lock_acquire || rc=$?
   [ "$rc" -eq 0 ] || { [ "$rc" -eq 1 ] && return "$REAUTH_EXIT_BUSY"; return "$REAUTH_EXIT_NOT_CONFIGURED"; }
   started="$(_reauth_state_get started_at)"
-  _reauth_state_set phase STARTING
+  _reauth_state_set phase "$REAUTH_PHASE_STARTING"
   _reauth_state_set platform "$REQ_PLATFORM"
   _reauth_state_set sender "$REQ_SENDER"
   _reauth_state_set chat "$REQ_CHAT"
@@ -279,7 +279,7 @@ _reauth_cmd_code() {
   _reauth_flow_is_live || return "$REAUTH_EXIT_NO_PENDING"
   [ "$(_reauth_state_get platform)" = "$REQ_PLATFORM" ] && [ "$(_reauth_state_get sender)" = "$REQ_SENDER" ] \
     || return "$REAUTH_EXIT_NO_PENDING"
-  [ "$(_reauth_state_get phase)" = "WAIT_CODE" ] || return "$REAUTH_EXIT_BUSY"
+  [ "$(_reauth_state_get phase)" = "$REAUTH_PHASE_WAIT_CODE" ] || return "$REAUTH_EXIT_BUSY"
   deadline="$(_reauth_state_get deadline)" || deadline=""
   [[ "$deadline" =~ $REAUTH_SECONDS_RE ]] && (( $(date +%s) < deadline )) || return "$REAUTH_EXIT_NO_PENDING"
   [ "$multiline" -eq 0 ] && reauth_code_is_valid "$code" || return "$REAUTH_EXIT_INVALID_CODE"
@@ -295,7 +295,7 @@ _reauth_cmd_code() {
 _reauth_cmd_status() {
   [ -n "${REAUTH_STATE_DIR:-}" ] || { echo idle; return 0; }
   if _reauth_flow_is_live; then
-    printf 'phase=%s\n' "$(_reauth_state_get phase || printf 'STARTING')"
+    printf 'phase=%s\n' "$(_reauth_state_get phase || printf '%s' "$REAUTH_PHASE_STARTING")"
   else
     echo idle
   fi
@@ -315,6 +315,15 @@ REAUTH_TMUX_PLACEHOLDER="sleep 86400"
 # 目前流程的 in-memory 狀態（只在 driver 行程內）
 REAUTH_PHASE="" REAUTH_BACKUP="" REAUTH_TOKEN="" REAUTH_CODE="" REAUTH_URL=""
 REAUTH_ENV_WRITTEN=0
+# 階段名（也是 state 檔 phase= 與 status 輸出的值）
+REAUTH_PHASE_STARTING=STARTING
+REAUTH_PHASE_WAIT_CODE=WAIT_CODE
+REAUTH_PHASE_EXCHANGING=EXCHANGING
+REAUTH_PHASE_PROBING=PROBING
+REAUTH_PHASE_APPLYING=APPLYING
+REAUTH_PHASE_RESTARTING=RESTARTING
+REAUTH_PHASE_VERIFYING=VERIFYING
+REAUTH_PHASE_DONE=DONE
 REAUTH_APPLY_UNCHANGED=1
 REAUTH_APPLY_MISMATCH=2
 REAUTH_WAIT_CODE_TTY_GONE=2
@@ -445,7 +454,7 @@ _reauth_cleanup() {
 _reauth_on_signal() {
   trap - TERM INT
   _reauth_log interrupted "phase=${REAUTH_PHASE:-none}"
-  if [ "$REAUTH_ENV_WRITTEN" = "1" ] && [ "$REAUTH_PHASE" = "APPLYING" ]; then
+  if [ "$REAUTH_ENV_WRITTEN" = "1" ] && [ "$REAUTH_PHASE" = "$REAUTH_PHASE_APPLYING" ]; then
     if _reauth_restore_backup; then
       _reauth_notify "重新驗證流程被中斷（服務停止），已還原 .env 備份（$(_reauth_backup_name)）。"
     else
@@ -455,7 +464,7 @@ _reauth_on_signal() {
   elif [ "$REAUTH_ENV_WRITTEN" = "1" ]; then
     _reauth_notify "重新驗證流程被中斷（${REAUTH_PHASE} 階段）。.env 已寫入事前驗證有效的新 token，請確認 agent 狀態。"
   else
-    _reauth_notify "重新驗證流程被中斷（${REAUTH_PHASE:-STARTING} 階段）。.env 未變更。"
+    _reauth_notify "重新驗證流程被中斷（${REAUTH_PHASE:-$REAUTH_PHASE_STARTING} 階段）。.env 未變更。"
   fi
   exit 1
 }
@@ -549,11 +558,11 @@ _reauth_driver() {
   platform="$(_reauth_state_get platform)"
   stale_phase="$(_reauth_state_get stale_phase || true)"
   case "$stale_phase" in
-    APPLYING|RESTARTING|VERIFYING)
+    "$REAUTH_PHASE_APPLYING"|"$REAUTH_PHASE_RESTARTING"|"$REAUTH_PHASE_VERIFYING")
       _reauth_notify "上次重新驗證流程於 ${stale_phase} 階段異常中斷，請確認 .env 狀態（備份：$(_reauth_state_get stale_backup || printf '無')）。" ;;
   esac
 
-  _reauth_set_phase STARTING
+  _reauth_set_phase "$REAUTH_PHASE_STARTING"
   cfg="$(umask 077; mktemp -d "$REAUTH_STATE_DIR/cfg.XXXXXX")" || exit 1
   if ! _reauth_start_tty "$cfg" || ! _reauth_wait_url; then
     _reauth_notify "重新驗證失敗：setup-token 未輸出授權連結，流程已結束，.env 未變更。"
@@ -565,7 +574,7 @@ _reauth_driver() {
   [ "$platform" = "discord" ] && url_text="<$REAUTH_URL>"
   _reauth_notify "請在 ${ttl_minutes} 分鐘內開啟以下連結完成授權，再回覆 /authcode <驗證碼>："$'\n'"$url_text"
   REAUTH_URL="" url_text=""
-  _reauth_set_phase WAIT_CODE
+  _reauth_set_phase "$REAUTH_PHASE_WAIT_CODE"
 
   _reauth_wait_code || wait_rc=$?
   if [ "$wait_rc" -eq "$REAUTH_WAIT_CODE_TTY_GONE" ]; then
@@ -577,7 +586,7 @@ _reauth_driver() {
     exit 0
   fi
 
-  _reauth_set_phase EXCHANGING
+  _reauth_set_phase "$REAUTH_PHASE_EXCHANGING"
   # -l：驗證碼當純文字打字，不讓 tmux 把 "Enter" / "C-c" 解讀成按鍵；--：以 - 開頭也不是選項
   _reauth_tmux send-keys -t "$REAUTH_TMUX_SESSION" -l -- "$REAUTH_CODE"
   _reauth_tmux send-keys -t "$REAUTH_TMUX_SESSION" Enter
@@ -589,13 +598,13 @@ _reauth_driver() {
   _reauth_destroy_tty
   rm -rf "$cfg"
 
-  _reauth_set_phase PROBING
+  _reauth_set_phase "$REAUTH_PHASE_PROBING"
   if ! _reauth_probe_token; then
     _reauth_notify "重新驗證失敗：新 token 驗證未通過，.env 未變更。"
     exit 0
   fi
 
-  _reauth_set_phase APPLYING
+  _reauth_set_phase "$REAUTH_PHASE_APPLYING"
   _reauth_apply_token || apply_rc=$?
   if [ "$apply_rc" -eq "$REAUTH_APPLY_UNCHANGED" ]; then
     _reauth_notify "重新驗證失敗：無法寫入 .env（備份、暫存檔或替換失敗），.env 未變更，agent 未重啟。"
@@ -613,10 +622,10 @@ _reauth_driver() {
   REAUTH_TOKEN=""
   _reauth_notify "新 token 已驗證可用，正在寫入 .env 並重啟 agent（最長約 8 分鐘）。"
 
-  _reauth_set_phase RESTARTING
+  _reauth_set_phase "$REAUTH_PHASE_RESTARTING"
   _reauth_restart_agent || restart_rc=$?
 
-  _reauth_set_phase VERIFYING
+  _reauth_set_phase "$REAUTH_PHASE_VERIFYING"
   if ! _reauth_probe_injection; then
     _reauth_report_injection_failure
     exit 0
@@ -629,7 +638,7 @@ _reauth_driver() {
     exit 0
   fi
   expires="$(_reauth_add_days "$issued" "$REAUTH_TOKEN_VALID_DAYS")"
-  _reauth_set_phase DONE
+  _reauth_set_phase "$REAUTH_PHASE_DONE"
   _reauth_notify "重新驗證完成：新 token 已生效（產生日 ${issued}，約 ${expires} 到期），agent 已重啟。"
   exit 0
 }
