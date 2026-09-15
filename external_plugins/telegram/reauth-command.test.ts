@@ -7,6 +7,7 @@ import {
   parseReauthCommand,
   replyForExit,
   runReauthBin,
+  shouldDropEditedReauth,
   REAUTH_BIN_TIMEOUT_MS,
   REAUTH_EXIT_BUSY,
   REAUTH_EXIT_INVALID_CODE,
@@ -229,4 +230,15 @@ describe('runReauthBin', () => {
     },
     REAUTH_BIN_TIMEOUT_MS + 10_000,
   )
+})
+
+describe('shouldDropEditedReauth', () => {
+  test('an edit that reads as a reauth command is dropped only while interception is on', () => {
+    expect(shouldDropEditedReauth('/authcode abc#def', '/x/reauth.sh')).toBe(true)
+    expect(shouldDropEditedReauth('/reauth', '/x/reauth.sh')).toBe(true)
+    expect(shouldDropEditedReauth('/authcode abc#def', undefined)).toBe(false)
+    expect(shouldDropEditedReauth('hello', '/x/reauth.sh')).toBe(false)
+    expect(shouldDropEditedReauth(undefined, '/x/reauth.sh')).toBe(false)
+    expect(shouldDropEditedReauth('/reauth@other_bot', '/x/reauth.sh', 'jr_bot')).toBe(false)
+  })
 })

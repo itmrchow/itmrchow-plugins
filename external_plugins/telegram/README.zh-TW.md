@@ -97,6 +97,8 @@ poller 設了 `REAUTH_BIN`（指向 im-core 的 `scripts/reauth.sh`）時，會�
 - `/authcode <驗證碼>` —— 授權完成後，把頁面顯示的驗證碼貼回來（須在連結訊息寫明的時限內）。
   Telegram 會在讀取後刪除你這則訊息。
 
+編輯後內容變成 /reauth、/authcode 的訊息會直接丟棄（不執行、不回話、不送進 agent）。要重送請傳新訊息。
+
 非管理員不會收到任何回覆；管理員在群組送出會被告知改用私訊。管理員名單、計時與所有對主機的
 寫入都在 im-core 執行器內，見 im-core 的 README。未設 `REAUTH_BIN` 時，兩個指令照一般文字分派。
 

@@ -33,7 +33,7 @@ import {
   type RouteContext,
   type SpawnOutcome,
 } from './route-update'
-import { interceptReauth, runReauthBin } from './reauth-command'
+import { interceptReauth, runReauthBin, shouldDropEditedReauth } from './reauth-command'
 import type { Update } from 'grammy/types'
 import { setDefaultResultOrder } from 'node:dns'
 import { setDefaultAutoSelectFamily } from 'node:net'
@@ -211,6 +211,11 @@ async function main(): Promise<void> {
   // Reauth commands are handled here, before routing, because this process is the
   // only getUpdates consumer and it outlives the agent it re-authenticates.
   const interceptTelegramReauth = (update: Update): Promise<boolean> => {
+    const edited = update.edited_message
+    if (edited && shouldDropEditedReauth(edited.text, REAUTH_BIN, me.username)) {
+      process.stderr.write(`telegram poller: reauth_edit_dropped update_id=${update.update_id}\n`)
+      return Promise.resolve(true)
+    }
     const message = update.message
     if (!message?.text || !message.from) return Promise.resolve(false)
     return interceptReauth(

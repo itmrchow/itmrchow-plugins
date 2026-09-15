@@ -98,6 +98,9 @@ intercepts two commands before routing, so they never reach the agent:
 - `/authcode <code>` — paste the code shown after authorizing (within the time
   stated in the link message). Telegram deletes your message after reading it.
 
+An edited message that reads as /reauth or /authcode is dropped (not run, no
+reply, not routed to the agent). Send a new message instead.
+
 Non-admins get no reply. Admins in a group are told to use a private chat. The
 admin list, timers and every write to the host live in the im-core executor;
 see im-core's README. Without `REAUTH_BIN` both commands route like any text.

@@ -168,3 +168,18 @@ export function runReauthBin(bin: string, args: readonly string[], stdin?: strin
     if (stdin !== undefined) child.stdin?.end(stdin)
   })
 }
+
+/**
+ * Whether an edited message must be dropped instead of routed: the edit reads as a
+ * reauth command. Edits are never executed, and routing one would hand whatever the
+ * admin pasted to the agent's transcript.
+ *
+ * @param text - Edited message text, when any.
+ * @param bin - REAUTH_BIN; undefined keeps today's routing.
+ * @param botUsername - This bot's username, to leave `/cmd@otherbot` alone.
+ * @returns true when the caller must drop the update.
+ */
+export function shouldDropEditedReauth(text: string | undefined, bin: string | undefined, botUsername?: string): boolean {
+  if (!bin || text === undefined) return false
+  return parseReauthCommand(text, botUsername) !== null
+}
