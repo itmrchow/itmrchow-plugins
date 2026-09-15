@@ -83,9 +83,12 @@ _reauth_state_set() {
   mv -f "$tmp" "$file"
 }
 
-# _reauth_lock_is_fresh: 鎖目錄建立不到一分鐘（state 檔都還沒寫出來的那一瞬間用）。
+# _reauth_lock_is_fresh: 鎖目錄建立未超過寬限秒數（state 檔都還沒寫出來的那一瞬間用）。
+# date -r <file> 在 GNU 與 BSD 都是印檔案 mtime。
 _reauth_lock_is_fresh() {
-  [ -n "$(find "$(_reauth_lock_dir)" -maxdepth 0 -mmin -1 2>/dev/null)" ]
+  local created
+  created="$(date -r "$(_reauth_lock_dir)" +%s 2>/dev/null)" || return 1
+  (( $(date +%s) - created <= REAUTH_LOCK_GRACE_SECONDS ))
 }
 
 # _reauth_flow_is_live: 鎖內 pid 活著且未超過流程上限。Returns: 0 / 1。

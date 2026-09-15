@@ -180,3 +180,8 @@ code()  { printf '%s\n' "$2" | "$BIN" code --platform discord --sender "$1" --ch
   run "$BIN" _driver; [ "$status" -ne 0 ]
   [ ! -d "$REAUTH_STATE_DIR/flow.lock" ]
 }
+@test "a lock dir with no state older than the grace period is reclaimed" {
+  mkdir -p "$REAUTH_STATE_DIR/flow.lock"
+  touch -t 202001010000 "$REAUTH_STATE_DIR/flow.lock"
+  run start 777; [ "$status" -eq 0 ]
+}
