@@ -26,8 +26,13 @@ REAUTH_URL_WAIT_SECONDS="${REAUTH_URL_WAIT_SECONDS:-45}"
 REAUTH_EXCHANGE_WAIT_SECONDS="${REAUTH_EXCHANGE_WAIT_SECONDS:-60}"
 REAUTH_PROBE_TIMEOUT_SECONDS="${REAUTH_PROBE_TIMEOUT_SECONDS:-90}"
 REAUTH_RESTART_TIMEOUT_SECONDS="${REAUTH_RESTART_TIMEOUT_SECONDS:-480}"
-REAUTH_FLOW_MAX_SECONDS="${REAUTH_FLOW_MAX_SECONDS:-1500}"
+# 最慢的失敗路徑（等碼 300 + 換 token 60 + probe 90 + 重啟 480 + probe 90 + 再重啟 480）加上
+# 每則通知的上限，約 1600 秒；上限要比它長，否則會把還在收尾的 driver 當 stale 殺掉。
+REAUTH_FLOW_MAX_SECONDS="${REAUTH_FLOW_MAX_SECONDS:-1800}"
 REAUTH_POLL_INTERVAL_SECONDS="${REAUTH_POLL_INTERVAL_SECONDS:-1}"
+# 單則通知上限。im-send 的 curl 自己有上限，這層再兜住 curl 以外的步驟：通知卡住時 driver 會
+# 一直持有全機鎖，而且可能停在「.env 已寫入、agent 未重啟」。
+REAUTH_NOTIFY_TIMEOUT_SECONDS="${REAUTH_NOTIFY_TIMEOUT_SECONDS:-45}"
 REAUTH_TMUX_SOCKET="${REAUTH_TMUX_SOCKET:-claude-reauth}"
 REAUTH_TMUX_SESSION="${REAUTH_TMUX_SESSION:-claude-reauth}"
 REAUTH_TMUX_WIDTH=500
@@ -226,12 +231,12 @@ _reauth_check_config() {
     if [[ "${!item}" =~ $REAUTH_NAME_RE ]]; then _reauth_report ok "$item value"; else _reauth_report missing "$item matching $REAUTH_NAME_RE"; fi
   done
   for item in REAUTH_CODE_TTL_SECONDS REAUTH_URL_WAIT_SECONDS REAUTH_EXCHANGE_WAIT_SECONDS REAUTH_PROBE_TIMEOUT_SECONDS \
-              REAUTH_RESTART_TIMEOUT_SECONDS REAUTH_FLOW_MAX_SECONDS; do
+              REAUTH_RESTART_TIMEOUT_SECONDS REAUTH_FLOW_MAX_SECONDS REAUTH_NOTIFY_TIMEOUT_SECONDS; do
     if [[ "${!item}" =~ $REAUTH_SECONDS_RE ]]; then _reauth_report ok "$item value"; else _reauth_report missing "$item as whole seconds"; fi
   done
   if _reauth_resolve_bin claude "${REAUTH_CLAUDE_BIN:-}" >/dev/null; then _reauth_report ok claude; else _reauth_report missing claude; fi
   if _reauth_resolve_bin direnv "${REAUTH_DIRENV_BIN:-}" >/dev/null; then _reauth_report ok direnv; else _reauth_report missing direnv; fi
-  for item in tmux sudo jq; do
+  for item in tmux sudo jq timeout; do
     if command -v "$item" >/dev/null; then _reauth_report ok "$item"; else _reauth_report missing "$item"; fi
   done
   if [ -x "$IM_SEND_BIN" ]; then _reauth_report ok IM_SEND_BIN; else _reauth_report missing IM_SEND_BIN; fi
@@ -312,7 +317,7 @@ _reauth_set_phase() { REAUTH_PHASE="$1"; _reauth_state_set phase "$1"; _reauth_l
 _reauth_notify() {
   local platform chat
   platform="$(_reauth_state_get platform)"; chat="$(_reauth_state_get chat)"
-  IM_SEND_NO_LINK_PREVIEW=1 "$IM_SEND_BIN" "$platform" "$chat" "$1" >/dev/null 2>&1 \
+  IM_SEND_NO_LINK_PREVIEW=1 timeout "$REAUTH_NOTIFY_TIMEOUT_SECONDS" "$IM_SEND_BIN" "$platform" "$chat" "$1" >/dev/null 2>&1 \
     || _reauth_log notify_failed "platform=$platform"
   return 0
 }
@@ -326,11 +331,6 @@ _reauth_scrub_env() {
     # shellcheck disable=SC2163  # 目標就是變數名本身
     [[ "$name" =~ $REAUTH_ENV_WHITELIST_RE ]] || export -n "$name" 2>/dev/null
   done < <(compgen -e)
-}
-
-# _reauth_timeout <seconds> <cmd...>: 有 timeout 就限時，沒有就直接跑。
-_reauth_timeout() {
-  if command -v timeout >/dev/null; then timeout "$@"; else shift; "$@"; fi
 }
 
 # _reauth_exec_setup_token <config dir>: tmux pane 內執行。清環境後 exec。
@@ -378,7 +378,7 @@ _reauth_probe_token() {
   out="$(
     _reauth_scrub_env
     export CLAUDE_CONFIG_DIR="$dir" CLAUDE_CODE_OAUTH_TOKEN="$REAUTH_TOKEN"
-    cd "$dir" && _reauth_timeout "$REAUTH_PROBE_TIMEOUT_SECONDS" "$claude_bin" -p "$REAUTH_PROBE_PROMPT" --max-turns 1 </dev/null 2>&1
+    cd "$dir" && timeout "$REAUTH_PROBE_TIMEOUT_SECONDS" "$claude_bin" -p "$REAUTH_PROBE_PROMPT" --max-turns 1 </dev/null 2>&1
   )"; rc=$?
   rm -rf "$dir"
   [ "$rc" -eq 0 ] && ! reauth_output_has_auth_failure "$out"
@@ -396,7 +396,7 @@ _reauth_probe_injection() {
     unset REAUTH_TOKEN
     _reauth_scrub_env
     export CLAUDE_CONFIG_DIR="$dir"
-    cd "$dir" && _reauth_timeout "$REAUTH_PROBE_TIMEOUT_SECONDS" "$direnv_bin" exec "$env_dir" "$claude_bin" -p "$REAUTH_PROBE_PROMPT" --max-turns 1 </dev/null 2>&1
+    cd "$dir" && timeout "$REAUTH_PROBE_TIMEOUT_SECONDS" "$direnv_bin" exec "$env_dir" "$claude_bin" -p "$REAUTH_PROBE_PROMPT" --max-turns 1 </dev/null 2>&1
   )"; rc=$?
   rm -rf "$dir"
   [ "$rc" -eq 0 ] && ! reauth_output_has_auth_failure "$out"
@@ -416,7 +416,7 @@ _reauth_restore_backup() {
 }
 
 _reauth_restart_agent() {
-  _reauth_timeout "$REAUTH_RESTART_TIMEOUT_SECONDS" sudo -n systemctl restart "$REAUTH_AGENT_SERVICE" >/dev/null 2>&1
+  timeout "$REAUTH_RESTART_TIMEOUT_SECONDS" sudo -n systemctl restart "$REAUTH_AGENT_SERVICE" >/dev/null 2>&1
 }
 
 _reauth_backup_name() {

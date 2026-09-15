@@ -161,6 +161,8 @@ code()  { printf '%s\n' "$2" | "$BIN" code --platform discord --sender "$1" --ch
   mkdir -p "$TMP/it's"
   REAUTH_STATE_DIR="$TMP/it's/reauth" run "$BIN" check; [ "$status" -eq 3 ]
   REAUTH_CODE_TTL_SECONDS=abc run "$BIN" check; [ "$status" -eq 3 ]
+  REAUTH_NOTIFY_TIMEOUT_SECONDS=abc run "$BIN" check; [ "$status" -eq 3 ]
+  [[ "$output" == *"missing: REAUTH_NOTIFY_TIMEOUT_SECONDS as whole seconds"* ]]
 }
 @test "check: without AGENT_SCOPES_DIR names it" {
   unset AGENT_SCOPES_DIR

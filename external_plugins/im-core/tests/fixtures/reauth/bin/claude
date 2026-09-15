@@ -23,6 +23,7 @@ case "${1:-}" in
     ;;
   -p)
     record_env_names "probe.$$.env-names"
+    [ -f "$HERE/scenario-probe-hang" ] && sleep 30
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ "$CLAUDE_CODE_OAUTH_TOKEN" = "$(cat "$HERE/probe-good-token.txt" 2>/dev/null)" ]; then
       echo OK; exit 0
     fi

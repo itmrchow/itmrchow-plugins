@@ -278,3 +278,32 @@ assert_no_token_leak() {
   run grep -nE '(^|[^_])(env |sudo |_reauth_tmux |tmux |"\$claude_bin"|"\$direnv_bin")[^#]*REAUTH_TOKEN' "$BIN"
   [ "$status" -ne 0 ]
 }
+@test "a probe that never answers is cut off at REAUTH_PROBE_TIMEOUT_SECONDS" {
+  touch "$TMP/bin/scenario-probe-hang"
+  export REAUTH_PROBE_TIMEOUT_SECONDS=1
+  before="$(cksum < "$REAUTH_ENV_FILE")"
+  start_flow; wait_phase WAIT_CODE; send_code 'goodcode#st_-9'
+  SECONDS=0
+  wait_phase PROBING
+  wait_idle
+  [ "$SECONDS" -lt 10 ]
+  sent | tail -1 | grep -q '新 token 驗證未通過'
+  [ "$(cksum < "$REAUTH_ENV_FILE")" = "$before" ]
+  [ ! -e "$TMP/bin/sudo.log" ]
+  assert_no_token_leak
+}
+@test "an IM send that hangs does not stall the flow after .env is written" {
+  export REAUTH_NOTIFY_TIMEOUT_SECONDS=1
+  cat > "$TMP/bin/im-send" <<'SH'
+#!/usr/bin/env bash
+HERE="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\t%s\t%s\t%s\n' "$1" "$2" "${IM_SEND_NO_LINK_PREVIEW:-0}" "${3//$'\n'/\\n}" >> "$HERE/sent.log"
+case "$3" in *正在寫入*) sleep 59 ;; esac
+SH
+  chmod +x "$TMP/bin/im-send"
+  start_flow; wait_phase WAIT_CODE; send_code 'goodcode#st_-9'; wait_idle
+  [ "$(cat "$TMP/bin/sudo.log")" = 'systemctl restart claude-tg-agent' ]
+  sent | tail -1 | grep -q '重新驗證完成'
+  [ "$(sent | head -1 | cut -f3)" = "1" ]   # 包了 timeout 之後預覽旗標仍傳得到 im-send
+  assert_no_token_leak
+}
