@@ -40,6 +40,15 @@ out="$(env -u TELEGRAM_BOT_TOKEN TELEGRAM_STATE_DIR="$tmp" IM_SEND_DRY_RUN=1 "$S
 check "telegram token from .env file" '[[ "$out" == *"api.telegram.org/bottg-env-file-tok/sendMessage"* ]]'
 rm -rf "$tmp"
 
+# --- real send path is time-bounded (curl stubbed, records its argv) ---
+tmp="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nprintf "%%s " "$@" > "%s/curl.args"\n' "$tmp" > "$tmp/curl"; chmod +x "$tmp/curl"
+PATH="$tmp:$PATH" TELEGRAM_BOT_TOKEN=tg-test "$SEND" telegram 1 'u'
+check "telegram curl is time-bounded" '[[ "$(cat "$tmp/curl.args")" == *"--connect-timeout 10 --max-time 30 "* ]]'
+PATH="$tmp:$PATH" DISCORD_BOT_TOKEN=dc-test "$SEND" discord 1 'u'
+check "discord curl is time-bounded" '[[ "$(cat "$tmp/curl.args")" == *"--connect-timeout 10 --max-time 30 "* ]]'
+rm -rf "$tmp"
+
 # --- unknown source errors ---
 if TELEGRAM_BOT_TOKEN=x "$SEND" slack 1 hi 2>/dev/null; then bad "unknown source should error"; else ok "unknown source errors"; fi
 

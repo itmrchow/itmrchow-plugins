@@ -8,6 +8,11 @@
 # not be fetched by a previewer). discord ignores it.
 set -euo pipefail
 
+# Bound every HTTP call: an IM API that accepts the connection but never answers
+# would otherwise stall the caller (a watchdog round, a reauth flow holding its lock).
+IM_SEND_CONNECT_TIMEOUT_SECONDS=10
+IM_SEND_MAX_TIME_SECONDS=30
+
 SOURCE="${1:?usage: im-send <source> <recipient> <text>}"
 RECIPIENT="${2:?usage: im-send <source> <recipient> <text>}"
 TEXT="${3:?usage: im-send <source> <recipient> <text>}"
@@ -45,7 +50,7 @@ case "$SOURCE" in
       jq -nc --arg url "$url" --arg body "$body" '{channel:"telegram", method:"POST", url:$url, auth:"url", body:$body}'
       exit 0
     fi
-    curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null
+    curl -fsS --connect-timeout "$IM_SEND_CONNECT_TIMEOUT_SECONDS" --max-time "$IM_SEND_MAX_TIME_SECONDS" -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null
     ;;
   discord)
     state_dir="${DISCORD_STATE_DIR:-$HOME/.claude/channels/discord}"
@@ -57,7 +62,7 @@ case "$SOURCE" in
       jq -nc --arg url "$url" --arg body "$body" '{channel:"discord", method:"POST", url:$url, auth:"header", body:$body}'
       exit 0
     fi
-    curl -fsS -X POST "$url" -H "Authorization: Bot ${token}" -H 'Content-Type: application/json' -d "$body" >/dev/null
+    curl -fsS --connect-timeout "$IM_SEND_CONNECT_TIMEOUT_SECONDS" --max-time "$IM_SEND_MAX_TIME_SECONDS" -X POST "$url" -H "Authorization: Bot ${token}" -H 'Content-Type: application/json' -d "$body" >/dev/null
     ;;
   *)
     echo "im-send: unknown source '$SOURCE'" >&2
