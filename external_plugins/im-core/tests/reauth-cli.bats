@@ -185,3 +185,14 @@ code()  { printf '%s\n' "$2" | "$BIN" code --platform discord --sender "$1" --ch
   touch -t 202001010000 "$REAUTH_STATE_DIR/flow.lock"
   run start 777; [ "$status" -eq 0 ]
 }
+@test "code: a multi-line message is rejected even when its first line is a valid code" {
+  mkdir -p "$REAUTH_STATE_DIR/flow.lock"
+  sleep 300 & live=$!
+  now="$(date +%s)"
+  printf 'pid=%s\nphase=WAIT_CODE\nplatform=discord\nsender=777\nchat=555\nstarted_at=%s\ndeadline=%s\n' "$live" "$now" $((now + 300)) > "$REAUTH_STATE_DIR/flow.lock/state"
+  run code 777 $'abc#def\nrm -rf ~'; [ "$status" -eq 14 ]
+  run code 777 $'abc#def\n'; [ "$status" -eq 14 ]
+  [ ! -e "$REAUTH_STATE_DIR/flow.lock/code.in" ]
+  run code 777 'abc#def'; kill "$live"
+  [ "$status" -eq 0 ]
+}

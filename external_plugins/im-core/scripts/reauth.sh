@@ -268,10 +268,12 @@ _reauth_cmd_start() {
 
 _reauth_cmd_code() {
   _reauth_parse_request "$@" || return "$REAUTH_EXIT_USAGE"
-  local code="" tmp deadline
+  local code="" rest="" multiline=0 tmp deadline
   _reauth_authorize || return $?
   _reauth_check_config || return "$REAUTH_EXIT_NOT_CONFIGURED"
   IFS= read -r -n "$REAUTH_MAX_CODE_BYTES" code || true
+  # poller 送的是「驗證碼 + 一個換行」；之後還讀得到任何位元組 = 多行訊息，整則當格式錯
+  IFS= read -r -n 1 rest && multiline=1
   code="${code%$'\r'}"
   code="${code#"${code%%[![:space:]]*}"}"; code="${code%"${code##*[![:space:]]}"}"
   _reauth_flow_is_live || return "$REAUTH_EXIT_NO_PENDING"
@@ -280,7 +282,7 @@ _reauth_cmd_code() {
   [ "$(_reauth_state_get phase)" = "WAIT_CODE" ] || return "$REAUTH_EXIT_BUSY"
   deadline="$(_reauth_state_get deadline)" || deadline=""
   [[ "$deadline" =~ $REAUTH_SECONDS_RE ]] && (( $(date +%s) < deadline )) || return "$REAUTH_EXIT_NO_PENDING"
-  reauth_code_is_valid "$code" || return "$REAUTH_EXIT_INVALID_CODE"
+  [ "$multiline" -eq 0 ] && reauth_code_is_valid "$code" || return "$REAUTH_EXIT_INVALID_CODE"
   tmp="$(umask 077; mktemp "$(_reauth_lock_dir)/.code.XXXXXX")" || return "$REAUTH_EXIT_NOT_CONFIGURED"
   if ! { printf '%s' "$code" > "$tmp" && mv -f "$tmp" "$(_reauth_code_file)"; }; then
     rm -f "$tmp"
