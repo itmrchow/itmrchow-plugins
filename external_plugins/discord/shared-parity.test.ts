@@ -10,6 +10,7 @@ const DUPLICATED = [
   'subscribe-client',
   'subscribe-server',
   'resolve-port',
+  'reauth-command',
 ]
 
 // These modules exist as an identical copy in each channel plugin. Not laziness:
