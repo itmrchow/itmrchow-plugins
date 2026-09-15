@@ -331,3 +331,15 @@ SH
   [ ! -e "$REAUTH_STATE_DIR/token-issued.json" ]
   assert_no_token_leak
 }
+@test "SIGTERM while restarting -> keeps the verified token, says .env was written" {
+  touch "$TMP/bin/scenario-restart-slow"
+  start_flow; wait_phase WAIT_CODE; send_code 'goodcode#st_-9'
+  wait_phase RESTARTING
+  pid="$(sed -n 's/^pid=//p' "$REAUTH_STATE_DIR/flow.lock/state")"
+  kill -TERM "$pid"
+  wait_idle
+  grep -qx "CLAUDE_CODE_OAUTH_TOKEN=$NEW" "$REAUTH_ENV_FILE"
+  sent | tail -1 | grep -q '被中斷（RESTARTING 階段）。.env 已寫入事前驗證有效的新 token'
+  [ ! -e "$REAUTH_STATE_DIR/token-issued.json" ]
+  assert_no_token_leak
+}
