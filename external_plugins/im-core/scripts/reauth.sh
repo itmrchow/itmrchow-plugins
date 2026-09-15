@@ -157,6 +157,7 @@ _reauth_lock_acquire() {
   [ -z "$stale_backup" ] || _reauth_state_set stale_backup "$stale_backup"
 }
 
+# shellcheck disable=SC2329  # 由 driver 的 EXIT trap 間接呼叫
 _reauth_lock_release() { rm -rf "$(_reauth_lock_dir)"; }
 
 # _reauth_resolve_bin <name> <override>: 印絕對路徑。systemd 的 PATH 很窄，補常見安裝位置。
@@ -296,9 +297,298 @@ _reauth_cmd_mark_issued() {
   reauth_write_issued "$REAUTH_STATE_DIR" "$1" manual || return "$REAUTH_EXIT_NOT_CONFIGURED"
 }
 
-# Task A5 取代以下兩個 stub
-_reauth_driver() { [ -d "$(_reauth_lock_dir)" ] || return 1; _reauth_lock_release; }
-_reauth_exec_setup_token() { return 1; }
+REAUTH_PROBE_PROMPT="Reply with the single word OK."
+# 在 pane 內等 setup-token 起來的佔位命令；選項設好之後才 respawn 成真正的命令，
+# 否則 setup-token 若瞬間結束，remain-on-exit 還沒生效，連失敗輸出都抓不到。
+REAUTH_TMUX_PLACEHOLDER="sleep 86400"
+
+# 目前流程的 in-memory 狀態（只在 driver 行程內）
+REAUTH_PHASE="" REAUTH_BACKUP="" REAUTH_TOKEN="" REAUTH_CODE="" REAUTH_URL=""
+REAUTH_ENV_WRITTEN=0
+
+_reauth_set_phase() { REAUTH_PHASE="$1"; _reauth_state_set phase "$1"; _reauth_log phase "phase=$1"; }
+
+# _reauth_notify <text>: 發給發起流程的管理員。失敗只記 log。Returns: 0。
+_reauth_notify() {
+  local platform chat
+  platform="$(_reauth_state_get platform)"; chat="$(_reauth_state_get chat)"
+  IM_SEND_NO_LINK_PREVIEW=1 "$IM_SEND_BIN" "$platform" "$chat" "$1" >/dev/null 2>&1 \
+    || _reauth_log notify_failed "platform=$platform"
+  return 0
+}
+
+# _reauth_scrub_env: 白名單以外的變數取消 export（值留在 shell 內，子行程看不到）。
+# 用 export -n 而非 unset：本檔自己的設定值（逾時秒數等）也可能來自環境，unset 會讓後續
+# 引用在 set -u 下直接中止。只在 subshell / 即將 exec 的行程內呼叫。
+_reauth_scrub_env() {
+  local name
+  while IFS= read -r name; do
+    # shellcheck disable=SC2163  # 目標就是變數名本身
+    [[ "$name" =~ $REAUTH_ENV_WHITELIST_RE ]] || export -n "$name" 2>/dev/null
+  done < <(compgen -e)
+}
+
+# _reauth_timeout <seconds> <cmd...>: 有 timeout 就限時，沒有就直接跑。
+_reauth_timeout() {
+  if command -v timeout >/dev/null; then timeout "$@"; else shift; "$@"; fi
+}
+
+# _reauth_exec_setup_token <config dir>: tmux pane 內執行。清環境後 exec。
+_reauth_exec_setup_token() {
+  local cfg="${1:-}" claude_bin
+  [ -d "$cfg" ] || return "$REAUTH_EXIT_USAGE"
+  claude_bin="$(_reauth_resolve_bin claude "${REAUTH_CLAUDE_BIN:-}")" || return "$REAUTH_EXIT_NOT_CONFIGURED"
+  _reauth_scrub_env
+  export CLAUDE_CONFIG_DIR="$cfg" TERM="${TERM:-xterm-256color}"
+  exec "$claude_bin" setup-token
+}
+
+_reauth_capture() { _reauth_tmux capture-pane -p -J -S "-$REAUTH_CAPTURE_LINES" -t "$REAUTH_TMUX_SESSION" 2>/dev/null; }
+
+# _reauth_pane_dead: setup-token 已結束（pane 死了，或整個 session 已不在）。
+_reauth_pane_dead() {
+  local dead
+  dead="$(_reauth_tmux display-message -p -t "$REAUTH_TMUX_SESSION" '#{pane_dead}' 2>/dev/null)" || return 0
+  [ "$dead" = "1" ]
+}
+
+_reauth_destroy_tty() {
+  _reauth_tmux clear-history -t "$REAUTH_TMUX_SESSION" 2>/dev/null || true
+  _reauth_tmux kill-server 2>/dev/null || true
+}
+
+# _reauth_start_tty <config dir>: 在專用 socket 開 500 寬的 pane 跑 setup-token。Returns: 0 / 1。
+_reauth_start_tty() {
+  local cfg="$1"
+  # 持有鎖時這個 socket 上的任何 server 都是前一個流程的殘留 —— 驗證碼絕不能送進去
+  _reauth_tmux kill-server 2>/dev/null || true
+  _reauth_tmux new-session -d -s "$REAUTH_TMUX_SESSION" -x "$REAUTH_TMUX_WIDTH" -y "$REAUTH_TMUX_HEIGHT" "$REAUTH_TMUX_PLACEHOLDER" \
+    \; set-option -g remain-on-exit on \
+    \; set-option -g history-limit "$REAUTH_CAPTURE_LINES" \
+    \; respawn-pane -k -t "$REAUTH_TMUX_SESSION" "exec '$REAUTH_SELF' _exec_setup_token '$cfg'" \
+    >/dev/null 2>&1
+}
+
+# _reauth_probe_token: 以 in-memory token 驗證（寫入 .env 之前）。Returns: 0 通過。
+_reauth_probe_token() {
+  local dir out rc claude_bin
+  claude_bin="$(_reauth_resolve_bin claude "${REAUTH_CLAUDE_BIN:-}")" || return 1
+  dir="$(umask 077; mktemp -d "$REAUTH_STATE_DIR/probe.XXXXXX")" || return 1
+  # shellcheck disable=SC2030  # subshell 內 export，本來就不該外溢
+  out="$(
+    _reauth_scrub_env
+    export CLAUDE_CONFIG_DIR="$dir" CLAUDE_CODE_OAUTH_TOKEN="$REAUTH_TOKEN"
+    cd "$dir" && _reauth_timeout "$REAUTH_PROBE_TIMEOUT_SECONDS" "$claude_bin" -p "$REAUTH_PROBE_PROMPT" --max-turns 1 </dev/null 2>&1
+  )"; rc=$?
+  rm -rf "$dir"
+  [ "$rc" -eq 0 ] && ! reauth_output_has_auth_failure "$out"
+}
+
+# _reauth_probe_injection: 經 direnv 讀 .env 的實際注入路徑驗證（環境不帶 in-memory token）。
+_reauth_probe_injection() {
+  local dir out rc claude_bin direnv_bin env_dir
+  claude_bin="$(_reauth_resolve_bin claude "${REAUTH_CLAUDE_BIN:-}")" || return 1
+  direnv_bin="$(_reauth_resolve_bin direnv "${REAUTH_DIRENV_BIN:-}")" || return 1
+  env_dir="$(dirname "$REAUTH_ENV_FILE")"
+  dir="$(umask 077; mktemp -d "$REAUTH_STATE_DIR/probe.XXXXXX")" || return 1
+  # shellcheck disable=SC2031  # 同上
+  out="$(
+    unset REAUTH_TOKEN
+    _reauth_scrub_env
+    export CLAUDE_CONFIG_DIR="$dir"
+    cd "$dir" && _reauth_timeout "$REAUTH_PROBE_TIMEOUT_SECONDS" "$direnv_bin" exec "$env_dir" "$claude_bin" -p "$REAUTH_PROBE_PROMPT" --max-turns 1 </dev/null 2>&1
+  )"; rc=$?
+  rm -rf "$dir"
+  [ "$rc" -eq 0 ] && ! reauth_output_has_auth_failure "$out"
+}
+
+# _reauth_restore_backup: 以備份原子覆寫 .env。Returns: 0 / 1（沒有備份可還原）。
+_reauth_restore_backup() {
+  local tmp
+  [ -n "$REAUTH_BACKUP" ] && [ -f "$REAUTH_BACKUP" ] || return 1
+  tmp="$(umask 077; mktemp "${REAUTH_ENV_FILE}.reauth.XXXXXX")" || return 1
+  if ! { cp -p "$REAUTH_BACKUP" "$tmp" && mv -f "$tmp" "$REAUTH_ENV_FILE"; }; then
+    rm -f "$tmp"
+    return 1
+  fi
+  REAUTH_ENV_WRITTEN=0
+  _reauth_log env_restored
+}
+
+_reauth_restart_agent() {
+  _reauth_timeout "$REAUTH_RESTART_TIMEOUT_SECONDS" sudo -n systemctl restart "$REAUTH_AGENT_SERVICE" >/dev/null 2>&1
+}
+
+_reauth_backup_name() {
+  if [ -n "$REAUTH_BACKUP" ]; then basename "$REAUTH_BACKUP"; else printf '無'; fi
+}
+
+# _reauth_cleanup: EXIT trap。只釋放自己持有的鎖 —— 被回收過的舊 driver 不得刪掉新流程的鎖。
+# shellcheck disable=SC2329  # trap handler
+_reauth_cleanup() {
+  _reauth_destroy_tty
+  rm -rf "$REAUTH_STATE_DIR"/cfg.* "$REAUTH_STATE_DIR"/probe.*
+  REAUTH_TOKEN="" REAUTH_CODE="" REAUTH_URL=""
+  [ "$(_reauth_state_get pid 2>/dev/null)" = "$$" ] && _reauth_lock_release
+  return 0
+}
+
+# shellcheck disable=SC2329  # trap handler
+_reauth_on_signal() {
+  trap - TERM INT
+  _reauth_log interrupted "phase=${REAUTH_PHASE:-none}"
+  if [ "$REAUTH_ENV_WRITTEN" = "1" ] && [ "$REAUTH_PHASE" = "APPLYING" ]; then
+    _reauth_restore_backup || _reauth_log env_restore_failed
+    _reauth_notify "重新驗證流程被中斷（服務停止），已還原 .env 備份（$(_reauth_backup_name)）。"
+  elif [ "$REAUTH_ENV_WRITTEN" = "1" ]; then
+    _reauth_notify "重新驗證流程被中斷（${REAUTH_PHASE} 階段）。.env 已寫入事前驗證有效的新 token，請確認 agent 狀態。"
+  else
+    _reauth_notify "重新驗證流程被中斷（${REAUTH_PHASE:-STARTING} 階段）。.env 未變更。"
+  fi
+  exit 1
+}
+
+# _reauth_wait_url: Returns 0 並設 REAUTH_URL。
+_reauth_wait_url() {
+  local deadline=$(( $(date +%s) + REAUTH_URL_WAIT_SECONDS ))
+  while (( $(date +%s) < deadline )); do
+    REAUTH_URL="$(reauth_extract_url "$(_reauth_capture)")" && return 0
+    _reauth_pane_dead && return 1
+    sleep "$REAUTH_POLL_INTERVAL_SECONDS"
+  done
+  return 1
+}
+
+# _reauth_wait_code: Returns 0 並設 REAUTH_CODE；到 deadline 或 setup-token 已結束 return 1。
+_reauth_wait_code() {
+  local deadline file
+  deadline="$(_reauth_state_get deadline)"; file="$(_reauth_code_file)"
+  while (( $(date +%s) < deadline )); do
+    if [ -f "$file" ]; then
+      REAUTH_CODE="$(cat "$file")"; rm -f "$file"
+      return 0
+    fi
+    _reauth_pane_dead && return 1
+    sleep "$REAUTH_POLL_INTERVAL_SECONDS"
+  done
+  return 1
+}
+
+# _reauth_wait_token: Returns 0 並設 REAUTH_TOKEN。
+_reauth_wait_token() {
+  local deadline=$(( $(date +%s) + REAUTH_EXCHANGE_WAIT_SECONDS )) pane
+  while (( $(date +%s) < deadline )); do
+    pane="$(_reauth_capture)"
+    REAUTH_TOKEN="$(reauth_extract_token "$pane")" && { pane=""; return 0; }
+    _reauth_pane_dead && return 1
+    sleep "$REAUTH_POLL_INTERVAL_SECONDS"
+  done
+  return 1
+}
+
+# _reauth_apply_token: 備份 -> 同目錄暫存檔 -> 原子替換 -> 讀回比對。Returns: 0 / 1。
+_reauth_apply_token() {
+  local tmp stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  if ! (umask 077; cp "$REAUTH_ENV_FILE" "${REAUTH_ENV_FILE}.bak.${stamp}") 2>/dev/null; then
+    return 1
+  fi
+  REAUTH_BACKUP="${REAUTH_ENV_FILE}.bak.${stamp}"
+  chmod 600 "$REAUTH_BACKUP"
+  _reauth_state_set backup "$(basename "$REAUTH_BACKUP")"
+  tmp="$(umask 077; mktemp "${REAUTH_ENV_FILE}.reauth.XXXXXX" 2>/dev/null)" || return 1
+  reauth_env_render "$REAUTH_ENV_FILE" "$REAUTH_TOKEN" > "$tmp" || { rm -f "$tmp"; return 1; }
+  REAUTH_ENV_WRITTEN=1
+  mv -f "$tmp" "$REAUTH_ENV_FILE" || { rm -f "$tmp"; return 1; }
+  [ "$(reauth_env_value "$REAUTH_ENV_FILE" "$REAUTH_TOKEN_KEY")" = "$REAUTH_TOKEN" ]
+}
+
+# _reauth_add_days <YYYY-MM-DD> <n>: 以 jq 做日期運算（GNU / BSD date 不相容）。
+_reauth_add_days() {
+  jq -rn --arg d "$1" --argjson n "$2" '(($d + "T00:00:00Z") | fromdateiso8601) + $n * 86400 | todate[0:10]'
+}
+
+_reauth_driver() {
+  local cfg ttl_minutes url_text platform stale_phase restart_rc=0 issued expires
+  [ -d "$(_reauth_lock_dir)" ] || return "$REAUTH_EXIT_NO_PENDING"
+  _reauth_state_set pid "$$"
+  trap _reauth_on_signal TERM INT
+  trap _reauth_cleanup EXIT
+  platform="$(_reauth_state_get platform)"
+  stale_phase="$(_reauth_state_get stale_phase || true)"
+  case "$stale_phase" in
+    APPLYING|RESTARTING|VERIFYING)
+      _reauth_notify "上次重新驗證流程於 ${stale_phase} 階段異常中斷，請確認 .env 狀態（備份：$(_reauth_state_get stale_backup || printf '無')）。" ;;
+  esac
+
+  _reauth_set_phase STARTING
+  cfg="$(umask 077; mktemp -d "$REAUTH_STATE_DIR/cfg.XXXXXX")" || exit 1
+  if ! _reauth_start_tty "$cfg" || ! _reauth_wait_url; then
+    _reauth_notify "重新驗證失敗：setup-token 未輸出授權連結，流程已結束，.env 未變更。"
+    exit 0
+  fi
+
+  ttl_minutes=$(( ( $(_reauth_state_get deadline) - $(date +%s) + 59 ) / 60 ))
+  url_text="$REAUTH_URL"
+  [ "$platform" = "discord" ] && url_text="<$REAUTH_URL>"
+  _reauth_notify "請在 ${ttl_minutes} 分鐘內開啟以下連結完成授權，再回覆 /authcode <驗證碼>："$'\n'"$url_text"
+  REAUTH_URL="" url_text=""
+  _reauth_set_phase WAIT_CODE
+
+  if ! _reauth_wait_code; then
+    _reauth_notify "重新驗證已逾時（$(( (REAUTH_CODE_TTL_SECONDS + 59) / 60 )) 分鐘內未收到有效驗證碼），流程已作廢；需要時請重新 /reauth。"
+    exit 0
+  fi
+
+  _reauth_set_phase EXCHANGING
+  # -l：驗證碼當純文字打字，不讓 tmux 把 "Enter" / "C-c" 解讀成按鍵；--：以 - 開頭也不是選項
+  _reauth_tmux send-keys -t "$REAUTH_TMUX_SESSION" -l -- "$REAUTH_CODE"
+  _reauth_tmux send-keys -t "$REAUTH_TMUX_SESSION" Enter
+  REAUTH_CODE=""
+  if ! _reauth_wait_token; then
+    _reauth_notify "重新驗證失敗：驗證碼無效或已過期，未取得新 token，.env 未變更。請重新 /reauth。"
+    exit 0
+  fi
+  _reauth_destroy_tty
+  rm -rf "$cfg"
+
+  _reauth_set_phase PROBING
+  if ! _reauth_probe_token; then
+    _reauth_notify "重新驗證失敗：新 token 驗證未通過，.env 未變更。"
+    exit 0
+  fi
+
+  _reauth_set_phase APPLYING
+  if ! _reauth_apply_token; then
+    _reauth_restore_backup || true
+    _reauth_notify "重新驗證失敗：.env 寫入後讀回不一致，已還原備份（$(_reauth_backup_name)），agent 未重啟。"
+    exit 0
+  fi
+  REAUTH_TOKEN=""
+  _reauth_notify "新 token 已驗證可用，正在寫入 .env 並重啟 agent（最長約 8 分鐘）。"
+
+  _reauth_set_phase RESTARTING
+  _reauth_restart_agent || restart_rc=$?
+
+  _reauth_set_phase VERIFYING
+  if ! _reauth_probe_injection; then
+    _reauth_restore_backup || _reauth_log env_restore_failed
+    _reauth_restart_agent || true
+    _reauth_notify "重新驗證失敗：重啟後以 .env 驗證未通過，已還原備份（$(_reauth_backup_name)）並再次重啟。注意：舊 token 若本已過期，還原後 agent 仍是登出狀態。"
+    exit 0
+  fi
+
+  issued="$(date -u +%Y-%m-%d)"
+  reauth_write_issued "$REAUTH_STATE_DIR" "$issued" reauth || _reauth_log issued_record_failed
+  if [ "$restart_rc" -ne 0 ]; then
+    _reauth_notify "新 token 已寫入且驗證有效，但 agent 重啟失敗（systemctl rc=${restart_rc}），請檢查服務狀態。"
+    exit 0
+  fi
+  expires="$(_reauth_add_days "$issued" "$REAUTH_TOKEN_VALID_DAYS")"
+  _reauth_set_phase DONE
+  _reauth_notify "重新驗證完成：新 token 已生效（產生日 ${issued}，約 ${expires} 到期），agent 已重啟。"
+  exit 0
+}
 
 main() {
   local sub="${1:-}"

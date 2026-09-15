@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# 假 im-send：錄下 平台 / 收件者 / 預覽旗標 / 文字（換行轉 \n）。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\t%s\t%s\t%s\n' "$1" "$2" "${IM_SEND_NO_LINK_PREVIEW:-0}" "${3//$'\n'/\\n}" >> "$HERE/sent.log"

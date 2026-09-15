@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 假 sudo：錄下 argv，回 restart-rc 指定的 exit code。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+[ "${1:-}" = "-n" ] && shift
+printf '%s\n' "$*" >> "$HERE/sudo.log"
+# 模擬「重啟後注入路徑壞掉」：restart 時把 direnv 切成不帶 token
+[ -f "$HERE/scenario-break-injection-on-restart" ] && [ ! -f "$HERE/restarted-once" ] && touch "$HERE/direnv-broken" "$HERE/restarted-once"
+exit "$(cat "$HERE/restart-rc" 2>/dev/null || echo 0)"
