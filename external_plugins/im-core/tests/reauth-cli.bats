@@ -196,3 +196,15 @@ code()  { printf '%s\n' "$2" | "$BIN" code --platform discord --sender "$1" --ch
   run code 777 'abc#def'; kill "$live"
   [ "$status" -eq 0 ]
 }
+@test "code: a malformed code does not reset or extend the deadline" {
+  mkdir -p "$REAUTH_STATE_DIR/flow.lock"
+  sleep 300 & live=$!
+  now="$(date +%s)"
+  printf 'pid=%s\nphase=WAIT_CODE\nplatform=discord\nsender=777\nchat=555\nstarted_at=%s\ndeadline=%s\n' "$live" "$now" $((now + 2)) > "$REAUTH_STATE_DIR/flow.lock/state"
+  before="$(cksum < "$REAUTH_STATE_DIR/flow.lock/state")"
+  run code 777 'abc; rm -rf /'; [ "$status" -eq 14 ]
+  [ "$(cksum < "$REAUTH_STATE_DIR/flow.lock/state")" = "$before" ]
+  sleep 3
+  run code 777 'abc#def'; kill "$live"
+  [ "$status" -eq 13 ]
+}
