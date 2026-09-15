@@ -315,6 +315,9 @@ REAUTH_TMUX_PLACEHOLDER="sleep 86400"
 # 目前流程的 in-memory 狀態（只在 driver 行程內）
 REAUTH_PHASE="" REAUTH_BACKUP="" REAUTH_TOKEN="" REAUTH_CODE="" REAUTH_URL=""
 REAUTH_ENV_WRITTEN=0
+REAUTH_APPLY_UNCHANGED=1
+REAUTH_APPLY_MISMATCH=2
+REAUTH_WAIT_CODE_TTY_GONE=2
 
 _reauth_set_phase() { REAUTH_PHASE="$1"; _reauth_state_set phase "$1"; _reauth_log phase "phase=$1"; }
 
@@ -443,8 +446,12 @@ _reauth_on_signal() {
   trap - TERM INT
   _reauth_log interrupted "phase=${REAUTH_PHASE:-none}"
   if [ "$REAUTH_ENV_WRITTEN" = "1" ] && [ "$REAUTH_PHASE" = "APPLYING" ]; then
-    _reauth_restore_backup || _reauth_log env_restore_failed
-    _reauth_notify "重新驗證流程被中斷（服務停止），已還原 .env 備份（$(_reauth_backup_name)）。"
+    if _reauth_restore_backup; then
+      _reauth_notify "重新驗證流程被中斷（服務停止），已還原 .env 備份（$(_reauth_backup_name)）。"
+    else
+      _reauth_log env_restore_failed
+      _reauth_notify "重新驗證流程被中斷（服務停止），還原 .env 備份（$(_reauth_backup_name)）失敗，.env 內容不確定，請到 VM 檢查。"
+    fi
   elif [ "$REAUTH_ENV_WRITTEN" = "1" ]; then
     _reauth_notify "重新驗證流程被中斷（${REAUTH_PHASE} 階段）。.env 已寫入事前驗證有效的新 token，請確認 agent 狀態。"
   else
@@ -464,7 +471,7 @@ _reauth_wait_url() {
   return 1
 }
 
-# _reauth_wait_code: Returns 0 並設 REAUTH_CODE；到 deadline 或 setup-token 已結束 return 1。
+# _reauth_wait_code: Returns 0 並設 REAUTH_CODE / 1 到 deadline / REAUTH_WAIT_CODE_TTY_GONE setup-token 先結束。
 _reauth_wait_code() {
   local deadline file
   deadline="$(_reauth_state_get deadline)"; file="$(_reauth_code_file)"
@@ -473,7 +480,7 @@ _reauth_wait_code() {
       REAUTH_CODE="$(cat "$file")"; rm -f "$file"
       return 0
     fi
-    _reauth_pane_dead && return 1
+    _reauth_pane_dead && return "$REAUTH_WAIT_CODE_TTY_GONE"
     sleep "$REAUTH_POLL_INTERVAL_SECONDS"
   done
   return 1
@@ -491,21 +498,24 @@ _reauth_wait_token() {
   return 1
 }
 
-# _reauth_apply_token: 備份 -> 同目錄暫存檔 -> 原子替換 -> 讀回比對。Returns: 0 / 1。
+# _reauth_apply_token: 備份 -> 同目錄暫存檔 -> 原子替換 -> 讀回比對。
+# Returns: 0 / REAUTH_APPLY_UNCHANGED（替換前就失敗，.env 未變更）/ REAUTH_APPLY_MISMATCH（已替換、讀回不一致）。
 _reauth_apply_token() {
   local tmp stamp
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   if ! (umask 077; cp "$REAUTH_ENV_FILE" "${REAUTH_ENV_FILE}.bak.${stamp}") 2>/dev/null; then
-    return 1
+    return "$REAUTH_APPLY_UNCHANGED"
   fi
   REAUTH_BACKUP="${REAUTH_ENV_FILE}.bak.${stamp}"
   chmod 600 "$REAUTH_BACKUP"
   _reauth_state_set backup "$(basename "$REAUTH_BACKUP")"
-  tmp="$(umask 077; mktemp "${REAUTH_ENV_FILE}.reauth.XXXXXX" 2>/dev/null)" || return 1
-  reauth_env_render "$REAUTH_ENV_FILE" "$REAUTH_TOKEN" > "$tmp" || { rm -f "$tmp"; return 1; }
+  tmp="$(umask 077; mktemp "${REAUTH_ENV_FILE}.reauth.XXXXXX" 2>/dev/null)" || return "$REAUTH_APPLY_UNCHANGED"
+  reauth_env_render "$REAUTH_ENV_FILE" "$REAUTH_TOKEN" > "$tmp" || { rm -f "$tmp"; return "$REAUTH_APPLY_UNCHANGED"; }
+  # 先標記再 mv：中斷落在兩者之間時，signal handler 寧可多還原一次（備份與原檔相同）
   REAUTH_ENV_WRITTEN=1
-  mv -f "$tmp" "$REAUTH_ENV_FILE" || { rm -f "$tmp"; return 1; }
-  [ "$(reauth_env_value "$REAUTH_ENV_FILE" "$REAUTH_TOKEN_KEY")" = "$REAUTH_TOKEN" ]
+  # rename 失敗 = 原檔沒被替換
+  mv -f "$tmp" "$REAUTH_ENV_FILE" || { rm -f "$tmp"; REAUTH_ENV_WRITTEN=0; return "$REAUTH_APPLY_UNCHANGED"; }
+  [ "$(reauth_env_value "$REAUTH_ENV_FILE" "$REAUTH_TOKEN_KEY")" = "$REAUTH_TOKEN" ] || return "$REAUTH_APPLY_MISMATCH"
 }
 
 # _reauth_add_days <YYYY-MM-DD> <n>: 以 jq 做日期運算（GNU / BSD date 不相容）。
@@ -513,8 +523,25 @@ _reauth_add_days() {
   jq -rn --arg d "$1" --argjson n "$2" '(($d + "T00:00:00Z") | fromdateiso8601) + $n * 86400 | todate[0:10]'
 }
 
+# _reauth_report_injection_failure: VERIFYING 不過 -> 還原備份 -> 再次重啟，依實際結果回報。
+# 還原失敗就不再重啟：.env 仍是新 token，agent 已經用它重啟過一次。Returns: 0。
+_reauth_report_injection_failure() {
+  local again_rc=0
+  if ! _reauth_restore_backup; then
+    _reauth_log env_restore_failed
+    _reauth_notify "重新驗證失敗：重啟後以 .env 驗證未通過，且還原備份（$(_reauth_backup_name)）失敗，.env 仍是新 token，未再次重啟。請到 VM 檢查 .env 與服務狀態。"
+    return 0
+  fi
+  _reauth_restart_agent || again_rc=$?
+  if [ "$again_rc" -ne 0 ]; then
+    _reauth_notify "重新驗證失敗：重啟後以 .env 驗證未通過，已還原備份（$(_reauth_backup_name)），但再次重啟失敗（systemctl rc=${again_rc}），請檢查服務狀態。注意：舊 token 若本已過期，還原後 agent 仍是登出狀態。"
+    return 0
+  fi
+  _reauth_notify "重新驗證失敗：重啟後以 .env 驗證未通過，已還原備份（$(_reauth_backup_name)）並再次重啟。注意：舊 token 若本已過期，還原後 agent 仍是登出狀態。"
+}
+
 _reauth_driver() {
-  local cfg ttl_minutes url_text platform stale_phase restart_rc=0 issued expires
+  local cfg ttl_minutes url_text platform stale_phase restart_rc=0 wait_rc=0 apply_rc=0 issued expires
   [ -d "$(_reauth_lock_dir)" ] || return "$REAUTH_EXIT_NO_PENDING"
   _reauth_state_set pid "$$"
   trap _reauth_on_signal TERM INT
@@ -540,7 +567,12 @@ _reauth_driver() {
   REAUTH_URL="" url_text=""
   _reauth_set_phase WAIT_CODE
 
-  if ! _reauth_wait_code; then
+  _reauth_wait_code || wait_rc=$?
+  if [ "$wait_rc" -eq "$REAUTH_WAIT_CODE_TTY_GONE" ]; then
+    _reauth_notify "重新驗證失敗：setup-token 在收到驗證碼前已結束，流程已作廢，.env 未變更。請重新 /reauth。"
+    exit 0
+  fi
+  if [ "$wait_rc" -ne 0 ]; then
     _reauth_notify "重新驗證已逾時（$(( (REAUTH_CODE_TTL_SECONDS + 59) / 60 )) 分鐘內未收到有效驗證碼），流程已作廢；需要時請重新 /reauth。"
     exit 0
   fi
@@ -564,8 +596,17 @@ _reauth_driver() {
   fi
 
   _reauth_set_phase APPLYING
-  if ! _reauth_apply_token; then
-    _reauth_restore_backup || true
+  _reauth_apply_token || apply_rc=$?
+  if [ "$apply_rc" -eq "$REAUTH_APPLY_UNCHANGED" ]; then
+    _reauth_notify "重新驗證失敗：無法寫入 .env（備份、暫存檔或替換失敗），.env 未變更，agent 未重啟。"
+    exit 0
+  fi
+  if [ "$apply_rc" -ne 0 ] && ! _reauth_restore_backup; then
+    _reauth_log env_restore_failed
+    _reauth_notify "重新驗證失敗：.env 寫入後讀回不一致，且還原備份（$(_reauth_backup_name)）失敗，.env 內容不確定，agent 未重啟。請到 VM 檢查 .env。"
+    exit 0
+  fi
+  if [ "$apply_rc" -ne 0 ]; then
     _reauth_notify "重新驗證失敗：.env 寫入後讀回不一致，已還原備份（$(_reauth_backup_name)），agent 未重啟。"
     exit 0
   fi
@@ -577,9 +618,7 @@ _reauth_driver() {
 
   _reauth_set_phase VERIFYING
   if ! _reauth_probe_injection; then
-    _reauth_restore_backup || _reauth_log env_restore_failed
-    _reauth_restart_agent || true
-    _reauth_notify "重新驗證失敗：重啟後以 .env 驗證未通過，已還原備份（$(_reauth_backup_name)）並再次重啟。注意：舊 token 若本已過期，還原後 agent 仍是登出狀態。"
+    _reauth_report_injection_failure
     exit 0
   fi
 

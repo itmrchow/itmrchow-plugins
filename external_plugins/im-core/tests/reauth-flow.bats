@@ -179,6 +179,8 @@ assert_no_token_leak() {
   before="$(cksum < "$REAUTH_ENV_FILE")"
   start_flow; wait_idle
   [ "$(sent | wc -l)" -eq 2 ]
+  sent | tail -1 | grep -q 'setup-token 在收到驗證碼前已結束'
+  refute grep -q '已逾時' "$TMP/bin/sent.log"
   [ "$(cksum < "$REAUTH_ENV_FILE")" = "$before" ]
   run send_code 'goodcode#st_-9'; [ "$status" -eq 13 ]
   assert_no_token_leak
@@ -220,7 +222,8 @@ assert_no_token_leak() {
   chmod 700 "$TMP/agent"
   [ "$(cksum < "$REAUTH_ENV_FILE")" = "$before" ]
   [ ! -e "$TMP/bin/sudo.log" ]
-  sent | tail -1 | grep -q '重新驗證失敗'
+  sent | tail -1 | grep -q '無法寫入 .env（備份、暫存檔或替換失敗），.env 未變更'
+  refute grep -q '已還原' "$TMP/bin/sent.log"
   [ ! -e "$REAUTH_STATE_DIR/token-issued.json" ]
   assert_no_token_leak
 }
@@ -305,5 +308,26 @@ SH
   [ "$(cat "$TMP/bin/sudo.log")" = 'systemctl restart claude-tg-agent' ]
   sent | tail -1 | grep -q '重新驗證完成'
   [ "$(sent | head -1 | cut -f3)" = "1" ]   # 包了 timeout 之後預覽旗標仍傳得到 im-send
+  assert_no_token_leak
+}
+@test "injection probe fails, restore ok, second restart fails -> says the restart failed" {
+  touch "$TMP/bin/scenario-break-injection-on-restart"
+  printf '1' > "$TMP/bin/restart-rc.2"
+  cp "$REAUTH_ENV_FILE" "$TMP/original.env"
+  start_flow; wait_phase WAIT_CODE; send_code 'goodcode#st_-9'; wait_idle
+  cmp "$REAUTH_ENV_FILE" "$TMP/original.env"
+  sent | tail -1 | grep -q '已還原備份（.env.bak.[0-9TZ]*），但再次重啟失敗（systemctl rc=1）'
+  refute grep -q '並再次重啟。' "$TMP/bin/sent.log"
+  assert_no_token_leak
+}
+@test "injection probe fails and the restore cannot be written -> says so, no second restart" {
+  touch "$TMP/bin/scenario-break-injection-on-restart" "$TMP/bin/scenario-lock-env-dir-on-restart"
+  start_flow; wait_phase WAIT_CODE; send_code 'goodcode#st_-9'; wait_idle
+  chmod 700 "$TMP/agent"
+  grep -qx "CLAUDE_CODE_OAUTH_TOKEN=$NEW" "$REAUTH_ENV_FILE"
+  [ "$(grep -c 'systemctl restart claude-tg-agent' "$TMP/bin/sudo.log")" -eq 1 ]
+  sent | tail -1 | grep -q '且還原備份（.env.bak.[0-9TZ]*）失敗，.env 仍是新 token，未再次重啟'
+  refute grep -q '已還原備份' "$TMP/bin/sent.log"
+  [ ! -e "$REAUTH_STATE_DIR/token-issued.json" ]
   assert_no_token_leak
 }
