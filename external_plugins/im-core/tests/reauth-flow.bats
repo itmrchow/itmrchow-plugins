@@ -91,6 +91,9 @@ assert_no_token_leak() {
   sent | tail -1 | grep -q "產生日 $(date -u +%Y-%m-%d)"
   [ "$(sent | cut -f2 | sort -u)" = "777" ]
   assert_no_token_leak
+  # 驗證碼與授權連結也不進 driver 的 log（journal）
+  refute grep -qF 'goodcode' "$DRIVER_LOG"
+  refute grep -qF 'oauth/authorize' "$DRIVER_LOG"
   [ -s "$TMP/ps.log" ]
   refute grep -qF "$NEW" "$TMP/ps.log"
 }
@@ -127,6 +130,15 @@ assert_no_token_leak() {
   run send_code '-t#-l'; [ "$status" -eq 0 ]
   wait_idle
   [ "$(cat "$TMP/bin/received-code")" = '-t#-l' ]
+  sent | tail -1 | grep -q '重新驗證完成'
+}
+@test "url and token wrapped in terminal colour codes are still extracted cleanly" {
+  touch "$TMP/bin/scenario-ansi"
+  start_flow; wait_phase WAIT_CODE
+  sent | head -1 | grep -qF "$(cat "$TMP/bin/url.txt")"
+  [ "$(sent | head -1 | grep -c $'\e')" -eq 0 ]
+  send_code 'goodcode#st_-9'; wait_idle
+  grep -qx "CLAUDE_CODE_OAUTH_TOKEN=$NEW" "$REAUTH_ENV_FILE"
   sent | tail -1 | grep -q '重新驗證完成'
 }
 @test "timeout: no code within TTL -> flow voided, session gone, env untouched, later code refused" {

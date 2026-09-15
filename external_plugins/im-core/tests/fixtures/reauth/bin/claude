@@ -7,12 +7,15 @@ case "${1:-}" in
   setup-token)
     record_env_names setup-token.env-names
     [ -f "$HERE/scenario-no-url" ] && { sleep 600; exit 1; }
-    printf "Browser didn't open? Use the url below to sign in:\n\n%s\n\nPaste code here if prompted > " "$(cat "$HERE/url.txt")"
+    # scenario-ansi：URL / token 前後夾顏色碼（真 TUI 會這樣輸出）
+    on=""; off=""
+    [ -f "$HERE/scenario-ansi" ] && { on=$'\e[1;36m'; off=$'\e[0m'; }
+    printf "Browser didn't open? Use the url below to sign in:\n\n%s%s%s\n\nPaste code here if prompted > " "$on" "$(cat "$HERE/url.txt")" "$off"
     [ -f "$HERE/scenario-exit-early" ] && { sleep 1; exit 1; }
     IFS= read -r code
     printf '%s' "$code" > "$HERE/received-code"
     if [ "$code" = "$(cat "$HERE/good-code.txt")" ]; then
-      printf '\nLong-lived authentication token created successfully!\n\nYour OAuth token (valid for 1 year):\n\n%s\n\nStore this token securely.\n' "$(cat "$HERE/token.txt")"
+      printf '\nLong-lived authentication token created successfully!\n\nYour OAuth token (valid for 1 year):\n\n%s%s%s\n\nStore this token securely.\n' "$on" "$(cat "$HERE/token.txt")" "$off"
       exit 0
     fi
     printf '\nOAuth error: Invalid code\n'
