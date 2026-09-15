@@ -39,6 +39,7 @@ import {
   type SpawnOutcome,
 } from './route-message'
 import { toInboundMessage, type InboundInteraction } from './inbound-message'
+import { interceptReauth, runReauthBin } from './reauth-command'
 import {
   createGatewayHealth,
   shouldLogGatewayDebug,
@@ -96,6 +97,10 @@ const POLLER_PORT = resolvePort(
 const MAX_SCOPES = resolveCount(process.env.MAX_SCOPES, DEFAULT_MAX_SCOPES, 'MAX_SCOPES')
 
 const SCOPE_SPAWN_BIN = process.env.SCOPE_SPAWN_BIN
+
+// The im-core reauth executor. Unset = /reauth and /authcode are NOT intercepted
+// and route like any other message (hosts that have not opted in keep today's behaviour).
+const REAUTH_BIN = process.env.REAUTH_BIN
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 if (!TOKEN) {
@@ -280,7 +285,32 @@ client.on('messageCreate', msg => {
   )
   health.markActivity()
   if (msg.author.bot) return
-  handle(messageInput(msg))
+  // Reauth commands are handled here, before routing, because this process holds the
+  // gateway and outlives the agent it re-authenticates.
+  void interceptReauth(
+    msg.content,
+    {
+      platform: 'discord',
+      senderId: msg.author.id,
+      chatId: msg.channelId,
+      chatType: msg.channel.type === ChannelType.DM ? 'dm' : 'group',
+    },
+    {
+      bin: REAUTH_BIN,
+      run: runReauthBin,
+      reply: async text => {
+        try {
+          if (msg.channel.isSendable()) await msg.channel.send(text)
+        } catch (err) {
+          process.stderr.write(`discord poller: reauth reply failed: ${err}\n`)
+        }
+      },
+      // A bot cannot delete another user's DM message; the code dies with the flow.
+      log: line => process.stderr.write(`discord poller: ${line}\n`),
+    },
+  ).then(intercepted => {
+    if (!intercepted) handle(messageInput(msg))
+  })
 })
 
 // JP-197 臨時診斷：比 messageCreate 更底層的原始 gateway dispatch，用來區分

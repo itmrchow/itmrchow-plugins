@@ -106,6 +106,20 @@ This fork extends the upstream plugin with operational features for running the 
 - **Read receipt** — inbound messages get an emoji reaction (default 👀) as a "seen" ack. Configure via `ackReaction` in `access.json` (see [ACCESS.md](./ACCESS.md)).
 - **Orphan watchdog** — the server exits when its parent agent process dies (plus SIGHUP handling), so no stale bot process lingers holding the token.
 
+## Re-authenticating Claude Code over IM (`/reauth`)
+
+When the poller has `REAUTH_BIN` set (path to im-core `scripts/reauth.sh`), it
+intercepts two commands before routing, so they never reach the agent:
+
+- `/reauth` — admin, private chat only: starts `claude setup-token` on the host
+  and DMs you the authorization link.
+- `/authcode <code>` — paste the code shown after authorizing (within the time
+  stated in the link message). Discord does not let a bot delete your DM message; the code is useless once the flow ends.
+
+Non-admins get no reply. Admins in a group are told to use a private chat. The
+admin list, timers and every write to the host live in the im-core executor;
+see im-core's README. Without `REAUTH_BIN` both commands route like any text.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |
