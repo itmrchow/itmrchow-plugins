@@ -1,6 +1,6 @@
 # im-core
 
-`claude-tg-agent` 六個 IM 維運指令的共用核心：六個 skill 加一支平台無關的送訊器 `im-send.sh`。
+`claude-tg-agent` 六個 IM 維運指令的共用核心：六個 skill、一支平台無關的送訊器 `im-send.sh`，以及 IM 重新驗證執行器 `reauth.sh`。
 
 **這不是 channel plugin**。它不提供 MCP server、不收發 gateway 事件，所以只進 carrier
 `.claude/settings.json` 的 `enabledPlugins`，**不進** `allowedChannelPlugins`、**不進** `--channels`。
@@ -9,7 +9,7 @@
 
 | 路徑 | 用途 |
 |---|---|
-| `scripts/im-send.sh` | 平台無關送訊器。`im-send <source> <recipient> <text>`，`source` 為 `telegram` / `discord` |
+| `scripts/im-send.sh` | 平台無關送訊器。`im-send <source> <recipient> <text>`，`source` 為 `telegram` / `discord`；`IM_SEND_NO_LINK_PREVIEW=1` 關閉 Telegram 連結預覽（discord 忽略） |
 | `scripts/im-send.test.sh` | `im-send.sh` 的 dry-run 單元測試，不打網路 |
 | `skills/im-common.md` | 六個 skill 共用的前置載入、欄位取法、身分判定、拒絕說法。**判定規則只寫在這一份** |
 | `skills/im-help/` | `/help`，依身分回一般使用者版 / 管理員版清單 |
@@ -23,6 +23,10 @@
 | `scripts/lib/manifest.txt` | 載入清單唯一真相來源（loader 與宿主 preflight 共讀） |
 | `scripts/lib/{scope,im,channels,spawn-contract}.sh` | scope 值域 / 六指令判定 / channel 值域 / spawn exit code 契約 |
 | `tests/parity.test.sh` | shell lib 與 channel plugin（TS）的契約 parity |
+| `scripts/reauth.sh` | IM 重新驗證執行器（`/reauth`、`/authcode`），見下方「重新驗證執行器」 |
+| `scripts/reauth/lib-reauth.sh` | 執行器的純函式：URL / token 擷取、驗證碼值域、`.env` render、產生日記錄 |
+| `scripts/lib/reauth-contract.sh` | 執行器與 poller 之間的 exit code 契約、產生日記錄檔名 |
+| `tests/reauth-{lib,cli,flow}.bats` | 執行器的純函式 / CLI 判定 / driver 整合測試（flow 需 tmux） |
 
 ## 環境變數契約
 
@@ -143,6 +147,113 @@ export IM_CORE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/itmrchow-p
 宿主重啟後即以舊版服務。這是 §4 preflight「不過就不動 pin」的手動版本 —— 兩者都靠同一件事：
 cache 保留多版本。
 
+## 重新驗證執行器（reauth.sh）
+
+讓管理員不進 VM、只在 Telegram / Discord 私訊 bot，就能為 agent 換發一年期
+`CLAUDE_CODE_OAUTH_TOKEN`。channel poller 攔下 `/reauth`、`/authcode` 後 spawn 本執行器，
+依 exit code 回一句話或沉默；**判定、計時、狀態、所有對主機的寫入都只在這裡**。
+
+```
+管理員私訊 -> poller（解析、spawn、依 exit code 回話）
+                 |  argv 只有身分；驗證碼走 stdin
+                 v
+             reauth.sh start / code（授權判定 + 全機單一流程鎖）
+                 |  start 背景起一支 driver
+                 v
+             reauth.sh _driver（tmux 內跑 claude setup-token -> 自己用 im-send 回報
+                                -> 寫入前驗證 -> 備份 + 原子寫 .env -> 重啟 -> 經 direnv 再驗證）
+```
+
+- 執行器由 poller 從 **marketplace clone** 呼叫（與 poller 同一份 checkout），不走 pinned installPath。
+- poller 重啟（含 discord gateway 自救退出）會以 SIGTERM 中斷流程；driver 依當下階段還原或回報。
+- 測試：`bats tests/reauth-lib.bats tests/reauth-cli.bats tests/reauth-flow.bats`（flow 需本機 tmux，沒有會 skip —— skip 不等於通過）。
+
+### CLI
+
+```
+reauth.sh start --platform <telegram|discord> --sender <id> --chat <id> --chat-type <dm|group>
+reauth.sh code  --platform <telegram|discord> --sender <id> --chat <id> --chat-type <dm|group>   # 驗證碼從 stdin 讀一行
+reauth.sh status        # 印 phase=<...> 或 idle；不印 id / URL / code
+reauth.sh check         # 逐項印 ok:/missing: 設定檢查；全過 exit 0，否則 exit 3
+reauth.sh mark-issued <YYYY-MM-DD>   # 手動補記產生日（source=manual）
+reauth.sh _driver       # 內部，勿直接呼叫
+reauth.sh _exec_setup_token <config dir>   # 內部，tmux 內執行
+```
+
+`--sender` / `--chat` 必須符合 `^-?[0-9]{1,32}$`；不符 -> exit 2。
+
+### exit code（`scripts/lib/reauth-contract.sh`，與 poller 的 `reauth-command.ts` 由 `tests/parity.test.sh` 比對）
+
+| 常數 | 值 | 誰會回 | poller 回覆 |
+|---|---|---|---|
+| `REAUTH_EXIT_OK` | 0 | start / code | start:「已開始重新驗證，授權連結稍後私訊給你。」code:「已收到驗證碼，處理中，完成或失敗都會再通知你。」 |
+| `REAUTH_EXIT_USAGE` | 2 | 全部 | 沉默 |
+| `REAUTH_EXIT_NOT_CONFIGURED` | 3 | start / code（已確認是管理員之後） | 「重新驗證功能未完整設定，請到 VM 查看 poller 的 journal。」 |
+| `REAUTH_EXIT_UNAUTHORIZABLE` | 4 | start / code（`AGENT_SCOPES_DIR` 缺 / lib 載不起來） | 沉默 |
+| `REAUTH_EXIT_NOT_ADMIN` | 10 | start / code | 沉默 |
+| `REAUTH_EXIT_NOT_DM` | 11 | start / code（管理員但在群組） | 「這個指令只能在私訊使用」 |
+| `REAUTH_EXIT_BUSY` | 12 | start：已有流程；code：流程非 WAIT_CODE | start:「已有進行中的重新驗證流程，請等它結束後再試。」code:「驗證碼已收過，流程處理中，請等候結果通知。」 |
+| `REAUTH_EXIT_NO_PENDING` | 13 | code | 「目前沒有等待驗證碼的流程（可能已逾時），需要時請重新 /reauth。」 |
+| `REAUTH_EXIT_INVALID_CODE` | 14 | code | 「驗證碼格式不正確，請貼上授權頁顯示的完整驗證碼：/authcode <驗證碼>」 |
+| spawn 失敗 / 逾時 / 其他 | — | — | 沉默 |
+
+沉默的那幾個值代表「還不知道對方是不是管理員」，回話等於告訴陌生人這個指令存在。
+
+判定順序（start / code 相同前段）：參數（2） -> 載入 admin 判定（4） -> `im_is_admin`（10） -> chat-type=dm（11） -> 設定完整（3） -> start：取鎖（12）；code：有進行中流程且 platform+sender 相符（否則 13） -> phase=WAIT_CODE（否則 12） -> 未過 deadline（否則 13） -> 格式（14） -> 寫入 code 檔（0）。
+
+### 環境變數
+
+| 變數 | 必填 | a1-b 值（poller unit 設定） | 說明 |
+|---|---|---|---|
+| `AGENT_SCOPES_DIR` | 是 | `/home/agent/.claude/agent-scopes` | `im_is_admin` 讀 `<platform>-admins.json` |
+| `REAUTH_ENV_FILE` | 是 | `/home/agent/claude-tg-agent/.env` | 必須是一般檔（非 symlink）、可讀寫 |
+| `REAUTH_AGENT_SERVICE` | 是 | `claude-tg-agent` | 必須與 sudoers 字面值一致（不可加 `.service`） |
+| `REAUTH_STATE_DIR` | 是 | `/home/agent/.claude/reauth` | 0700；鎖、狀態、code 檔、隔離 config、`token-issued.json`。路徑不得含 `'` |
+| `REAUTH_CLAUDE_BIN` | 否 | （不設） | 未設時以 `PATH=$HOME/.local/bin:/usr/local/bin:$PATH` 找 `claude` |
+| `REAUTH_DIRENV_BIN` | 否 | （不設） | 未設時同上找 `direnv` |
+| `REAUTH_TMUX_SOCKET` / `REAUTH_TMUX_SESSION` | 否 | 預設 `claude-reauth` / `claude-reauth` | 專用 socket，與 agent 的 tmux server 完全隔離；值域 `[A-Za-z0-9_-]` |
+| `REAUTH_CODE_TTL_SECONDS` | 否 | 預設 300 | 從 `/reauth` 受理時起算 |
+| `REAUTH_URL_WAIT_SECONDS` | 否 | 預設 45 | |
+| `REAUTH_EXCHANGE_WAIT_SECONDS` | 否 | 預設 60 | |
+| `REAUTH_PROBE_TIMEOUT_SECONDS` | 否 | 預設 90 | |
+| `REAUTH_RESTART_TIMEOUT_SECONDS` | 否 | 預設 480 | 高於 unit `TimeoutStartSec=420` |
+| `REAUTH_FLOW_MAX_SECONDS` | 否 | 預設 1500 | stale 判定上限 |
+| `REAUTH_POLL_INTERVAL_SECONDS` | 否 | 預設 1 | 測試調小 |
+| `IM_SEND_BIN` | 否 | （不設） | 預設同目錄 `im-send.sh`；測試替換為錄製 stub |
+| `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` | 由 poller 行程環境繼承 | — | im-send 送訊用 |
+
+poller 端另需：`REAUTH_BIN=<marketplace clone>/external_plugins/im-core/scripts/reauth.sh`。未設 = 完全不攔截。
+poller unit **不得**加 `NoNewPrivileges=yes`（driver 需要 `sudo -n systemctl restart <service>`）。
+
+### state 檔
+
+- 路徑 `$REAUTH_STATE_DIR/flow.lock/state`，格式 `key=value` 一行一個，值域受限（數字 / 固定字串 / 檔名），**不含 token / URL / code**。僅執行器內部讀寫，poller 不讀。
+- 鎖 = `mkdir flow.lock`（原子、跨平台）。pid 已死、超過 `REAUTH_FLOW_MAX_SECONDS`，或（尚無 pid 時）建立超過寬限時間 -> 視為 stale 並回收；回收時若前一個流程停在 `APPLYING|RESTARTING|VERIFYING`，新流程會先私訊提醒確認 `.env`。
+- 驗證碼暫存：`$REAUTH_STATE_DIR/flow.lock/code.in`（0600，`code` 子指令原子寫入、driver 讀後立即刪除）。
+- 隔離 config：`$REAUTH_STATE_DIR/cfg.XXXXXX/`（setup-token 用）、`$REAUTH_STATE_DIR/probe.XXXXXX/`（probe 用），流程結束刪除。
+
+### 產生日記錄（執行器寫、carrier watchdog 讀）
+
+- 路徑：`$REAUTH_STATE_DIR/token-issued.json`（檔名常數 `REAUTH_ISSUED_FILE_NAME`；carrier 端 `TOKEN_ISSUED_FILE_NAME` 必須同值）
+- 內容（單行 JSON，mode 600）：`{"version":1,"issued_on":"2026-09-15","source":"reauth"}`；`source ∈ {reauth, manual}`；`issued_on` 為 UTC 日期；效期以 365 天計。
+- 只在「重啟後經 .env 注入路徑驗證通過」後寫入（或 `mark-issued`）。
+
+### token 不外洩的手段
+
+| 管道 | 手段 |
+|---|---|
+| argv（`ps` 可見） | token 只以 bash 內建（`printf` / `[[ ]]` / 變數賦值）處理；傳給 claude 一律在 subshell 內 `export CLAUDE_CODE_OAUTH_TOKEN` 後執行；禁止 `env VAR=token cmd`、禁止當任何命令參數 |
+| tmux scrollback | 專用 socket `-L claude-reauth`；抓到 token 後立即 `clear-history` + `kill-server` |
+| log | driver 只記 `phase=` / `event=` / `rc=`；capture 內容、URL、驗證碼、token 都不記；`set -x` 禁用 |
+| 檔案 | token 只寫入 `REAUTH_ENV_FILE`（同目錄 mktemp、umask 077、`mv -f` 原子替換）與其 `.bak.<UTC>` 備份（600）；state 目錄不得出現 token |
+| IM | 訊息模板不含 token；整合測試對 im-send 錄製檔斷言 |
+| setup-token / probe 子行程環境 | 白名單 `HOME PATH LANG LC_ALL USER LOGNAME TERM` 以外全部取消 export，只加 `CLAUDE_CONFIG_DIR=<隔離目錄>` |
+| 驗證碼注入 | `tmux send-keys -l -- <code>`：當純文字打字，`Enter` / `C-c` 不會被當按鍵，`-` 開頭不會被當選項 |
+| Claude Code 工具 | 執行器由 poller spawn 在 VM 本機跑，不經 Claude Code |
+| 腳本被 marketplace update 中途改寫 | 主體包在函式內、檔尾 `main "$@"; exit`，bash 已完整 parse 才執行 |
+
+每次換發會留下一份含舊 token 的 `.env.bak.<UTC>`（600），不自動清理；確認新 token 正常後可手動刪除。
+
 ## 測試
 
 ```bash
@@ -150,7 +261,7 @@ bash scripts/im-send.test.sh    # im-send dry-run 單元測試（不打網路）
 bash tests/skills.test.sh       # skill 內容靜態衛生測試
 bash tests/lib-loader.test.sh   # loader 契約
 bash tests/parity.test.sh       # shell 與 TS 的契約 parity（需 sibling plugin 在場）
-bats tests/                     # lib 的行為測試（scope / im / channels）
+bats tests/                     # lib 的行為測試（scope / im / channels）與重新驗證執行器（reauth-*，flow 需 tmux）
 ```
 
 `tests/skills.test.sh` 釘住三件事：
