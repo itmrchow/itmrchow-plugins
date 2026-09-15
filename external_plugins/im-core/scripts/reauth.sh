@@ -132,6 +132,8 @@ _reauth_lock_reclaim() {
     return 1
   fi
   if [ "$(cat "$graveyard/lock/state" 2>/dev/null)" != "$seen" ]; then
+    # 已知限制：若第三支 start 已在原位建了新鎖，mv 會把這個鎖搬進它的子目錄。前提是 stale 鎖 +
+    # 兩支以上「已通過管理員判定」的 start 毫秒級同時到達；不值得為此再加一把會自己 stale 的回收鎖。
     mv "$graveyard/lock" "$lock" 2>/dev/null || true
     rm -rf "$graveyard"
     return 1
