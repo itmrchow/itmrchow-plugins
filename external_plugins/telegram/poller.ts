@@ -33,6 +33,8 @@ import {
   type RouteContext,
   type SpawnOutcome,
 } from './route-update'
+import { interceptReauth, runReauthBin, shouldDropEditedReauth } from './reauth-command'
+import type { Update } from 'grammy/types'
 import { setDefaultResultOrder } from 'node:dns'
 import { setDefaultAutoSelectFamily } from 'node:net'
 
@@ -103,6 +105,10 @@ const CONTROL_COMMANDS_ENABLED = resolveControlCommands(
 )
 
 const SCOPE_SPAWN_BIN = process.env.SCOPE_SPAWN_BIN
+
+// The im-core reauth executor. Unset = /reauth and /authcode are NOT intercepted
+// and route like any other message (hosts that have not opted in keep today's behaviour).
+const REAUTH_BIN = process.env.REAUTH_BIN
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
@@ -202,7 +208,49 @@ async function main(): Promise<void> {
   // Built once, outside the loop: it owns the per-update failure counter, which
   // has to survive across batches for the poison-pill threshold to be reachable
   // at all (a poison update returns in a NEW batch every time).
-  const consume = createUpdateConsumer({ route: update => routeUpdate(update, ctx) })
+  // Reauth commands are handled here, before routing, because this process is the
+  // only getUpdates consumer and it outlives the agent it re-authenticates.
+  const interceptTelegramReauth = (update: Update): Promise<boolean> => {
+    const edited = update.edited_message
+    if (edited && shouldDropEditedReauth(edited.text, REAUTH_BIN, me.username)) {
+      process.stderr.write(`telegram poller: reauth_edit_dropped update_id=${update.update_id}\n`)
+      return Promise.resolve(true)
+    }
+    const message = update.message
+    if (!message?.text || !message.from) return Promise.resolve(false)
+    return interceptReauth(
+      message.text,
+      {
+        platform: 'telegram',
+        senderId: String(message.from.id),
+        chatId: String(message.chat.id),
+        chatType: message.chat.type === 'private' ? 'dm' : 'group',
+        botUsername: me.username,
+      },
+      {
+        bin: REAUTH_BIN,
+        run: runReauthBin,
+        reply: async text => {
+          await bot.api.sendMessage(message.chat.id, text).catch(err => {
+            process.stderr.write(`telegram poller: reauth reply failed update_id=${update.update_id}: ${err}\n`)
+          })
+        },
+        discardCommandMessage: async () => {
+          await bot.api.deleteMessage(message.chat.id, message.message_id).catch(() => {
+            process.stderr.write(`telegram poller: reauth could not delete command message update_id=${update.update_id}\n`)
+          })
+        },
+        log: line => process.stderr.write(`telegram poller: ${line} update_id=${update.update_id}\n`),
+      },
+    )
+  }
+
+  const consume = createUpdateConsumer({
+    route: async update => {
+      if (await interceptTelegramReauth(update)) return
+      await routeUpdate(update, ctx)
+    },
+  })
 
   let offset: number | undefined
   while (!shuttingDown) {

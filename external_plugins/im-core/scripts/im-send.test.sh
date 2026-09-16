@@ -14,6 +14,14 @@ check "telegram url has token path" '[[ "$out" == *"api.telegram.org/bottg-test/
 check "telegram chat_id in body"    'echo "$out" | jq -e ".body|fromjson|.chat_id==\"12345\"" >/dev/null'
 check "telegram text field"         'echo "$out" | jq -e ".body|fromjson|.text==\"hi there\"" >/dev/null'
 
+# --- telegram link preview off ---
+out="$(TELEGRAM_BOT_TOKEN=tg-test IM_SEND_NO_LINK_PREVIEW=1 IM_SEND_DRY_RUN=1 "$SEND" telegram 1 'u')"
+check "telegram preview disabled when asked" 'echo "$out" | jq -e ".body|fromjson|.link_preview_options.is_disabled==true" >/dev/null'
+out="$(TELEGRAM_BOT_TOKEN=tg-test IM_SEND_DRY_RUN=1 "$SEND" telegram 1 'u')"
+check "telegram body unchanged by default" 'echo "$out" | jq -e ".body|fromjson|has(\"link_preview_options\")|not" >/dev/null'
+out="$(DISCORD_BOT_TOKEN=dc-test IM_SEND_NO_LINK_PREVIEW=1 IM_SEND_DRY_RUN=1 "$SEND" discord 1 'u')"
+check "discord ignores the preview flag" 'echo "$out" | jq -e ".body|fromjson|keys==[\"content\"]" >/dev/null'
+
 # --- discord dry-run ---
 out="$(DISCORD_BOT_TOKEN=dc-test IM_SEND_DRY_RUN=1 "$SEND" discord 999 'yo')"
 check "discord url has channel path" '[[ "$out" == *"discord.com/api/v10/channels/999/messages"* ]]'
@@ -30,6 +38,15 @@ rm -rf "$tmp"
 tmp="$(mktemp -d)"; printf 'TELEGRAM_BOT_TOKEN=tg-env-file-tok\n' > "$tmp/.env"
 out="$(env -u TELEGRAM_BOT_TOKEN TELEGRAM_STATE_DIR="$tmp" IM_SEND_DRY_RUN=1 "$SEND" telegram 7 'x')"
 check "telegram token from .env file" '[[ "$out" == *"api.telegram.org/bottg-env-file-tok/sendMessage"* ]]'
+rm -rf "$tmp"
+
+# --- real send path is time-bounded (curl stubbed, records its argv) ---
+tmp="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nprintf "%%s " "$@" > "%s/curl.args"\n' "$tmp" > "$tmp/curl"; chmod +x "$tmp/curl"
+PATH="$tmp:$PATH" TELEGRAM_BOT_TOKEN=tg-test "$SEND" telegram 1 'u'
+check "telegram curl is time-bounded" '[[ "$(cat "$tmp/curl.args")" == *"--connect-timeout 10 --max-time 30 "* ]]'
+PATH="$tmp:$PATH" DISCORD_BOT_TOKEN=dc-test "$SEND" discord 1 'u'
+check "discord curl is time-bounded" '[[ "$(cat "$tmp/curl.args")" == *"--connect-timeout 10 --max-time 30 "* ]]'
 rm -rf "$tmp"
 
 # --- unknown source errors ---

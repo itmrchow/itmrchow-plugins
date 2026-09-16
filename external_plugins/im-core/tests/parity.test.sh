@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # shell lib 與 channel plugin（TS）之間的契約 parity。
 #
-# 三組值必須逐字相同，因為它們描述的是同一件事實：
+# 四組值必須逐字相同，因為它們描述的是同一件事實：
 #   1. SCOPE_ID_RE   —— 兩邊各自鑄造 scope-id，形狀不同 = 同一個人被拆成兩個 scope
 #   2. port 預設     —— 不同 = watchdog 探一個沒人聽的 port -> 判定 agent 死掉 -> 無限重啟
 #   3. spawn exit code —— 不同 = poller 把「機器滿了」讀成「id 不合法」，訊息被丟掉
+#   4. reauth exit code —— 不同 = poller 對陌生人回話，或對管理員沉默
 #
 # 以前這三組跨兩個 repo，只能靠註解互相提醒。lib 搬進本 repo 之後可以直接比。
 # 需要 sibling plugin 在場（repo checkout 有，安裝後的 im-core 沒有），
@@ -93,5 +94,23 @@ for f in "$PLUGINS/telegram/poller.ts" "$PLUGINS/discord/discord-poller.ts"; do
   check_exit SPAWN_EXIT_CAP_REACHED "$f"
   check_exit SPAWN_EXIT_INVALID_SCOPE "$f"
 done
+
+# --- 4. reauth exit code ---
+# poller（TS）把 exit code 翻成「回什麼話 / 沉默」。兩邊值漂移 = 對陌生人回話或對管理員沉默。
+# discord 版與 telegram 版逐位元組相同由 discord/shared-parity.test.ts 守，這裡只比 telegram。
+TS_REAUTH="$PLUGINS/telegram/reauth-command.ts"
+if [ ! -r "$TS_REAUTH" ]; then
+  skip "telegram/reauth-command.ts not present"
+else
+  for name in OK USAGE NOT_CONFIGURED UNAUTHORIZABLE NOT_ADMIN NOT_DM BUSY NO_PENDING INVALID_CODE; do
+    sh_val="$(shell_value "printf '%s' \"\$REAUTH_EXIT_$name\"")"
+    ts_val="$(sed -n "s|^export const REAUTH_EXIT_$name = \([0-9]\{1,\}\)\$|\1|p" "$TS_REAUTH")"
+    if [ -n "$sh_val" ] && [ "$sh_val" = "$ts_val" ]; then
+      ok "REAUTH_EXIT_$name matches ($sh_val)"
+    else
+      bad "REAUTH_EXIT_$name drifted: shell='$sh_val' ts='$ts_val'"
+    fi
+  done
+fi
 
 exit $fail

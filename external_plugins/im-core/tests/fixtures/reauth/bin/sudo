@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# 假 sudo：錄下 argv，回 restart-rc 指定的 exit code。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+[ "${1:-}" = "-n" ] && shift
+printf '%s\n' "$*" >> "$HERE/sudo.log"
+# 模擬「重啟後注入路徑壞掉」：restart 時把 direnv 切成不帶 token
+[ -f "$HERE/scenario-break-injection-on-restart" ] && [ ! -f "$HERE/restarted-once" ] && touch "$HERE/direnv-broken" "$HERE/restarted-once"
+[ -f "$HERE/scenario-restart-slow" ] && sleep 2
+# 模擬「還原寫不回去」：restart 時把 .env 所在目錄設成唯讀（備份在，但暫存檔建不出來）
+[ -f "$HERE/scenario-lock-env-dir-on-restart" ] && chmod 500 "$HERE/../agent"
+# 每次 restart 各自的 rc：restart-rc.<n> 優先於 restart-rc
+n="$(grep -c . "$HERE/sudo.log")"
+[ -f "$HERE/restart-rc.$n" ] && exit "$(cat "$HERE/restart-rc.$n")"
+exit "$(cat "$HERE/restart-rc" 2>/dev/null || echo 0)"

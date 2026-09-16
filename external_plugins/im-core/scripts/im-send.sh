@@ -4,7 +4,14 @@
 # server.ts convention: real env var wins, else read <STATE_DIR>/.env.
 # Set IM_SEND_DRY_RUN=1 to print the resolved request as JSON instead of
 # performing the HTTP call (used by im-send.test.sh).
+# Set IM_SEND_NO_LINK_PREVIEW=1 to disable telegram link previews (links that must
+# not be fetched by a previewer). discord ignores it.
 set -euo pipefail
+
+# Bound every HTTP call: an IM API that accepts the connection but never answers
+# would otherwise stall the caller (a watchdog round, a reauth flow holding its lock).
+IM_SEND_CONNECT_TIMEOUT_SECONDS=10
+IM_SEND_MAX_TIME_SECONDS=30
 
 SOURCE="${1:?usage: im-send <source> <recipient> <text>}"
 RECIPIENT="${2:?usage: im-send <source> <recipient> <text>}"
@@ -34,12 +41,16 @@ case "$SOURCE" in
     token="$(resolve_token TELEGRAM_BOT_TOKEN "$state_dir")"
     [ -n "$token" ] || { echo "im-send: TELEGRAM_BOT_TOKEN not found (env or $state_dir/.env)" >&2; exit 1; }
     url="https://api.telegram.org/bot${token}/sendMessage"
-    body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t}')"
+    if [ "${IM_SEND_NO_LINK_PREVIEW:-}" = "1" ]; then
+      body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t, link_preview_options:{is_disabled:true}}')"
+    else
+      body="$(jq -nc --arg cid "$RECIPIENT" --arg t "$TEXT" '{chat_id:$cid, text:$t}')"
+    fi
     if [ "${IM_SEND_DRY_RUN:-}" = "1" ]; then
       jq -nc --arg url "$url" --arg body "$body" '{channel:"telegram", method:"POST", url:$url, auth:"url", body:$body}'
       exit 0
     fi
-    curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null
+    curl -fsS --connect-timeout "$IM_SEND_CONNECT_TIMEOUT_SECONDS" --max-time "$IM_SEND_MAX_TIME_SECONDS" -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null
     ;;
   discord)
     state_dir="${DISCORD_STATE_DIR:-$HOME/.claude/channels/discord}"
@@ -51,7 +62,7 @@ case "$SOURCE" in
       jq -nc --arg url "$url" --arg body "$body" '{channel:"discord", method:"POST", url:$url, auth:"header", body:$body}'
       exit 0
     fi
-    curl -fsS -X POST "$url" -H "Authorization: Bot ${token}" -H 'Content-Type: application/json' -d "$body" >/dev/null
+    curl -fsS --connect-timeout "$IM_SEND_CONNECT_TIMEOUT_SECONDS" --max-time "$IM_SEND_MAX_TIME_SECONDS" -X POST "$url" -H "Authorization: Bot ${token}" -H 'Content-Type: application/json' -d "$body" >/dev/null
     ;;
   *)
     echo "im-send: unknown source '$SOURCE'" >&2

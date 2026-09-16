@@ -88,6 +88,20 @@ Claude Code 用上一步方式跑起來後，在 Telegram DM 你的 bot — 它�
 - **已讀回應** — inbound 訊息會收到 emoji reaction（預設 👀）作為「已讀」確認。在 `access.json` 用 `ackReaction` 設定（見 [ACCESS.md](./ACCESS.md)）；只接受 Telegram 固定的 emoji 白名單。
 - **孤兒看門狗** — 父 agent 程序死亡時 server 自行退出（並處理 SIGHUP），不會殘留霸佔 token 的殭屍 bot 程序。
 
+## 經 IM 重新驗證 Claude Code（`/reauth`）
+
+poller 設了 `REAUTH_BIN`（指向 im-core 的 `scripts/reauth.sh`）時，會在分派前攔下兩個
+指令，它們不會送進 agent：
+
+- `/reauth` —— 限管理員、限私訊：在主機上啟動 `claude setup-token`，並把授權連結私訊給你。
+- `/authcode <驗證碼>` —— 授權完成後，把頁面顯示的驗證碼貼回來（須在連結訊息寫明的時限內）。
+  Telegram 會在讀取後刪除你這則訊息。
+
+編輯後內容變成 /reauth、/authcode 的訊息會直接丟棄（不執行、不回話、不送進 agent）。要重送請傳新訊息。
+
+非管理員不會收到任何回覆；管理員在群組送出會被告知改用私訊。管理員名單、計時與所有對主機的
+寫入都在 im-core 執行器內，見 im-core 的 README。未設 `REAUTH_BIN` 時，兩個指令照一般文字分派。
+
 ## 提供給 assistant 的工具
 
 | 工具 | 用途 |

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# 假 direnv exec <dir> <cmd...>：從 <dir>/.env 讀 token 並 export（真 direnv 的 dotenv 行為）。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+[ "${1:-}" = "exec" ] || exit 2
+dir="$2"; shift 2
+if [ ! -f "$HERE/direnv-broken" ]; then
+  value="$(grep -E '^CLAUDE_CODE_OAUTH_TOKEN=' "$dir/.env" | tail -1 | cut -d= -f2-)"
+  export CLAUDE_CODE_OAUTH_TOKEN="$value"
+fi
+exec "$@"
