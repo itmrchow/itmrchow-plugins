@@ -118,7 +118,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | 建立時沒帶 `timeout_seconds` 時，等按鈕的時間。 |
 | `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | 建立時沒帶 `comment_timeout_seconds` 時，按「退回」後等意見的時間。 |
 | `TELEGRAM_POLLER_PORT` | `7852` | 既有變數；介面掛在 poller 的埠上。 |
-| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址。正式環境不要設 —— 有設時 poller 會把 bot token 送往該位址，並在啟動時於 stderr 印一行 `WARNING TELEGRAM_API_ROOT is set`。 |
+| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址，用來把 poller 指向本機的假伺服器。**只接受本機位址**（`127.0.0.1`、`localhost`、`[::1]`；`http` 或 `https`；URL 內不得帶帳密），所以 bot token 不可能經這個變數被送到機器以外。被採用時啟動會在 stderr 印 `WARNING TELEGRAM_API_ROOT is set`。其他值（別的主機、無法解析的 URL）一律忽略：poller 印 `TELEGRAM_API_ROOT ignored (<原因>)`（不印出該值本身），照舊連 Telegram 官方伺服器。與 `TELEGRAM_APPROVAL_BUTTONS` 開關無關。 |
 
 兩個逾時都接受小數，須大於 0 且不超過 604800（7 天）；不合法時在 stderr 警告並退回預設值。
 

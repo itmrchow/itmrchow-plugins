@@ -123,7 +123,7 @@ call that sets a decision**, and extra fields in a request body are ignored.
 | `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | How long a request waits for a button when the create call names no `timeout_seconds`. |
 | `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | How long a "reject" waits for a written comment when the create call names no `comment_timeout_seconds`. |
 | `TELEGRAM_POLLER_PORT` | `7852` | Existing variable; the interface lives on the poller's port. |
-| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL. Leave unset in production — when set, the poller sends the bot token there and prints a `WARNING TELEGRAM_API_ROOT is set` line on stderr at startup. |
+| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL, used to point the poller at a local fake. **Only a loopback host is accepted** (`127.0.0.1`, `localhost`, `[::1]`; `http` or `https`; no credentials in the URL), so the bot token cannot leave the machine through it. An accepted value prints `WARNING TELEGRAM_API_ROOT is set` on stderr at startup. Any other value — another host, an unparsable URL — is ignored: the poller prints `TELEGRAM_API_ROOT ignored (<reason>)` (never the value itself) and talks to Telegram's servers as usual. Independent of `TELEGRAM_APPROVAL_BUTTONS`. |
 
 Both timeouts accept fractions and must be above 0 and at most 604800 (7 days);
 an unusable value falls back to the default with a warning on stderr.

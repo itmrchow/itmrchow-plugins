@@ -34,6 +34,7 @@ import {
   type SpawnOutcome,
 } from './route-update'
 import { interceptReauth, runReauthBin, shouldDropEditedReauth } from './reauth-command'
+import { API_ROOT_ENV, resolveApiRoot } from './api-root'
 import { resolveApprovalConfig } from './approval-config'
 import { ApprovalStore } from './approval-store'
 import { createApprovalService, type ApprovalService } from './approval-service'
@@ -122,11 +123,18 @@ const REAUTH_BIN = process.env.REAUTH_BIN
 // is intercepted and no state file is written.
 const APPROVAL_CONFIG = resolveApprovalConfig(process.env)
 
-// Test hook: point the Bot API client at a local fake. Unset = Telegram itself.
-const API_ROOT = process.env.TELEGRAM_API_ROOT?.trim() || undefined
+// Test hook: point the Bot API client at a local fake. Loopback hosts only, so
+// the bot token cannot leave this machine through it; see resolveApiRoot.
+const API_ROOT_RESOLUTION = resolveApiRoot(process.env[API_ROOT_ENV])
+if (API_ROOT_RESOLUTION.kind === 'ignored') {
+  process.stderr.write(
+    `telegram poller: ${API_ROOT_ENV} ignored (${API_ROOT_RESOLUTION.reason}); using Telegram's Bot API servers\n`,
+  )
+}
+const API_ROOT = API_ROOT_RESOLUTION.kind === 'override' ? API_ROOT_RESOLUTION.apiRoot : undefined
 if (API_ROOT) {
-  // Loud on purpose: this sends the bot token to that address, and only this
-  // process is redirected — server.ts keeps talking to Telegram.
+  // Loud on purpose: only this process is redirected — server.ts keeps talking
+  // to Telegram.
   process.stderr.write(
     `telegram poller: WARNING TELEGRAM_API_ROOT is set, Bot API calls go to ${API_ROOT} instead of Telegram (test hook)\n`,
   )
