@@ -11,6 +11,7 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { isValidTimeoutSeconds } from './approval-config'
 import {
+  APPROVAL_ID_PATTERN,
   APPROVAL_ID_RE,
   MAX_APPROVAL_TEXT_LENGTH,
   type ApprovalService,
@@ -29,6 +30,7 @@ const URL_BASE = 'http://127.0.0.1'
 const HTTP_OK = 200
 const HTTP_CREATED = 201
 const HTTP_BAD_REQUEST = 400
+const HTTP_FORBIDDEN = 403
 const HTTP_NOT_FOUND = 404
 const HTTP_METHOD_NOT_ALLOWED = 405
 const HTTP_CONFLICT = 409
@@ -59,6 +61,8 @@ export type ApprovalHttpDefaults = { timeoutSeconds: number; commentTimeoutSecon
 type ParsedCreate = { ok: true; input: CreateApprovalInput } | { ok: false; detail: string }
 
 /**
+ * Reduce a stored request to what a caller may see.
+ *
  * @param request - A stored request.
  * @returns Its public JSON shape.
  */
@@ -96,7 +100,7 @@ export function parseCreateBody(raw: string, defaults: ApprovalHttpDefaults): Pa
   const fields = body as Record<string, unknown>
   const { id, text, kind } = fields
   if (typeof id !== 'string' || !APPROVAL_ID_RE.test(id)) {
-    return { ok: false, detail: 'id must match [A-Za-z0-9_-]{1,40}' }
+    return { ok: false, detail: `id must match ${APPROVAL_ID_PATTERN}` }
   }
   if (typeof text !== 'string' || text.trim() === '') return { ok: false, detail: 'text must be a non-empty string' }
   if (text.length > MAX_APPROVAL_TEXT_LENGTH) {
@@ -192,6 +196,13 @@ export function createApprovalHandler(
   return (req, res) => {
     const { pathname } = new URL(req.url ?? '', URL_BASE)
     if (pathname !== APPROVALS_PATH && !pathname.startsWith(`${APPROVALS_PATH}/`)) return false
+    // Browsers attach Origin to every cross-site POST, including the no-cors
+    // "simple" ones that skip preflight; local callers (curl, scripts) do not.
+    // Refusing it keeps a web page from creating or cancelling requests.
+    if (req.headers.origin !== undefined) {
+      sendJson(res, HTTP_FORBIDDEN, { error: 'forbidden_origin' })
+      return true
+    }
     const segments = pathname.slice(APPROVALS_PATH.length).split('/').filter(segment => segment !== '')
     dispatch(req, res, segments).catch(err => {
       process.stderr.write(`telegram poller: approval request failed: ${err}\n`)

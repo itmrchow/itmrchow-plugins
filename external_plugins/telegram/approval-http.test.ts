@@ -11,8 +11,11 @@ import { createSubscribeServer, type SubscribeHub } from './subscribe-server'
 
 const U1 = 111
 const DEFAULTS = { timeoutSeconds: 60, commentTimeoutSeconds: 5 }
+const EXTERNAL_ADDRESS = Object.values(networkInterfaces())
+  .flat()
+  .find(iface => iface && iface.family === 'IPv4' && !iface.internal)?.address
 
-type Response = { status: number; body: Record<string, unknown> | string }
+type Reply = { status: number; body: Record<string, unknown> | string }
 type Context = { hub: SubscribeHub; port: number; service?: ApprovalService; sent: number[]; failSend: { on: boolean } }
 
 let dir: string
@@ -57,7 +60,7 @@ async function startServer(opts: { enabled: boolean }): Promise<Context> {
   return { hub, port: (hub.server.address() as { port: number }).port, service, sent, failSend }
 }
 
-async function call(port: number, method: string, path: string, body?: unknown, host = '127.0.0.1'): Promise<Response> {
+async function call(port: number, method: string, path: string, body?: unknown, host = '127.0.0.1'): Promise<Reply> {
   const res = await fetch(`http://${host}:${port}${path}`, {
     method,
     headers: body === undefined ? undefined : { 'content-type': 'application/json' },
@@ -229,13 +232,31 @@ test('開關未設（未掛路由）時三個動作都落到既有的 404 not fo
   expect(await call(port, 'POST', '/approvals/R1/cancel')).toEqual({ status: 404, body: 'not found' })
 })
 
-test('只綁 127.0.0.1：從本機其他介面位址連不上', async () => {
+// Skipped, visibly, on a machine with no non-loopback interface to connect from.
+test.skipIf(!EXTERNAL_ADDRESS)('只綁 127.0.0.1：從本機其他介面位址連不上', async () => {
   const { port } = await startServer({ enabled: true })
-  const external = Object.values(networkInterfaces())
-    .flat()
-    .find(iface => iface && iface.family === 'IPv4' && !iface.internal)?.address
-  if (!external) return
-  await expect(call(port, 'GET', '/approvals/R1', undefined, external)).rejects.toThrow()
+  await expect(call(port, 'GET', '/approvals/R1', undefined, EXTERNAL_ADDRESS)).rejects.toThrow()
+})
+
+test('帶 Origin header 的請求（瀏覽器跨站）一律 403，不建立也不取消', async () => {
+  const { port, sent } = await startServer({ enabled: true })
+  await call(port, 'POST', '/approvals', { id: 'R50', text: 't', kind: 'allow_deny' })
+  const fromPage = (method: string, path: string, body?: string): Promise<Response> =>
+    fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: { origin: 'https://evil.example', 'content-type': 'text/plain' },
+      body,
+    })
+
+  const created = await fromPage('POST', '/approvals', JSON.stringify({ id: 'R51', text: 't', kind: 'allow_deny' }))
+  expect(created.status).toBe(403)
+  expect(await created.json()).toEqual({ error: 'forbidden_origin' })
+  expect((await fromPage('POST', '/approvals/R50/cancel')).status).toBe(403)
+  expect((await fromPage('GET', '/approvals/R50')).status).toBe(403)
+
+  expect(sent).toHaveLength(1)
+  expect((await call(port, 'GET', '/approvals/R51')).status).toBe(404)
+  expect(await statusOf(port, 'R50')).toBe('pending')
 })
 
 test('parseCreateBody 只讀取文件化的欄位，未帶逾時用預設值', () => {
