@@ -438,13 +438,14 @@ test('以非文字（貼圖）回覆時提示改用文字、吃掉該則、繼�
   expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '請用文字回覆意見。' })
 })
 
-test('等意見期間被取消 -> cancelled，晚到的意見不改結果也不被吃掉', async () => {
+test('等意見期間被取消 -> cancelled，晚到回覆提示的意見不改結果、不轉給 session', async () => {
   const h = harness()
   const messageId = await createOne(h, 'R25', 'approve_reject')
   await h.service.interceptUpdate(press('appr:reject:R25', U1, messageId))
   await h.service.cancel('R25')
   expect(h.service.get('R25')?.status).toBe('cancelled')
-  expect(await h.service.interceptUpdate(message(U1, '晚到', prompts(h)[0].messageId))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, '晚到', prompts(h)[0].messageId))).toBe(true)
+  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '這筆請求已經結案，這則意見沒有被記錄。' })
   expect(h.service.get('R25')).toMatchObject({ status: 'cancelled', comment: null })
 })
 
@@ -498,6 +499,29 @@ test('超過期限才到的按鈕不會被記為允許', async () => {
   h.advance(TIMEOUT_SECONDS * 1000)
   await h.service.interceptUpdate(press('appr:allow:R34', U1, messageId))
   expect(h.service.get('R34')?.status).toBe('expired')
+})
+
+test('等意見期間以 / 開頭的回覆不當意見、不被吃掉', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'R28', 'approve_reject')
+  await h.service.interceptUpdate(press('appr:reject:R28', U1, messageId))
+  expect(await h.service.interceptUpdate(message(U1, '/restart', prompts(h)[0].messageId))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, '/ctx', messageId))).toBe(false)
+  expect(h.service.get('R28')?.status).toBe('awaiting_comment')
+})
+
+test('意見逾時後回覆提示訊息：吃掉並告知已結案；回覆原請求訊息或非 allowFrom 的人則照常放行', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'R29', 'approve_reject')
+  await h.service.interceptUpdate(press('appr:reject:R29', U1, messageId))
+  const promptId = prompts(h)[0].messageId
+  h.advance(COMMENT_TIMEOUT_SECONDS * 1000)
+
+  expect(await h.service.interceptUpdate(message(U2, '外人', promptId, { chatId: U1 }))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, '回原訊息', messageId))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, '遲到的意見', promptId))).toBe(true)
+  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '這筆請求已經結案，這則意見沒有被記錄。' })
+  expect(h.service.get('R29')).toMatchObject({ status: 'denied', comment: '' })
 })
 
 test('service 對外沒有任何寫入決定的動作', () => {

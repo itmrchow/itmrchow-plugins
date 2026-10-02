@@ -237,6 +237,6 @@ test.each([
 test('store 沒有任何可直接寫入決定的公開方法', () => {
   const methods = Object.getOwnPropertyNames(ApprovalStore.prototype).filter(name => name !== 'constructor').sort()
   expect(methods).toEqual(
-    ['add', 'addPrompt', 'cancel', 'findAwaitingComment', 'get', 'press', 'recordComment', 'size', 'sweep'].sort(),
+    ['add', 'addPrompt', 'cancel', 'findAwaitingComment', 'findClosedByPrompt', 'get', 'press', 'recordComment', 'size', 'sweep'].sort(),
   )
 })

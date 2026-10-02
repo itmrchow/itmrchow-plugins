@@ -14,6 +14,7 @@
 import type { Update } from 'grammy/types'
 import {
   ACTIONS_BY_KIND,
+  ALL_ACTIONS,
   type ApprovalAction,
   type ApprovalKind,
   type ApprovalRequest,
@@ -24,8 +25,9 @@ import {
 /** Prefix of every callback_data this feature owns. `perm:` belongs to server.ts. */
 export const APPROVAL_CALLBACK_PREFIX = 'appr:'
 /** Request ids: short enough that the longest callback_data stays under Telegram's 64 bytes. */
-export const APPROVAL_ID_RE = /^[A-Za-z0-9_-]{1,40}$/
-const CALLBACK_RE = /^appr:(allow|deny|approve|reject):([A-Za-z0-9_-]{1,40})$/
+export const APPROVAL_ID_PATTERN = '[A-Za-z0-9_-]{1,40}'
+export const APPROVAL_ID_RE = new RegExp(`^${APPROVAL_ID_PATTERN}$`)
+const CALLBACK_RE = new RegExp(`^${APPROVAL_CALLBACK_PREFIX}(${ALL_ACTIONS.join('|')}):(${APPROVAL_ID_PATTERN})$`)
 
 /** Telegram caps a message at 4096 UTF-16 code units. */
 const TELEGRAM_MESSAGE_LIMIT = 4096
@@ -64,6 +66,9 @@ const NOT_FOUND_TEXT = '找不到這筆請求（可能已過期）。'
 const ALREADY_SETTLED_TEXT = '這筆請求已經處理過了。'
 const COMMENT_REQUESTED_TEXT = '請回覆意見'
 const TEXT_ONLY_COMMENT_TEXT = '請用文字回覆意見。'
+const COMMENT_TOO_LATE_TEXT = '這筆請求已經結案，這則意見沒有被記錄。'
+/** Bot commands are never comments: a /restart typed into the forced reply box must still reach its handler. */
+const COMMAND_PREFIX = '/'
 
 export type ApprovalButton = { text: string; callbackData: string }
 
@@ -288,12 +293,24 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
   const handleReply = async (message: NonNullable<Update['message']>): Promise<boolean> => {
     const repliedTo = message.reply_to_message
     if (!repliedTo || !message.from || message.from.is_bot) return false
+    if (message.text?.startsWith(COMMAND_PREFIX)) return false
     await sweep()
-    const request = store.findAwaitingComment({ chatId: message.chat.id, messageId: repliedTo.message_id })
-    if (!request) return false
+    const target: SentMessage = { chatId: message.chat.id, messageId: repliedTo.message_id }
+    const request = store.findAwaitingComment(target)
+    const closed = request ? undefined : store.findClosedByPrompt(target)
+    if (!request && !closed) return false
     // Not ours to swallow: an outsider's reply takes today's route, where
     // server.ts's gate applies the access policy as it always has.
     if (!deps.loadAllowFrom().includes(String(message.from.id))) return false
+
+    // Too late: routing it would hand a session the prompt text plus an
+    // orphaned comment, which reads like an instruction. Say so instead.
+    if (!request) {
+      await api.sendText(message.chat.id, COMMENT_TOO_LATE_TEXT).catch(err => {
+        log(`telegram poller: approval ${closed?.id} late-comment notice failed: ${err}`)
+      })
+      return true
+    }
 
     if (message.text === undefined) {
       await api.sendText(message.chat.id, TEXT_ONLY_COMMENT_TEXT).catch(err => {

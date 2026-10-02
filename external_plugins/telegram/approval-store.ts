@@ -72,7 +72,9 @@ const OPEN_STATUSES: ReadonlySet<ApprovalStatus> = new Set(['pending', 'awaiting
 const ALL_STATUSES: ReadonlySet<string> = new Set([
   'pending', 'awaiting_comment', 'approved', 'denied', 'cancelled', 'expired',
 ])
-const ALL_ACTIONS: ReadonlySet<string> = new Set(['allow', 'deny', 'approve', 'reject'])
+/** Every button there is, derived from the kinds so the two cannot drift apart. */
+export const ALL_ACTIONS: readonly ApprovalAction[] = Object.values(ACTIONS_BY_KIND).flat()
+const KNOWN_ACTIONS: ReadonlySet<string> = new Set(ALL_ACTIONS)
 
 const STATE_FILE_VERSION = 1
 const STATE_FILE_MODE = 0o600
@@ -83,6 +85,8 @@ const NO_COMMENT = ''
 type StateFile = { version: number; requests: ApprovalRequest[] }
 
 /**
+ * Tell an open request from a settled one.
+ *
  * @param status - A request status.
  * @returns true while the request can still be decided, commented on or cancelled.
  */
@@ -114,7 +118,7 @@ function isApprovalRequest(value: unknown): value is ApprovalRequest {
     typeof request.kind === 'string' && Object.hasOwn(ACTIONS_BY_KIND, request.kind) &&
     typeof request.text === 'string' &&
     typeof request.status === 'string' && ALL_STATUSES.has(request.status) &&
-    (request.decision === null || (typeof request.decision === 'string' && ALL_ACTIONS.has(request.decision))) &&
+    (request.decision === null || (typeof request.decision === 'string' && KNOWN_ACTIONS.has(request.decision))) &&
     (request.comment === null || typeof request.comment === 'string') &&
     typeof request.createdAtMs === 'number' &&
     typeof request.expiresAtMs === 'number' &&
@@ -141,6 +145,8 @@ export class ApprovalStore {
   readonly #log: (line: string) => void
 
   /**
+   * Open the store, loading whatever the state file holds.
+   *
    * @param opts.filePath - State file. Read once here, rewritten on every change.
    * @param opts.now - Clock in epoch milliseconds; injectable for tests.
    * @param opts.log - Sink for load / save problems.
@@ -153,6 +159,8 @@ export class ApprovalStore {
   }
 
   /**
+   * Look a request up by id.
+   *
    * @param id - Request id.
    * @returns The request, or undefined when unknown.
    */
@@ -160,7 +168,11 @@ export class ApprovalStore {
     return this.#requests.get(id)
   }
 
-  /** @returns Number of requests currently held, settled ones included. */
+  /**
+   * Count the requests held, for the capacity check.
+   *
+   * @returns Number of requests currently held, settled ones included.
+   */
   size(): number {
     return this.#requests.size
   }
@@ -229,6 +241,20 @@ export class ApprovalStore {
     for (const request of this.#requests.values()) {
       if (request.status !== 'awaiting_comment') continue
       if (ownsMessage(request.messages, repliedTo) || ownsMessage(request.prompts, repliedTo)) return request
+    }
+    return undefined
+  }
+
+  /**
+   * Find the request whose comment window has closed but whose comment prompt
+   * is the given message — a reply that arrived too late.
+   *
+   * @param repliedTo - The message a user quote-replied to.
+   * @returns The no-longer-waiting request, or undefined.
+   */
+  findClosedByPrompt(repliedTo: SentMessage): ApprovalRequest | undefined {
+    for (const request of this.#requests.values()) {
+      if (request.status !== 'awaiting_comment' && ownsMessage(request.prompts, repliedTo)) return request
     }
     return undefined
   }
@@ -336,9 +362,15 @@ export class ApprovalStore {
     }
   }
 
-  // Synchronous and atomic (tmp + rename) on purpose: a decision must be on
-  // disk before its Telegram message is rewritten to say so, or a crash in
-  // between would show the user "allowed" for a request that comes back pending.
+  // Synchronous and atomic (tmp + rename), and called before the Telegram
+  // message is rewritten: in the normal case a decision is on disk before the
+  // user is shown it, so a crash in between cannot bring it back as pending.
+  //
+  // A failed write (disk full, permissions) is only logged: the decision stands
+  // in memory and the message is still rewritten. If the poller then restarts,
+  // that request comes back in its last saved state — never as approved, since
+  // nothing but a button press writes that. There is no fsync either, so power
+  // loss can likewise roll a request back to its previous saved state.
   #save(): void {
     const state: StateFile = { version: STATE_FILE_VERSION, requests: [...this.#requests.values()] }
     const tmp = `${this.#filePath}.tmp`
