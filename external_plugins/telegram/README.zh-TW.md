@@ -118,7 +118,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | 建立時沒帶 `timeout_seconds` 時，等按鈕的時間。 |
 | `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | 建立時沒帶 `comment_timeout_seconds` 時，按「退回」後等意見的時間。 |
 | `TELEGRAM_POLLER_PORT` | `7852` | 既有變數；介面掛在 poller 的埠上。 |
-| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址。正式環境不要設。 |
+| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址。正式環境不要設 —— 有設時 poller 會把 bot token 送往該位址，並在啟動時於 stderr 印一行 `WARNING TELEGRAM_API_ROOT is set`。 |
 
 兩個逾時都接受小數，須大於 0 且不超過 604800（7 天）；不合法時在 stderr 警告並退回預設值。
 
@@ -128,14 +128,15 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 
 ### 呼叫
 
-位址：`http://127.0.0.1:<TELEGRAM_POLLER_PORT>`（只綁 loopback，無認證）。請求與回應皆為 JSON
+位址：`http://127.0.0.1:<TELEGRAM_POLLER_PORT>`（只綁 loopback，無認證）。帶 `Origin` header 的請求（網頁發出的請求才會帶）
+一律回 `403 {"error":"forbidden_origin"}`；`curl` 與腳本不會帶。請求與回應皆為 JSON
 （`content-type: application/json`）；唯一的非 JSON 回應是功能關閉時的純文字 `404 not found`。
 
 **建立 —— `POST /approvals`**
 
 | body 欄位 | 必填 | 意思 |
 | --- | --- | --- |
-| `id` | 是 | 由呼叫方產生。`[A-Za-z0-9_-]{1,40}`。 |
+| `id` | 是 | 由呼叫方產生。`[A-Za-z0-9_-]{1,40}`。**必須不可預測**，見「呼叫方必須遵守的規則」。 |
 | `text` | 是 | 顯示給 user 的文字。不可空白，最多 3500 字元。以純文字送出（不帶 `parse_mode`），不需跳脫。 |
 | `kind` | 是 | `allow_deny`（按鈕：允許 / 拒絕）或 `approve_reject`（按鈕：approve / 退回）。 |
 | `timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
@@ -145,11 +146,22 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | --- | --- | --- |
 | `201` | 該請求（格式見下），`status: "pending"` | 至少發給一位收件人。 |
 | `400` | `{"error":"invalid_request","detail":"..."}` | 欄位缺漏 / 不合法、JSON 格式錯誤、body 超過 32 KB。沒有發出任何訊息。 |
-| `409` | `{"error":"duplicate_id","request":{...}}` | id 已存在。回傳既有請求的現況，不重置、不重發。只有同一 id 仍在建立中時才沒有 `request`。 |
+| `409` | `{"error":"duplicate_id","request":{...}}` | id 已存在。回傳既有請求的現況，不重置、不重發。只有同一 id 仍在建立中時才沒有 `request`。**這不是你的請求**，見「呼叫方必須遵守的規則」。 |
 | `502` | `{"error":"telegram_send_failed"}` | Telegram 全部發送失敗。不留下請求，該 id 可再用。 |
 | `503` | `{"error":"no_recipient"}` | `access.json` 的 `allowFrom` 為空（或讀不到）。 |
 | `503` | `{"error":"too_many_requests"}` | 已保有 200 筆請求。 |
 | `404` 純文字 `not found` | | 功能關閉（或 poller 版本尚無此功能）。 |
+
+#### 呼叫方必須遵守的規則
+
+本機任何程序都能呼叫這個介面，而 id 是呼叫方自己選的。下面兩條規則用來避免把別人建立的請求當成自己的：
+
+1. **每筆請求產生不可預測的 id** —— 至少 128 bit 隨機值，例如 `appr_$(openssl rand -hex 16)` 或去掉連字號的 UUID。
+   給人看的字樣（ticket 編號、PR 編號）放在 `text`，不要放在 `id`。像 `spec-<ticket>` 這種猜得到的 id，
+   別的程序可以搶先用同一個 id、配上看似無害的文字建立請求；user 核准的是那段文字，之後讀這個 id 的呼叫方
+   卻會把它當成自己那件事的核准。
+2. **`409` 代表這筆請求不是你建立的。** 不得輪詢它、不得採用它的結果、不得取消它。把這次建立視為失敗，換一個新的 id 重試。
+   只對**自己拿到 `201`** 的 id 做 `GET` 或取消（續等時用當時記下的 id）。
 
 訊息會發到 `access.json` 的 `allowFrom` 內**每一位** user 的私訊；先到的決定為準，所有副本一起改寫成結果。
 
@@ -159,7 +171,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 
 ```json
 {
-  "id": "spec-JP-123",
+  "id": "appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f",
   "kind": "approve_reject",
   "status": "denied",
   "decision": "reject",
@@ -192,9 +204,9 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 
 ```sh
 curl -s -X POST http://127.0.0.1:7852/approvals \
-  -d '{"id":"spec-JP-123","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
-curl -s http://127.0.0.1:7852/approvals/spec-JP-123
-curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
+  -d '{"id":"appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
+curl -s http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f
+curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/cancel
 ```
 
 ### user 看到什麼、什麼才算決定
@@ -206,14 +218,17 @@ curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
 - 「退回」讓請求進入 `awaiting_comment`，bot 另發一則提示請 user 回覆。意見 = `allowFrom` 內的人
   **引用回覆**該提示（或原請求訊息）的文字。這則回覆由 poller 吃掉，**不會**轉給任何 session。
   非文字的回覆會收到「請用文字回覆意見。」並繼續等。等意見逾時則記為 `denied`、`comment: ""`。
+- 以 `/` 開頭的回覆一律不算意見、照常轉送，所以等意見期間 `/restart` 這類 bot 指令照樣有效。
+- 請求已結案（等意見逾時、被取消）後才引用回覆提示訊息：不記錄、也不轉給 session，bot 回一句
+  「這筆請求已經結案，這則意見沒有被記錄。」。
 - 一般訊息、回覆其他訊息、其他 callback data（含 `perm:` 權限按鈕）照舊轉給 session。
 - 逾時的請求訊息改為 `[已逾時]`。
 - 改訊息失敗不會讓決定消失；以查詢結果為準。
 
 ### 重啟與狀態
 
-請求同步寫入 `$TELEGRAM_STATE_DIR/approvals.json`（權限 0600，先落檔再改 Telegram 訊息），只有 poller
-讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
+請求同步寫入 `$TELEGRAM_STATE_DIR/approvals.json`（權限 0600，先落檔再改 Telegram 訊息；寫檔失敗只記 log，
+記憶體內的結果在下次重啟前仍有效），只有 poller 讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
 重啟後處理；期間跨過期限的請求變成 `expired`。檔案遺失或讀不了時 poller 從空狀態啟動（壞檔保留為
 `approvals.json.corrupt-<時間戳>`），先前的 id 查詢為 `not_found`。
 

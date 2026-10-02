@@ -123,7 +123,7 @@ call that sets a decision**, and extra fields in a request body are ignored.
 | `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | How long a request waits for a button when the create call names no `timeout_seconds`. |
 | `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | How long a "reject" waits for a written comment when the create call names no `comment_timeout_seconds`. |
 | `TELEGRAM_POLLER_PORT` | `7852` | Existing variable; the interface lives on the poller's port. |
-| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL. Leave unset in production. |
+| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL. Leave unset in production — when set, the poller sends the bot token there and prints a `WARNING TELEGRAM_API_ROOT is set` line on stderr at startup. |
 
 Both timeouts accept fractions and must be above 0 and at most 604800 (7 days);
 an unusable value falls back to the default with a warning on stderr.
@@ -136,7 +136,9 @@ is unchanged by this feature, so any mix of poller and server versions is fine.
 ### Calls
 
 Base URL: `http://127.0.0.1:<TELEGRAM_POLLER_PORT>` (bound to loopback only, no
-authentication). Bodies and replies are JSON (`content-type: application/json`);
+authentication). A request carrying an `Origin` header — which is what a web
+page sends — is refused with `403 {"error":"forbidden_origin"}`; `curl` and
+scripts do not send one. Bodies and replies are JSON (`content-type: application/json`);
 the only non-JSON reply is the plain-text `404 not found` you get when the
 feature is off.
 
@@ -144,7 +146,7 @@ feature is off.
 
 | Body field | Required | Meaning |
 | --- | --- | --- |
-| `id` | yes | Chosen by the caller. `[A-Za-z0-9_-]{1,40}`. |
+| `id` | yes | Chosen by the caller. `[A-Za-z0-9_-]{1,40}`. **Must be unpredictable** — see "Rules for callers". |
 | `text` | yes | Message shown to the user. Non-blank, at most 3500 characters. Sent as plain text (no `parse_mode`), so no escaping is needed. |
 | `kind` | yes | `allow_deny` (buttons 允許 / 拒絕) or `approve_reject` (buttons approve / 退回). |
 | `timeout_seconds` | no | Number, `0 < n <= 604800`. |
@@ -154,11 +156,27 @@ feature is off.
 | --- | --- | --- |
 | `201` | the request (see below), `status: "pending"` | Sent to at least one recipient. |
 | `400` | `{"error":"invalid_request","detail":"..."}` | Missing / invalid field, malformed JSON, or a body over 32 KB. Nothing was sent. |
-| `409` | `{"error":"duplicate_id","request":{...}}` | The id exists. The existing request is returned untouched (never reset, never re-sent). `request` is absent only if the same id is still being created. |
+| `409` | `{"error":"duplicate_id","request":{...}}` | The id exists. The existing request is returned untouched (never reset, never re-sent). `request` is absent only if the same id is still being created. **This is not your request** — see "Rules for callers". |
 | `502` | `{"error":"telegram_send_failed"}` | Telegram refused every send. Nothing is stored; the id stays free. |
 | `503` | `{"error":"no_recipient"}` | `access.json` has no `allowFrom` entry (or is unreadable). |
 | `503` | `{"error":"too_many_requests"}` | 200 requests are already held. |
 | `404` plain text `not found` | | The feature is off (or the poller predates it). |
+
+#### Rules for callers
+
+Any local process can call this interface, and the id is picked by the caller.
+Two rules keep someone else's request from being mistaken for yours:
+
+1. **Generate an unpredictable id per request** — at least 128 bits of
+   randomness, e.g. `appr_$(openssl rand -hex 16)` or a UUID without dashes.
+   Put anything human-readable (ticket key, PR number) in `text`, never in `id`.
+   A guessable id such as `spec-<ticket>` lets another process create that id
+   first with harmless-looking text; the user approves *that* text, and a caller
+   that then reads the id would take the approval as its own.
+2. **`409` means the request is not yours.** Do not poll it, do not use its
+   result, do not cancel it. Treat the create as failed and retry with a fresh
+   id. Only ever `GET` or cancel an id for which *you* received `201`
+   (when resuming a wait, use the id you stored at that moment).
 
 The message goes to the DM of **every** user in `access.json`'s `allowFrom`;
 the first decision wins and every copy is rewritten to the outcome.
@@ -170,7 +188,7 @@ failed, state file lost, or dropped 24 hours after it settled).
 
 ```json
 {
-  "id": "spec-JP-123",
+  "id": "appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f",
   "kind": "approve_reject",
   "status": "denied",
   "decision": "reject",
@@ -204,9 +222,9 @@ failed, state file lost, or dropped 24 hours after it settled).
 
 ```sh
 curl -s -X POST http://127.0.0.1:7852/approvals \
-  -d '{"id":"spec-JP-123","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
-curl -s http://127.0.0.1:7852/approvals/spec-JP-123
-curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
+  -d '{"id":"appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
+curl -s http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f
+curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/cancel
 ```
 
 ### What the user sees, and what counts as a decision
@@ -225,6 +243,11 @@ curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
   the poller and is **not** delivered to any session. A non-text reply gets
   "請用文字回覆意見。" and the wait continues. No reply within the comment
   timeout settles it as `denied` with `comment: ""`.
+- A reply that starts with `/` is never a comment: it is routed as usual, so
+  bot commands such as `/restart` keep working while a comment is awaited.
+- A quote-reply to the prompt that arrives after the request has settled
+  (comment timeout, cancel) is not recorded and not delivered to a session; the
+  bot answers "這筆請求已經結案，這則意見沒有被記錄。".
 - Ordinary messages, replies to anything else, and other callback data
   (`perm:` permission buttons included) are routed to sessions as before.
 - An expired request's message becomes `[已逾時]`.
@@ -233,7 +256,9 @@ curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
 ### Restarts and state
 
 Requests are mirrored to `$TELEGRAM_STATE_DIR/approvals.json` (mode 0600,
-written before the Telegram message is updated), read only by the poller. After
+written before the Telegram message is updated; a failed write is logged and
+the in-memory result still stands until the next restart), read only by the
+poller. After
 a poller restart, results are kept and pending requests stay answerable through
 their original buttons — nothing is re-sent. A button pressed while the poller
 was down is handled when it comes back; a request whose deadline passed
