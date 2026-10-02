@@ -124,6 +124,13 @@ const APPROVAL_CONFIG = resolveApprovalConfig(process.env)
 
 // Test hook: point the Bot API client at a local fake. Unset = Telegram itself.
 const API_ROOT = process.env.TELEGRAM_API_ROOT?.trim() || undefined
+if (API_ROOT) {
+  // Loud on purpose: this sends the bot token to that address, and only this
+  // process is redirected — server.ts keeps talking to Telegram.
+  process.stderr.write(
+    `telegram poller: WARNING TELEGRAM_API_ROOT is set, Bot API calls go to ${API_ROOT} instead of Telegram (test hook)\n`,
+  )
+}
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
@@ -196,6 +203,12 @@ function spawnScope(scopeId: string): Promise<SpawnOutcome> {
  * Who may answer an approval request: access.json's allowFrom, read fresh each
  * time so a pairing made after startup counts. Read-only here — server.ts owns
  * the file — and an unreadable file means nobody, never everybody.
+ *
+ * Only allowFrom is consulted, the same as server.ts's `perm:` button handler:
+ * dmPolicy and static mode are not applied. So with dmPolicy "disabled" an
+ * allowlisted user can still press a button, and under static mode an edit to
+ * access.json takes effect here before server.ts restarts. Both only ever
+ * narrow or widen within the list the owner maintains.
  */
 function loadAllowFrom(): string[] {
   try {
