@@ -23,6 +23,9 @@ const SHORT_TIMEOUT_SECONDS = 0.4
 const LONG_TIMEOUT_SECONDS = 60
 const TEST_TIMEOUT_MS = 20_000
 const SWITCH_ON = '1'
+const EXTERNAL_ADDRESS = Object.values(networkInterfaces())
+  .flat()
+  .find(iface => iface && iface.family === 'IPv4' && !iface.internal)?.address
 const FIRST_FAKE_MESSAGE_ID = 1000
 
 type Json = Record<string, unknown>
@@ -235,6 +238,55 @@ describe('開關', () => {
     expect(world.fake.callsOf('editMessageText')).toEqual([])
     expect(world.fake.callsOf('sendMessage')).toEqual([])
     session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  // In-repo guard for A-2 ("switch unset = today's behaviour"): the complete
+  // Bot API call log and the complete routed stream for a fixed update
+  // sequence, pinned to what main produces. The one-off main-vs-branch diff
+  // cannot live here (it needs a second checkout); this keeps its expectation.
+  test('A-2 開關未設：固定 update 序列的完整 Bot API 呼叫記錄與轉給 session 的內容與現版相同', async () => {
+    const world = await startWorld({})
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+
+    sendDm(world, U1, '一般 DM')
+    sendDm(world, U1, '引用回覆', { replyTo: 1000 })
+    pressButton(world, 'perm:allow:abcde', U1, 1000)
+    pressButton(world, 'appr:allow:R1', U1, 1000)
+    pressButton(world, 'anything', U1, 1000)
+    sendDm(world, U2, '非 allowFrom 的 DM')
+    sendDm(world, U1, '/reauth')
+    await drained(world)
+    await waitFor(() => session.envelopes.length === 6, 'six updates routed to the U1 session')
+    await waitFor(() => world.fake.callsOf('sendMessage').length === 1, 'the not-configured notice to U2')
+
+    // Everything from U1 reaches its session untouched and in order, callbacks
+    // and /reauth (no REAUTH_BIN) included.
+    const routed = session.envelopes.map(e => e.payload as { message?: { text?: string }; callback_query?: { data?: string } })
+    expect(routed.map(p => p.message?.text ?? p.callback_query?.data)).toEqual([
+      '一般 DM', '引用回覆', 'perm:allow:abcde', 'appr:allow:R1', 'anything', '/reauth',
+    ])
+    // The only Bot API traffic: the command menu at startup, and the
+    // "not fully configured" notice to U2, who has no session and no spawn bin.
+    expect(world.fake.calls.map(c => c.method)).toEqual(['setMyCommands', 'sendMessage'])
+    expect(world.fake.calls[1].params).toEqual({ chat_id: U2, text: '服務未完整設定，請聯絡管理者。' })
+    expect(readdirSync(world.stateDir).sort()).toEqual(['access.json', 'poller.pid'])
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  test('開關未設：access.json 不存在也不影響啟動與路由（poller 不依賴它）', async () => {
+    const world = await startWorld({})
+    rmSync(join(world.stateDir, 'access.json'))
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    sendDm(world, U1, '照常路由')
+    await waitFor(() => session.envelopes.length === 1, 'routed')
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  test('TELEGRAM_API_ROOT 有設時在 stderr 印警告', async () => {
+    const world = await startWorld({})
+    expect(world.stderr.join('')).toContain(`WARNING TELEGRAM_API_ROOT is set, Bot API calls go to ${world.fake.apiRoot}`)
   }, TEST_TIMEOUT_MS)
 
   test('A-5 開關開：一般 DM、引用回覆、perm: callback 照常路由，pending 請求不受影響', async () => {
@@ -499,6 +551,37 @@ describe('退回 + 意見', () => {
     expect(await statusOf(world, 'R26')).toMatchObject({ status: 'denied', comment: '文字意見' })
   }, TEST_TIMEOUT_MS)
 
+  test('等意見期間以 / 開頭的回覆不當意見、照常轉給 session', async () => {
+    const world = await startWorld()
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    const { messageId } = await create(world, 'R28', 'approve_reject')
+    pressButton(world, 'appr:reject:R28', U1, messageId)
+    await drained(world)
+    sendDm(world, U1, '/restart', { replyTo: 1001 })
+    await waitFor(() => session.envelopes.length === 1, '/restart routed')
+    expect(routedTexts(session.envelopes)).toEqual(['/restart'])
+    expect((await statusOf(world, 'R28')).status).toBe('awaiting_comment')
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  test('意見逾時後才回覆提示訊息：不轉給 session、不改結果，回一句已結案', async () => {
+    const world = await startWorld()
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    const { messageId } = await create(world, 'R29', 'approve_reject', { comment_timeout_seconds: SHORT_TIMEOUT_SECONDS })
+    pressButton(world, 'appr:reject:R29', U1, messageId)
+    await drained(world)
+    await sleep(SHORT_TIMEOUT_SECONDS * 1000 + 100)
+    sendDm(world, U1, '遲到的意見', { replyTo: 1001 })
+    sendDm(world, U1, '之後的一般訊息')
+    await waitFor(() => session.envelopes.length === 1, 'the later DM to be routed')
+    expect(routedTexts(session.envelopes)).toEqual(['之後的一般訊息'])
+    expect(await statusOf(world, 'R29')).toMatchObject({ status: 'denied', comment: '' })
+    expect(world.fake.callsOf('sendMessage').at(-1)?.params.text).toBe('這筆請求已經結案，這則意見沒有被記錄。')
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
   test('D-7 等意見期間被取消 -> cancelled，晚到的回覆不改結果', async () => {
     const world = await startWorld()
     const { messageId } = await create(world, 'R25', 'approve_reject')
@@ -586,13 +669,22 @@ describe('決定保管', () => {
     expect((await statusOf(world, 'R41')).status).toBe('pending')
   }, TEST_TIMEOUT_MS)
 
-  test('F-2 只綁 127.0.0.1', async () => {
+  // Skipped, visibly, on a machine with no non-loopback interface to connect from.
+  test.skipIf(!EXTERNAL_ADDRESS)('F-2 只綁 127.0.0.1', async () => {
     const world = await startWorld()
-    const external = Object.values(networkInterfaces())
-      .flat()
-      .find(iface => iface && iface.family === 'IPv4' && !iface.internal)?.address
-    if (!external) return
-    await expect(call(world, 'GET', '/approvals/R1', undefined, external)).rejects.toThrow()
+    await expect(call(world, 'GET', '/approvals/R1', undefined, EXTERNAL_ADDRESS)).rejects.toThrow()
+  }, TEST_TIMEOUT_MS)
+
+  test('帶 Origin header 的請求（瀏覽器跨站）回 403，不發訊息', async () => {
+    const world = await startWorld()
+    const res = await fetch(`http://${LOOPBACK}:${world.port}/approvals`, {
+      method: 'POST',
+      headers: { origin: 'https://evil.example', 'content-type': 'text/plain' },
+      body: JSON.stringify({ id: 'R43', text: 't', kind: 'allow_deny' }),
+    })
+    expect(res.status).toBe(403)
+    expect(world.fake.callsOf('sendMessage')).toEqual([])
+    expect((await call(world, 'GET', '/approvals/R43')).status).toBe(404)
   }, TEST_TIMEOUT_MS)
 
   test('F-3 狀態檔在 poller 狀態目錄、權限 0600，不落在舊決定檔目錄', async () => {
