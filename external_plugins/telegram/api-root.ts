@@ -9,6 +9,7 @@ export const API_ROOT_ENV = 'TELEGRAM_API_ROOT'
 /** The only hosts an override may name: this machine, and nothing else. */
 const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '[::1]'])
 const ALLOWED_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:'])
+const TRAILING_SLASHES_RE = /\/+$/
 
 export type ApiRootResolution =
   /** Unset or blank: use Telegram's own servers, say nothing. */
@@ -30,6 +31,9 @@ export type ApiRootResolution =
  * guarantee on an IPv6-only loopback. A URL with embedded credentials is
  * refused — no local fake needs them, and it keeps secrets out of this value.
  *
+ * Trailing slashes are dropped from an accepted value, because the Bot API
+ * client rejects them outright.
+ *
  * The reason never echoes the raw value, which could itself hold a secret.
  *
  * @param rawValue - Raw env value, or undefined when the key is unset.
@@ -50,5 +54,7 @@ export function resolveApiRoot(rawValue: string | undefined): ApiRootResolution 
   if (!LOOPBACK_HOSTNAMES.has(url.hostname)) {
     return { kind: 'ignored', reason: 'host is not loopback (only 127.0.0.1, localhost and [::1] are accepted)' }
   }
-  return { kind: 'override', apiRoot: trimmed }
+  // grammY refuses an apiRoot ending in '/' by throwing from `new Bot`, which
+  // would take the poller down at startup over a cosmetic difference.
+  return { kind: 'override', apiRoot: trimmed.replace(TRAILING_SLASHES_RE, '') }
 }

@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Bot } from 'grammy'
 import { resolveApiRoot } from './api-root'
 
 test.each([undefined, '', '   '])('未設或空白（%p）：走預設（Telegram 官方位址），不回報任何事', value => {
@@ -25,7 +26,21 @@ test('前後空白會去掉', () => {
 })
 
 test.each([
+  ['http://127.0.0.1:8081/', 'http://127.0.0.1:8081'],
+  ['http://localhost:8081//', 'http://localhost:8081'],
+  ['http://[::1]:8081/prefix/', 'http://[::1]:8081/prefix'],
+  ['  http://127.0.0.1/  ', 'http://127.0.0.1'],
+])('尾端的 / 會去掉（%p），Bot client 才建得起來', (value, expected) => {
+  const resolved = resolveApiRoot(value)
+  expect(resolved).toEqual({ kind: 'override', apiRoot: expected })
+  // The reason this exists: grammY throws on a trailing slash.
+  expect(() => new Bot('1:fake', { client: { apiRoot: value.trim() } })).toThrow()
+  expect(() => new Bot('1:fake', { client: { apiRoot: expected } })).not.toThrow()
+})
+
+test.each([
   ['外部主機', 'https://api.example.com'],
+  ['外部主機、尾端帶 /', 'https://api.example.com/'],
   ['自架 Bot API server', 'http://10.0.0.5:8081'],
   ['區網位址', 'http://192.168.1.10:8081'],
   ['0.0.0.0', 'http://0.0.0.0:8081'],
