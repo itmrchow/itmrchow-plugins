@@ -34,6 +34,12 @@ import {
   type SpawnOutcome,
 } from './route-update'
 import { interceptReauth, runReauthBin, shouldDropEditedReauth } from './reauth-command'
+import { API_ROOT_ENV, resolveApiRoot } from './api-root'
+import { resolveApprovalConfig } from './approval-config'
+import { ApprovalStore } from './approval-store'
+import { createApprovalService, type ApprovalService } from './approval-service'
+import { createApprovalHandler, mountApprovalRoutes } from './approval-http'
+import { pickAccessFields, type Access } from './access-schema'
 import type { Update } from 'grammy/types'
 import { setDefaultResultOrder } from 'node:dns'
 import { setDefaultAutoSelectFamily } from 'node:net'
@@ -75,6 +81,8 @@ if (!STATE_DIR) {
 
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'poller.pid')
+const ACCESS_FILE = join(STATE_DIR, 'access.json')
+const APPROVALS_FILE = join(STATE_DIR, 'approvals.json')
 
 // Load STATE_DIR/.env (real env wins) — same convention as server.ts.
 try {
@@ -110,6 +118,28 @@ const SCOPE_SPAWN_BIN = process.env.SCOPE_SPAWN_BIN
 // and route like any other message (hosts that have not opted in keep today's behaviour).
 const REAUTH_BIN = process.env.REAUTH_BIN
 
+// Approval requests over inline buttons (JP-315). Off unless explicitly enabled:
+// with the switch unset nothing below is built, no route is mounted, no update
+// is intercepted and no state file is written.
+const APPROVAL_CONFIG = resolveApprovalConfig(process.env)
+
+// Test hook: point the Bot API client at a local fake. Loopback hosts only, so
+// the bot token cannot leave this machine through it; see resolveApiRoot.
+const API_ROOT_RESOLUTION = resolveApiRoot(process.env[API_ROOT_ENV])
+if (API_ROOT_RESOLUTION.kind === 'ignored') {
+  process.stderr.write(
+    `telegram poller: ${API_ROOT_ENV} ignored (${API_ROOT_RESOLUTION.reason}); using Telegram's Bot API servers\n`,
+  )
+}
+const API_ROOT = API_ROOT_RESOLUTION.kind === 'override' ? API_ROOT_RESOLUTION.apiRoot : undefined
+if (API_ROOT) {
+  // Loud on purpose: only this process is redirected — server.ts keeps talking
+  // to Telegram.
+  process.stderr.write(
+    `telegram poller: WARNING TELEGRAM_API_ROOT is set, Bot API calls go to ${API_ROOT} instead of Telegram (test hook)\n`,
+  )
+}
+
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
   process.stderr.write(`telegram poller: TELEGRAM_BOT_TOKEN required (set in ${ENV_FILE})\n`)
@@ -136,7 +166,7 @@ const shutdown = (): void => {
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-const bot = new Bot(TOKEN)
+const bot = API_ROOT ? new Bot(TOKEN, { client: { apiRoot: API_ROOT } }) : new Bot(TOKEN)
 const registry = new ScopeRegistry({ maxScopes: MAX_SCOPES, maxQueue: MAX_QUEUE_PER_SCOPE })
 const hub = createSubscribeServer({
   registry,
@@ -175,6 +205,73 @@ function spawnScope(scopeId: string): Promise<SpawnOutcome> {
       resolve('failed')
     })
   })
+}
+
+/**
+ * Who may answer an approval request: access.json's allowFrom, read fresh each
+ * time so a pairing made after startup counts. Read-only here — server.ts owns
+ * the file — and an unreadable file means nobody, never everybody.
+ *
+ * Only allowFrom is consulted, the same as server.ts's `perm:` button handler:
+ * dmPolicy and static mode are not applied. So with dmPolicy "disabled" an
+ * allowlisted user can still press a button, and under static mode an edit to
+ * access.json takes effect here before server.ts restarts. Both only ever
+ * narrow or widen within the list the owner maintains.
+ */
+function loadAllowFrom(): string[] {
+  try {
+    const parsed = JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) as Partial<Access>
+    const { allowFrom } = pickAccessFields(parsed)
+    return Array.isArray(allowFrom) ? allowFrom.filter(id => typeof id === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function createApprovals(): ApprovalService {
+  return createApprovalService({
+    store: new ApprovalStore({ filePath: APPROVALS_FILE }),
+    loadAllowFrom,
+    api: {
+      sendRequest: async (chatId, text, buttons) => {
+        const sent = await bot.api.sendMessage(chatId, text, {
+          reply_markup: {
+            inline_keyboard: [buttons.map(button => ({ text: button.text, callback_data: button.callbackData }))],
+          },
+        })
+        return sent.message_id
+      },
+      sendPrompt: async (chatId, text, replyToMessageId) => {
+        const sent = await bot.api.sendMessage(chatId, text, {
+          reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true },
+          reply_markup: { force_reply: true },
+        })
+        return sent.message_id
+      },
+      editText: async (chatId, messageId, text) => {
+        await bot.api.editMessageText(chatId, messageId, text)
+      },
+      answerCallback: async (callbackQueryId, text) => {
+        await bot.api.answerCallbackQuery(callbackQueryId, text === undefined ? undefined : { text })
+      },
+      sendText: async (chatId, text) => {
+        await bot.api.sendMessage(chatId, text)
+      },
+    },
+  })
+}
+
+const approvals: ApprovalService | undefined = APPROVAL_CONFIG.enabled ? createApprovals() : undefined
+if (approvals) {
+  mountApprovalRoutes(
+    hub.server,
+    createApprovalHandler(approvals, {
+      timeoutSeconds: APPROVAL_CONFIG.defaultTimeoutSeconds,
+      commentTimeoutSeconds: APPROVAL_CONFIG.defaultCommentTimeoutSeconds,
+    }),
+  )
+  approvals.start()
+  process.stderr.write('telegram poller: approval requests enabled\n')
 }
 
 async function main(): Promise<void> {
@@ -248,6 +345,9 @@ async function main(): Promise<void> {
   const consume = createUpdateConsumer({
     route: async update => {
       if (await interceptTelegramReauth(update)) return
+      // Button presses and reject comments are decided here and never reach a
+      // session: the decision must stay in this process.
+      if (approvals && (await approvals.interceptUpdate(update))) return
       await routeUpdate(update, ctx)
     },
   })
