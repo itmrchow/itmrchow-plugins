@@ -28,6 +28,23 @@ const EXIT_MISCONFIGURED = 1
 /** What a module that failed to load under node looks like on stderr. */
 const LOAD_FAILURE_RE = /SyntaxError|ERR_MODULE_NOT_FOUND|ERR_UNKNOWN_FILE_EXTENSION|Cannot find module|TransformError/
 
+/**
+ * What `process.versions.bun` is inside the runtime tsx actually starts.
+ * 'undefined' means node. Anything else means "tsx" is running on bun (a bun
+ * binary standing in for node on PATH, `bun --bun`, …), and every test below
+ * would pass without having exercised node at all.
+ */
+const BUN_VERSION_UNDER_TSX = TSX_BIN
+  ? spawnSync(TSX_BIN, ['-e', 'process.stdout.write(String(process.versions.bun))'], {
+      env: { PATH: process.env.PATH ?? '' },
+      // stdin closed: with an open pipe, `tsx -e` waits on it and never exits.
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      timeout: WAIT_TIMEOUT_MS,
+    }).stdout
+  : undefined
+const RUNS_ON_NODE = 'undefined'
+
 if (!TSX_BIN) {
   process.stderr.write(
     'poller-tsx.e2e: SKIPPED — tsx not found (set TSX_BIN or put tsx on PATH); the poller was NOT verified under tsx\n',
@@ -101,6 +118,12 @@ async function startUnderTsx(env: Record<string, string>): Promise<Running> {
   await waitFor(() => stderr.join('').includes('polling as @'), 'the poller to start polling under tsx', stderr)
   return run
 }
+
+// Fails rather than skips: tsx was supplied, so a green run would be read as
+// "verified under tsx". A skip is reserved for "there is no tsx to try".
+test.skipIf(!TSX_BIN)('tsx 實際跑在 node 上（不是 bun 冒充），否則下面三條等於沒驗', () => {
+  expect(BUN_VERSION_UNDER_TSX).toBe(RUNS_ON_NODE)
+})
 
 test.skipIf(!TSX_BIN)('tsx 下 poller 的所有模組都載入成功：無 token 時停在設定檢查，而不是 import / 語法錯誤', () => {
   const { stateDir, homeDir } = makeDirs()
