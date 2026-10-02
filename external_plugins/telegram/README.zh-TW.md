@@ -102,6 +102,121 @@ poller 設了 `REAUTH_BIN`（指向 im-core 的 `scripts/reauth.sh`）時，會�
 非管理員不會收到任何回覆；管理員在群組送出會被告知改用私訊。管理員名單、計時與所有對主機的
 寫入都在 im-core 執行器內，見 im-core 的 README。未設 `REAUTH_BIN` 時，兩個指令照一般文字分派。
 
+## 核准請求（inline 按鈕，loopback 介面）
+
+預設關閉。poller 的 `TELEGRAM_APPROVAL_BUTTONS` 設為 `1` 或 `true` 時，本機程序可以請
+bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆。
+
+決定在 Telegram 上產生、保管在 poller 程序內。下面的介面只能建立、查詢、取消 ——
+**沒有任何寫入決定的呼叫**，請求 body 內多帶的欄位一律忽略。
+
+### 環境變數（`poller.ts` 讀取；可放環境或 `$TELEGRAM_STATE_DIR/.env`）
+
+| 變數 | 預設 | 意思 |
+| --- | --- | --- |
+| `TELEGRAM_APPROVAL_BUTTONS` | 未設（關閉） | `1` 或 `true`（去空白、不分大小寫）才啟用。未設、空字串、`0`、`false` 與其他值一律關閉。 |
+| `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | 建立時沒帶 `timeout_seconds` 時，等按鈕的時間。 |
+| `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | 建立時沒帶 `comment_timeout_seconds` 時，按「退回」後等意見的時間。 |
+| `TELEGRAM_POLLER_PORT` | `7852` | 既有變數；介面掛在 poller 的埠上。 |
+| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址。正式環境不要設。 |
+
+兩個逾時都接受小數，須大於 0 且不超過 604800（7 天）；不合法時在 stderr 警告並退回預設值。
+
+開關關閉時 poller 行為與先前完全相同：下面三個路徑回 server 原本的 `404 not found`（純文字）、
+不攔截任何 update、不讀 `access.json`、不寫狀態檔。本功能沒有改 `server.ts`，poller 與 server
+新舊版本任意混搭都不受影響。
+
+### 呼叫
+
+位址：`http://127.0.0.1:<TELEGRAM_POLLER_PORT>`（只綁 loopback，無認證）。請求與回應皆為 JSON
+（`content-type: application/json`）；唯一的非 JSON 回應是功能關閉時的純文字 `404 not found`。
+
+**建立 —— `POST /approvals`**
+
+| body 欄位 | 必填 | 意思 |
+| --- | --- | --- |
+| `id` | 是 | 由呼叫方產生。`[A-Za-z0-9_-]{1,40}`。 |
+| `text` | 是 | 顯示給 user 的文字。不可空白，最多 3500 字元。以純文字送出（不帶 `parse_mode`），不需跳脫。 |
+| `kind` | 是 | `allow_deny`（按鈕：允許 / 拒絕）或 `approve_reject`（按鈕：approve / 退回）。 |
+| `timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
+| `comment_timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
+
+| 回應 | body | 何時 |
+| --- | --- | --- |
+| `201` | 該請求（格式見下），`status: "pending"` | 至少發給一位收件人。 |
+| `400` | `{"error":"invalid_request","detail":"..."}` | 欄位缺漏 / 不合法、JSON 格式錯誤、body 超過 32 KB。沒有發出任何訊息。 |
+| `409` | `{"error":"duplicate_id","request":{...}}` | id 已存在。回傳既有請求的現況，不重置、不重發。只有同一 id 仍在建立中時才沒有 `request`。 |
+| `502` | `{"error":"telegram_send_failed"}` | Telegram 全部發送失敗。不留下請求，該 id 可再用。 |
+| `503` | `{"error":"no_recipient"}` | `access.json` 的 `allowFrom` 為空（或讀不到）。 |
+| `503` | `{"error":"too_many_requests"}` | 已保有 200 筆請求。 |
+| `404` 純文字 `not found` | | 功能關閉（或 poller 版本尚無此功能）。 |
+
+訊息會發到 `access.json` 的 `allowFrom` 內**每一位** user 的私訊；先到的決定為準，所有副本一起改寫成結果。
+
+**查詢 —— `GET /approvals/<id>`**
+
+`200` 與該請求，或 `404 {"error":"not_found"}`（從未建立、建立失敗、狀態檔遺失、或結束滿 24 小時已清除）。
+
+```json
+{
+  "id": "spec-JP-123",
+  "kind": "approve_reject",
+  "status": "denied",
+  "decision": "reject",
+  "comment": "範圍要再縮小，拿掉 X",
+  "created_at_ms": 1790927386899,
+  "expires_at_ms": 1791013786899,
+  "resolved_at_ms": 1790927400000
+}
+```
+
+| `status` | 意思 | `decision` | `comment` |
+| --- | --- | --- | --- |
+| `pending` | 等按鈕。 | `null` | `null` |
+| `awaiting_comment` | 已按「退回」，等文字意見。尚未定案，請繼續輪詢；最後只會變成 `denied` 或 `cancelled`。 | `reject` | `null` |
+| `approved` | 按了「允許」或 approve。 | `allow` / `approve` | `null` |
+| `denied` | 按了「拒絕」，或「退回」已完成。 | `deny` / `reject` | `deny` 為 `null`；`reject` 為意見文字，逾時沒寫則為 `""` |
+| `cancelled` | 經本介面取消。 | `null` | `null` |
+| `expired` | 期限內沒人按。 | `null` | `null` |
+
+**取消 —— `POST /approvals/<id>/cancel`**（不需 body）
+
+| 回應 | 何時 |
+| --- | --- |
+| `200` 與該請求，`status: "cancelled"` | 原為 `pending` 或 `awaiting_comment`。Telegram 訊息改為 `[已在電腦處理]` 並移除按鈕。 |
+| `200` 與該請求，狀態不變 | 已有結果（`approved` / `denied` / `expired` / `cancelled`）。保留原結果、不動訊息，重複取消是安全的。 |
+| `404 {"error":"not_found"}` | 查無此 id。 |
+
+**其他** `/approvals` 底下的請求：路徑對但方法錯回 `405 {"error":"method_not_allowed"}`；路徑不存在回
+`404 {"error":"not_found"}`。
+
+```sh
+curl -s -X POST http://127.0.0.1:7852/approvals \
+  -d '{"id":"spec-JP-123","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
+curl -s http://127.0.0.1:7852/approvals/spec-JP-123
+curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
+```
+
+### user 看到什麼、什麼才算決定
+
+- 按鈕要同時符合三件事才算數：按的人在 `allowFrom` 內（驗的是按的人，不是訊息所在的聊天室）、
+  該按鈕屬於這筆請求的 `kind`、按鈕掛在 poller 為這筆請求發出的訊息上。其餘一律只回應、不採用。
+- 請求離開 `pending` 之後再按都不會改變結果，包含按「退回」後改按 approve。
+- 「允許」/「拒絕」/ approve 立即定案；訊息變成原文加上 `[已允許]`、`[已拒絕]` 或 `[已 approve]`，按鈕移除。
+- 「退回」讓請求進入 `awaiting_comment`，bot 另發一則提示請 user 回覆。意見 = `allowFrom` 內的人
+  **引用回覆**該提示（或原請求訊息）的文字。這則回覆由 poller 吃掉，**不會**轉給任何 session。
+  非文字的回覆會收到「請用文字回覆意見。」並繼續等。等意見逾時則記為 `denied`、`comment: ""`。
+- 一般訊息、回覆其他訊息、其他 callback data（含 `perm:` 權限按鈕）照舊轉給 session。
+- 逾時的請求訊息改為 `[已逾時]`。
+- 改訊息失敗不會讓決定消失；以查詢結果為準。
+
+### 重啟與狀態
+
+請求同步寫入 `$TELEGRAM_STATE_DIR/approvals.json`（權限 0600，先落檔再改 Telegram 訊息），只有 poller
+讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
+重啟後處理；期間跨過期限的請求變成 `expired`。檔案遺失或讀不了時 poller 從空狀態啟動（壞檔保留為
+`approvals.json.corrupt-<時間戳>`），先前的 id 查詢為 `not_found`。
+
 ## 提供給 assistant 的工具
 
 | 工具 | 用途 |

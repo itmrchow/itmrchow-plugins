@@ -105,6 +105,142 @@ Non-admins get no reply. Admins in a group are told to use a private chat. The
 admin list, timers and every write to the host live in the im-core executor;
 see im-core's README. Without `REAUTH_BIN` both commands route like any text.
 
+## Approval requests over inline buttons (loopback interface)
+
+Off by default. When the poller has `TELEGRAM_APPROVAL_BUTTONS` set to `1` or
+`true`, a local process can ask the bot's owner a yes/no question as a Telegram
+message with two buttons, and read back what was pressed.
+
+The decision is made in Telegram and kept inside the poller process. The
+interface below can create a request, read it and cancel it — **there is no
+call that sets a decision**, and extra fields in a request body are ignored.
+
+### Environment variables (read by `poller.ts`, from the environment or `$TELEGRAM_STATE_DIR/.env`)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TELEGRAM_APPROVAL_BUTTONS` | unset (off) | `1` or `true` (trimmed, case-insensitive) turns the feature on. Unset, empty, `0`, `false` and any other value leave it off. |
+| `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | How long a request waits for a button when the create call names no `timeout_seconds`. |
+| `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | How long a "reject" waits for a written comment when the create call names no `comment_timeout_seconds`. |
+| `TELEGRAM_POLLER_PORT` | `7852` | Existing variable; the interface lives on the poller's port. |
+| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL. Leave unset in production. |
+
+Both timeouts accept fractions and must be above 0 and at most 604800 (7 days);
+an unusable value falls back to the default with a warning on stderr.
+
+With the switch off, the poller behaves exactly as before: the three paths
+below answer the server's ordinary `404 not found` (plain text), no update is
+intercepted, `access.json` is not read and no state file is written. `server.ts`
+is unchanged by this feature, so any mix of poller and server versions is fine.
+
+### Calls
+
+Base URL: `http://127.0.0.1:<TELEGRAM_POLLER_PORT>` (bound to loopback only, no
+authentication). Bodies and replies are JSON (`content-type: application/json`);
+the only non-JSON reply is the plain-text `404 not found` you get when the
+feature is off.
+
+**Create — `POST /approvals`**
+
+| Body field | Required | Meaning |
+| --- | --- | --- |
+| `id` | yes | Chosen by the caller. `[A-Za-z0-9_-]{1,40}`. |
+| `text` | yes | Message shown to the user. Non-blank, at most 3500 characters. Sent as plain text (no `parse_mode`), so no escaping is needed. |
+| `kind` | yes | `allow_deny` (buttons 允許 / 拒絕) or `approve_reject` (buttons approve / 退回). |
+| `timeout_seconds` | no | Number, `0 < n <= 604800`. |
+| `comment_timeout_seconds` | no | Number, `0 < n <= 604800`. |
+
+| Reply | Body | When |
+| --- | --- | --- |
+| `201` | the request (see below), `status: "pending"` | Sent to at least one recipient. |
+| `400` | `{"error":"invalid_request","detail":"..."}` | Missing / invalid field, malformed JSON, or a body over 32 KB. Nothing was sent. |
+| `409` | `{"error":"duplicate_id","request":{...}}` | The id exists. The existing request is returned untouched (never reset, never re-sent). `request` is absent only if the same id is still being created. |
+| `502` | `{"error":"telegram_send_failed"}` | Telegram refused every send. Nothing is stored; the id stays free. |
+| `503` | `{"error":"no_recipient"}` | `access.json` has no `allowFrom` entry (or is unreadable). |
+| `503` | `{"error":"too_many_requests"}` | 200 requests are already held. |
+| `404` plain text `not found` | | The feature is off (or the poller predates it). |
+
+The message goes to the DM of **every** user in `access.json`'s `allowFrom`;
+the first decision wins and every copy is rewritten to the outcome.
+
+**Query — `GET /approvals/<id>`**
+
+`200` with the request, or `404 {"error":"not_found"}` (never created, creation
+failed, state file lost, or dropped 24 hours after it settled).
+
+```json
+{
+  "id": "spec-JP-123",
+  "kind": "approve_reject",
+  "status": "denied",
+  "decision": "reject",
+  "comment": "narrow the scope, drop X",
+  "created_at_ms": 1790927386899,
+  "expires_at_ms": 1791013786899,
+  "resolved_at_ms": 1790927400000
+}
+```
+
+| `status` | Meaning | `decision` | `comment` |
+| --- | --- | --- | --- |
+| `pending` | Waiting for a button. | `null` | `null` |
+| `awaiting_comment` | 退回 was pressed; waiting for the written comment. Not final yet — keep polling. It can only end as `denied` or `cancelled`. | `reject` | `null` |
+| `approved` | 允許 or approve was pressed. | `allow` / `approve` | `null` |
+| `denied` | 拒絕 was pressed, or a 退回 was completed. | `deny` / `reject` | `null` for `deny`; for `reject` the comment text, or `""` when none came in time |
+| `cancelled` | Cancelled through this interface. | `null` | `null` |
+| `expired` | Nobody pressed a button in time. | `null` | `null` |
+
+**Cancel — `POST /approvals/<id>/cancel`** (no body needed)
+
+| Reply | When |
+| --- | --- |
+| `200` with the request, `status: "cancelled"` | It was `pending` or `awaiting_comment`. The Telegram message is rewritten to `[已在電腦處理]` and loses its buttons. |
+| `200` with the request, status unchanged | It had already settled (`approved` / `denied` / `expired` / `cancelled`). The result is kept and the message is not touched, so repeating a cancel is safe. |
+| `404 {"error":"not_found"}` | Unknown id. |
+
+**Anything else** under `/approvals`: a known path with the wrong method answers
+`405 {"error":"method_not_allowed"}`; an unknown path answers
+`404 {"error":"not_found"}`.
+
+```sh
+curl -s -X POST http://127.0.0.1:7852/approvals \
+  -d '{"id":"spec-JP-123","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
+curl -s http://127.0.0.1:7852/approvals/spec-JP-123
+curl -s -X POST http://127.0.0.1:7852/approvals/spec-JP-123/cancel
+```
+
+### What the user sees, and what counts as a decision
+
+- A button only counts when the person pressing it is in `allowFrom` (the
+  presser is checked, not the chat), the button belongs to that request's
+  `kind`, and it sits on a message the poller sent for that request. Anything
+  else is answered and ignored.
+- Once a request has left `pending`, later presses change nothing — including
+  approve after 退回.
+- 允許 / 拒絕 / approve settle at once; the message becomes the original text
+  plus `[已允許]`, `[已拒絕]` or `[已 approve]`, without buttons.
+- 退回 moves the request to `awaiting_comment` and the bot sends a prompt asking
+  for a reply. The comment is the text of a **quote-reply** to that prompt (or to
+  the request message) from someone in `allowFrom`. That reply is consumed by
+  the poller and is **not** delivered to any session. A non-text reply gets
+  "請用文字回覆意見。" and the wait continues. No reply within the comment
+  timeout settles it as `denied` with `comment: ""`.
+- Ordinary messages, replies to anything else, and other callback data
+  (`perm:` permission buttons included) are routed to sessions as before.
+- An expired request's message becomes `[已逾時]`.
+- A failed message edit never undoes a decision; the query result is the record.
+
+### Restarts and state
+
+Requests are mirrored to `$TELEGRAM_STATE_DIR/approvals.json` (mode 0600,
+written before the Telegram message is updated), read only by the poller. After
+a poller restart, results are kept and pending requests stay answerable through
+their original buttons — nothing is re-sent. A button pressed while the poller
+was down is handled when it comes back; a request whose deadline passed
+meanwhile becomes `expired`. If the file is missing or unreadable the poller
+starts with no requests (the unreadable file is kept as
+`approvals.json.corrupt-<timestamp>`), so earlier ids answer `not_found`.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |
