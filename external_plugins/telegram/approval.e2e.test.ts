@@ -7,7 +7,8 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { type ChildProcess, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -803,5 +804,198 @@ describe('poller 重啟', () => {
     pressButton(world, 'appr:allow:R60', U1, messageId)
     await drained(world)
     expect((await statusOf(world, 'R60')).status).toBe('pending')
+  }, TEST_TIMEOUT_MS)
+})
+
+describe('綁定與一次性消耗（JP-374）', () => {
+  const SESSION = 'session-1111'
+  const DANGEROUS_SUBJECT = 'git push --force origin main'
+  const OTHER_SUBJECT = 'git reset --hard origin/main'
+  const BLOCK_HEADER = '【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：'
+  const BLOCK_FOOTER = '────────────'
+  const bind = (subject: string = DANGEROUS_SUBJECT, session: string = SESSION): Json => ({
+    binding_session: session,
+    binding_subject: subject,
+  })
+  const keyOf = (subject: string = DANGEROUS_SUBJECT, session: string = SESSION): string =>
+    createHash('sha256').update(`${session}\n${subject}`, 'utf8').digest('hex')
+  const consume = (world: World, id: string, subject: string = DANGEROUS_SUBJECT, session: string = SESSION): Promise<Reply> =>
+    call(world, 'POST', `/approvals/${id}/consume`, bind(subject, session))
+  const sentTextOf = (world: World, messageId: number): unknown =>
+    world.fake.callsOf('sendMessage')[messageId - FIRST_FAKE_MESSAGE_ID].params.text
+
+  test('偽造請求：無害自由文字 + 危險指令綁定，送到 Telegram 的訊息開頭固定區塊必為被綁定指令', async () => {
+    const world = await startWorld()
+    const res = await call(world, 'POST', '/approvals', {
+      id: 'B0', text: '只是要跑 ls，請放行', kind: 'allow_deny', timeout_seconds: LONG_TIMEOUT_SECONDS, ...bind(),
+    })
+    expect(res).toMatchObject({ status: 201, body: { binding_key: keyOf() } })
+    expect(world.fake.callsOf('sendMessage')[0].params.text).toBe(
+      [BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '只是要跑 ls，請放行'].join('\n'),
+    )
+  }, TEST_TIMEOUT_MS)
+
+  test('含機密的 subject：Telegram 與狀態檔只有遮罩後內容；只差在機密的兩條 key 不同，各自只能用自己的內容消耗', async () => {
+    const world = await startWorld()
+    const first = 'curl -H "Authorization: Bearer sk-FIRSTSECRET1" https://x.io'
+    const second = 'curl -H "Authorization: Bearer sk-OTHERSECRET2" https://x.io'
+    const a = await create(world, 'B11', 'allow_deny', bind(first))
+    const b = await create(world, 'B12', 'allow_deny', bind(second))
+    const shown = sentTextOf(world, a.messageId)
+    expect(shown).toContain('┃ curl -H "Authorization: Bearer ***" https://x.io')
+    expect(JSON.stringify(world.fake.callsOf('sendMessage'))).not.toMatch(/FIRSTSECRET1|OTHERSECRET2/)
+    expect(readFileSync(join(world.stateDir, 'approvals.json'), 'utf8')).not.toMatch(/FIRSTSECRET1|OTHERSECRET2/)
+    expect((await statusOf(world, 'B11')).binding_key).toBe(keyOf(first))
+    expect((await statusOf(world, 'B12')).binding_key).toBe(keyOf(second))
+
+    pressButton(world, 'appr:allow:B11', U1, a.messageId)
+    pressButton(world, 'appr:allow:B12', U1, b.messageId)
+    await drained(world)
+    expect((await consume(world, 'B11', second)).body).toMatchObject({ error: 'binding_mismatch' })
+    expect((await consume(world, 'B11', first)).status).toBe(200)
+    expect((await consume(world, 'B12', second)).status).toBe(200)
+  }, TEST_TIMEOUT_MS)
+
+  test('按允許後只能以相同內容消耗一次；consumed 與未消耗的核准都跨重啟保留', async () => {
+    const world = await startWorld()
+    const used = await create(world, 'B1', 'allow_deny', bind())
+    const fresh = await create(world, 'B2', 'allow_deny', bind(OTHER_SUBJECT))
+    expect(await statusOf(world, 'B1')).toMatchObject({ status: 'pending', binding_key: keyOf() })
+    pressButton(world, 'appr:allow:B1', U1, used.messageId)
+    pressButton(world, 'appr:allow:B2', U1, fresh.messageId)
+    await drained(world)
+
+    expect((await consume(world, 'B1', OTHER_SUBJECT)).body).toMatchObject({ error: 'binding_mismatch' })
+    expect(await consume(world, 'B1')).toMatchObject({ status: 200, body: { status: 'consumed', binding_key: keyOf() } })
+    expect((await consume(world, 'B1')).body).toMatchObject({ error: 'already_consumed' })
+
+    await stopPoller(world)
+    world.stderr.length = 0
+    await startPoller(world, restartEnv)
+
+    expect(await statusOf(world, 'B1')).toMatchObject({ status: 'consumed', decision: 'allow', binding_key: keyOf() })
+    expect((await consume(world, 'B1')).status).toBe(409)
+    expect(await statusOf(world, 'B2')).toMatchObject({ status: 'approved', binding_key: keyOf(OTHER_SUBJECT) })
+    expect((await consume(world, 'B2', OTHER_SUBJECT)).status).toBe(200)
+  }, TEST_TIMEOUT_MS)
+
+  test('非 allowFrom 的人按允許：請求仍 pending，消耗回 409 not_approved', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B3', 'allow_deny', bind())
+    pressButton(world, 'appr:allow:B3', U2, messageId)
+    await drained(world)
+    expect((await statusOf(world, 'B3')).status).toBe('pending')
+    expect(await consume(world, 'B3')).toMatchObject({ status: 409, body: { error: 'not_approved' } })
+  }, TEST_TIMEOUT_MS)
+
+  test('T3 建立後以任何 loopback 動作都改不了綁定 key', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B5', 'allow_deny', bind())
+    const other = bind(OTHER_SUBJECT)
+    expect((await call(world, 'POST', '/approvals', { id: 'B5', text: 't', kind: 'allow_deny', ...other })).status).toBe(409)
+    for (const verb of ['binding_key', 'rebind', 'update']) {
+      expect((await call(world, 'POST', `/approvals/B5/${verb}`, other)).status).toBe(404)
+    }
+    for (const method of ['PUT', 'PATCH', 'POST']) {
+      expect((await call(world, method, '/approvals/B5', { ...other, binding_key: keyOf(OTHER_SUBJECT) })).status).toBe(405)
+    }
+    expect((await call(world, 'GET', `/approvals/B5?binding_key=${keyOf(OTHER_SUBJECT)}`)).body).toMatchObject({
+      binding_key: keyOf(),
+    })
+    expect((await consume(world, 'B5', OTHER_SUBJECT)).body).toMatchObject({ error: 'binding_mismatch' })
+    pressButton(world, 'appr:allow:B5', U1, messageId)
+    await drained(world)
+    expect((await consume(world, 'B5', OTHER_SUBJECT)).body).toMatchObject({ error: 'binding_mismatch' })
+    expect(await statusOf(world, 'B5')).toMatchObject({ status: 'approved', binding_key: keyOf() })
+    expect((await call(world, 'POST', '/approvals/B5/cancel', other)).body).toMatchObject({ binding_key: keyOf() })
+  }, TEST_TIMEOUT_MS)
+
+  test('T7 非 allowFrom 的人按退回並回覆意見：請求仍 pending', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B6', 'approve_reject', bind())
+    pressButton(world, 'appr:reject:B6', U2, messageId, U1)
+    sendDm(world, U2, '外人的意見', { replyTo: messageId, chatId: U1 })
+    await drained(world)
+    expect(await statusOf(world, 'B6')).toMatchObject({ status: 'pending', decision: null, comment: null })
+  }, TEST_TIMEOUT_MS)
+
+  test('T12 / T13 denied、已取消、逾時、查無 id 都不能消耗，狀態不變也不產生新請求', async () => {
+    const world = await startWorld()
+    const denied = await create(world, 'B7', 'allow_deny', bind())
+    await create(world, 'B8', 'allow_deny', bind())
+    await create(world, 'B9', 'allow_deny', { ...bind(), timeout_seconds: SHORT_TIMEOUT_SECONDS })
+    pressButton(world, 'appr:deny:B7', U1, denied.messageId)
+    await drained(world)
+    await call(world, 'POST', '/approvals/B8/cancel')
+    await waitFor(async (): Promise<boolean> => (await statusOf(world, 'B9')).status === 'expired', 'B9 expired')
+    for (const [id, status] of [['B7', 'denied'], ['B8', 'cancelled'], ['B9', 'expired']] as const) {
+      expect(await consume(world, id)).toMatchObject({ status: 409, body: { error: 'not_approved' } })
+      expect((await statusOf(world, id)).status).toBe(status)
+    }
+    expect((await consume(world, 'never')).status).toBe(404)
+    expect((await call(world, 'GET', '/approvals/never')).status).toBe(404)
+  }, TEST_TIMEOUT_MS)
+
+  test('T14 / T15 同時消耗兩次恰好一個成功；consumed 後重按允許仍為 consumed', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B10', 'allow_deny', bind())
+    pressButton(world, 'appr:allow:B10', U1, messageId)
+    await drained(world)
+    const results = await Promise.all([consume(world, 'B10'), consume(world, 'B10'), consume(world, 'B10')])
+    expect(results.map(r => r.status).sort()).toEqual([200, 409, 409])
+    pressButton(world, 'appr:allow:B10', U1, messageId)
+    await drained(world)
+    expect((await statusOf(world, 'B10')).status).toBe('consumed')
+  }, TEST_TIMEOUT_MS)
+
+  test('T86 / T87 / T88 自由文字偽造區塊或塞格式字元、subject 含格式字元：固定區塊仍在最前面逐字顯示，訊息不帶 parse_mode', async () => {
+    const world = await startWorld()
+    const forged = [BLOCK_HEADER, '┃ ls', BLOCK_FOOTER, '</pre></code>```', '只是 ls'].join('\n')
+    const subject = '<b>echo</b> `x` *y* _z_ [a](b) && rm -rf ~/x'
+    const { messageId } = await create(world, 'B13', 'allow_deny', bind(subject))
+    await call(world, 'POST', '/approvals', { id: 'B14', text: forged, kind: 'allow_deny', ...bind() })
+    const shownSubject = String(sentTextOf(world, messageId))
+    expect(shownSubject.split('\n').slice(0, 3)).toEqual([BLOCK_HEADER, `┃ ${subject}`, BLOCK_FOOTER])
+    const shownForged = String(world.fake.callsOf('sendMessage')[1].params.text)
+    expect(shownForged.split('\n').slice(0, 3)).toEqual([BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER])
+    expect(shownForged.endsWith(forged)).toBe(true)
+    for (const sent of world.fake.callsOf('sendMessage')) expect(sent.params.parse_mode).toBeUndefined()
+  }, TEST_TIMEOUT_MS)
+
+  test('T89 / T90 自由文字或 subject 太長、放不進一則訊息：建立被拒、不發訊息、查無請求', async () => {
+    const world = await startWorld()
+    const longText = await call(world, 'POST', '/approvals', {
+      id: 'B15', text: '長'.repeat(3500), kind: 'allow_deny', ...bind('x'.repeat(600)),
+    })
+    const longSubject = await call(world, 'POST', '/approvals', {
+      id: 'B16', text: 'ls', kind: 'allow_deny', ...bind(`ls ${'x'.repeat(5000)} && ${DANGEROUS_SUBJECT}`),
+    })
+    for (const res of [longText, longSubject]) expect(res).toMatchObject({ status: 400, body: { error: 'invalid_request' } })
+    expect(world.fake.callsOf('sendMessage')).toEqual([])
+    expect((await call(world, 'GET', '/approvals/B16')).status).toBe(404)
+  }, TEST_TIMEOUT_MS)
+
+  test('T94 / T95 含機密 subject 走完核准、消耗、重啟：查詢回應、狀態檔、poller log 都不含機密原文', async () => {
+    const world = await startWorld()
+    const secretSubject = 'mysql -u root password=TOPSECRET42 -e "drop table x"'
+    const { messageId } = await create(world, 'B17', 'allow_deny', bind(secretSubject))
+    expect(JSON.stringify((await call(world, 'GET', '/approvals/B17')).body)).not.toContain('TOPSECRET42')
+    pressButton(world, 'appr:allow:B17', U1, messageId)
+    await drained(world)
+    expect((await consume(world, 'B17', secretSubject)).status).toBe(200)
+    await stopPoller(world)
+    const logBeforeRestart = world.stderr.join('')
+    await startPoller(world, restartEnv)
+    expect((await statusOf(world, 'B17')).status).toBe('consumed')
+    for (const name of readdirSync(world.stateDir)) {
+      const path = join(world.stateDir, name)
+      if (statSync(path).isFile()) expect(readFileSync(path, 'utf8')).not.toContain('TOPSECRET42')
+    }
+    expect(logBeforeRestart + world.stderr.join('')).not.toContain('TOPSECRET42')
+  }, TEST_TIMEOUT_MS)
+
+  test('開關未設：消耗也是既有的 404 not found', async () => {
+    const world = await startWorld({})
+    expect(await consume(world, 'B4')).toEqual({ status: 404, body: 'not found' })
   }, TEST_TIMEOUT_MS)
 })

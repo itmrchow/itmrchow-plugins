@@ -1,27 +1,38 @@
 /**
- * Loopback HTTP interface for approval requests (JP-315): create, query, cancel.
+ * Loopback HTTP interface for approval requests (JP-315): create, query, cancel,
+ * and (JP-374) consume a bound approval once.
  *
  * There is no route that writes a decision, and there must never be one — the
- * decision comes from Telegram only. See approval-store.ts.
+ * decision comes from Telegram only. Consume only turns `approved` into
+ * `consumed`. See approval-store.ts.
  *
  * Mounted onto the poller's existing subscription server instead of opening a
  * second port, by wrapping its request listener: subscribe-server.ts is shared
  * byte-for-byte with the discord plugin, and this feature is telegram-only.
  */
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
+import {
+  BINDING_SESSION_PATTERN,
+  BINDING_SESSION_RE,
+  composeMessageText,
+  renderBindingDisplay,
+  type ApprovalBinding,
+} from './approval-binding'
 import { isValidTimeoutSeconds } from './approval-config'
 import {
   APPROVAL_ID_PATTERN,
   APPROVAL_ID_RE,
   MAX_APPROVAL_TEXT_LENGTH,
+  TELEGRAM_MESSAGE_LIMIT,
   type ApprovalService,
   type CreateApprovalError,
   type CreateApprovalInput,
 } from './approval-service'
-import { ACTIONS_BY_KIND, type ApprovalKind, type ApprovalRequest } from './approval-store'
+import { ACTIONS_BY_KIND, type ApprovalKind, type ApprovalRequest, type ConsumeOutcome } from './approval-store'
 
 export const APPROVALS_PATH = '/approvals'
 const CANCEL_SEGMENT = 'cancel'
+const CONSUME_SEGMENT = 'consume'
 /** A request body is one small JSON object; the text cap is 3500 characters. */
 const MAX_BODY_BYTES = 32_768
 /** Any absolute base works — only the path is read back out. */
@@ -44,7 +55,20 @@ const CREATE_ERROR_STATUS: Readonly<Record<CreateApprovalError, number>> = {
   telegram_send_failed: HTTP_BAD_GATEWAY,
 }
 
-/** What a caller sees of a request. Message ids and chat ids stay inside the poller. */
+type ConsumeRefusal = Exclude<ConsumeOutcome['outcome'], 'consumed' | 'not_found'>
+const CONSUME_REFUSAL_STATUS: Readonly<Record<ConsumeRefusal, number>> = {
+  binding_mismatch: HTTP_CONFLICT,
+  already_consumed: HTTP_CONFLICT,
+  not_approved: HTTP_CONFLICT,
+  persist_failed: HTTP_SERVICE_UNAVAILABLE,
+}
+
+/**
+ * What a caller sees of a request. Message ids and chat ids stay inside the poller.
+ * `binding_key` (derived by the poller) is present only for a bound request, so
+ * an unbound request reads exactly as it did before JP-374. The subject itself
+ * is never returned.
+ */
 export type ApprovalView = {
   id: string
   kind: ApprovalKind
@@ -54,11 +78,19 @@ export type ApprovalView = {
   created_at_ms: number
   expires_at_ms: number
   resolved_at_ms: number | null
+  binding_key?: string
 }
 
 export type ApprovalHttpDefaults = { timeoutSeconds: number; commentTimeoutSeconds: number }
 
 type ParsedCreate = { ok: true; input: CreateApprovalInput } | { ok: false; detail: string }
+type ParsedConsume = { ok: true; binding: ApprovalBinding } | { ok: false; detail: string }
+type ParsedBinding = { ok: true; binding: ApprovalBinding | null } | { ok: false; detail: string }
+
+const BINDING_REQUIRED_DETAIL = 'binding_session and binding_subject are required'
+const BINDING_SESSION_DETAIL = `binding_session must match ${BINDING_SESSION_PATTERN}`
+const BINDING_SUBJECT_DETAIL = 'binding_subject must be a non-empty string'
+const MESSAGE_TOO_LONG_DETAIL = `text and binding_subject together must fit in one Telegram message (${TELEGRAM_MESSAGE_LIMIT} characters)`
 
 /**
  * Reduce a stored request to what a caller may see.
@@ -76,6 +108,7 @@ export function toApprovalView(request: ApprovalRequest): ApprovalView {
     created_at_ms: request.createdAtMs,
     expires_at_ms: request.expiresAtMs,
     resolved_at_ms: request.resolvedAtMs,
+    ...(request.bindingKey === null ? {} : { binding_key: request.bindingKey }),
   }
 }
 
@@ -88,16 +121,8 @@ export function toApprovalView(request: ApprovalRequest): ApprovalView {
  * @returns The typed input, or what was wrong.
  */
 export function parseCreateBody(raw: string, defaults: ApprovalHttpDefaults): ParsedCreate {
-  let body: unknown
-  try {
-    body = JSON.parse(raw)
-  } catch {
-    return { ok: false, detail: 'body is not valid JSON' }
-  }
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    return { ok: false, detail: 'body must be a JSON object' }
-  }
-  const fields = body as Record<string, unknown>
+  const fields = parseJsonObject(raw)
+  if (typeof fields === 'string') return { ok: false, detail: fields }
   const { id, text, kind } = fields
   if (typeof id !== 'string' || !APPROVAL_ID_RE.test(id)) {
     return { ok: false, detail: `id must match ${APPROVAL_ID_PATTERN}` }
@@ -115,12 +140,57 @@ export function parseCreateBody(raw: string, defaults: ApprovalHttpDefaults): Pa
   if (!isValidTimeoutSeconds(commentTimeoutSeconds)) {
     return { ok: false, detail: 'comment_timeout_seconds is out of range' }
   }
-  return { ok: true, input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds } }
+  const parsedBinding = parseBindingFields(fields, false)
+  if (!parsedBinding.ok) return parsedBinding
+  const { binding } = parsedBinding
+  // The message the user approves on must be whole: refuse rather than cut it.
+  if (binding !== null && composeMessageText(renderBindingDisplay(binding.subject), text).length > TELEGRAM_MESSAGE_LIMIT) {
+    return { ok: false, detail: MESSAGE_TOO_LONG_DETAIL }
+  }
+  return { ok: true, input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds, binding } }
+}
+
+/**
+ * Validate a consume body: `binding_session` and `binding_subject`, both
+ * required; anything else is ignored.
+ *
+ * @param raw - Request body text.
+ * @returns The binding, or what was wrong.
+ */
+export function parseConsumeBody(raw: string): ParsedConsume {
+  const fields = parseJsonObject(raw)
+  if (typeof fields === 'string') return { ok: false, detail: fields }
+  const parsedBinding = parseBindingFields(fields, true)
+  if (!parsedBinding.ok) return parsedBinding
+  if (parsedBinding.binding === null) return { ok: false, detail: BINDING_REQUIRED_DETAIL }
+  return { ok: true, binding: parsedBinding.binding }
 }
 
 function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
   res.writeHead(status, { 'content-type': 'application/json' })
   res.end(JSON.stringify(body))
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | string {
+  let body: unknown
+  try {
+    body = JSON.parse(raw)
+  } catch {
+    return 'body is not valid JSON'
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return 'body must be a JSON object'
+  return body as Record<string, unknown>
+}
+
+/** Both binding fields or neither; `required` makes neither an error. */
+function parseBindingFields(fields: Record<string, unknown>, required: boolean): ParsedBinding {
+  const { binding_session: session, binding_subject: subject } = fields
+  if (session === undefined && subject === undefined) {
+    return required ? { ok: false, detail: BINDING_REQUIRED_DETAIL } : { ok: true, binding: null }
+  }
+  if (typeof session !== 'string' || !BINDING_SESSION_RE.test(session)) return { ok: false, detail: BINDING_SESSION_DETAIL }
+  if (typeof subject !== 'string' || subject.trim() === '') return { ok: false, detail: BINDING_SUBJECT_DETAIL }
+  return { ok: true, binding: { session, subject } }
 }
 
 function readBody(req: IncomingMessage): Promise<string | null> {
@@ -176,18 +246,36 @@ export function createApprovalHandler(
     sendJson(res, HTTP_OK, toApprovalView(request))
   }
 
+  const handleConsume = async (req: IncomingMessage, res: ServerResponse, id: string): Promise<void> => {
+    const raw = await readBody(req)
+    if (raw === null) return sendJson(res, HTTP_BAD_REQUEST, { error: 'invalid_request', detail: 'body too large' })
+    const parsed = parseConsumeBody(raw)
+    if (!parsed.ok) return sendJson(res, HTTP_BAD_REQUEST, { error: 'invalid_request', detail: parsed.detail })
+    const result = service.consume(id, parsed.binding)
+    if (result.outcome === 'not_found') return sendJson(res, HTTP_NOT_FOUND, { error: 'not_found' })
+    if (result.outcome === 'consumed') return sendJson(res, HTTP_OK, toApprovalView(result.request))
+    sendJson(res, CONSUME_REFUSAL_STATUS[result.outcome], {
+      error: result.outcome,
+      request: toApprovalView(result.request),
+    })
+  }
+
   const dispatch = async (req: IncomingMessage, res: ServerResponse, segments: string[]): Promise<void> => {
     const [id, verb, ...rest] = segments
     if (id === undefined) {
       if (req.method !== 'POST') return sendJson(res, HTTP_METHOD_NOT_ALLOWED, { error: 'method_not_allowed' })
       return handleCreate(req, res)
     }
-    if (rest.length > 0 || (verb !== undefined && verb !== CANCEL_SEGMENT)) {
+    if (rest.length > 0 || (verb !== undefined && verb !== CANCEL_SEGMENT && verb !== CONSUME_SEGMENT)) {
       return sendJson(res, HTTP_NOT_FOUND, { error: 'not_found' })
     }
     if (verb === CANCEL_SEGMENT) {
       if (req.method !== 'POST') return sendJson(res, HTTP_METHOD_NOT_ALLOWED, { error: 'method_not_allowed' })
       return handleCancel(res, id)
+    }
+    if (verb === CONSUME_SEGMENT) {
+      if (req.method !== 'POST') return sendJson(res, HTTP_METHOD_NOT_ALLOWED, { error: 'method_not_allowed' })
+      return handleConsume(req, res, id)
     }
     if (req.method !== 'GET') return sendJson(res, HTTP_METHOD_NOT_ALLOWED, { error: 'method_not_allowed' })
     handleGet(res, id)

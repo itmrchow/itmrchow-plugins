@@ -7,11 +7,12 @@
  * against a fake in tests.
  *
  * Two entry points, on purpose kept apart:
- * - create / get / cancel — reachable from the loopback interface;
+ * - create / get / cancel / consume — reachable from the loopback interface;
  * - interceptUpdate — reachable only from the getUpdates loop.
  * Only the second one can produce a decision.
  */
 import type { Update } from 'grammy/types'
+import { composeMessageText, computeBindingKey, renderBindingDisplay, type ApprovalBinding } from './approval-binding'
 import {
   ACTIONS_BY_KIND,
   ALL_ACTIONS,
@@ -19,6 +20,7 @@ import {
   type ApprovalKind,
   type ApprovalRequest,
   type ApprovalStore,
+  type ConsumeOutcome,
   type SentMessage,
 } from './approval-store'
 
@@ -30,7 +32,7 @@ export const APPROVAL_ID_RE = new RegExp(`^${APPROVAL_ID_PATTERN}$`)
 const CALLBACK_RE = new RegExp(`^${APPROVAL_CALLBACK_PREFIX}(${ALL_ACTIONS.join('|')}):(${APPROVAL_ID_PATTERN})$`)
 
 /** Telegram caps a message at 4096 UTF-16 code units. */
-const TELEGRAM_MESSAGE_LIMIT = 4096
+export const TELEGRAM_MESSAGE_LIMIT = 4096
 /** Display text cap; the remainder is kept free for the outcome line and comment. */
 export const MAX_APPROVAL_TEXT_LENGTH = 3500
 /** Requests held at once (settled ones included) before create is refused. */
@@ -90,6 +92,8 @@ export type CreateApprovalInput = {
   text: string
   timeoutSeconds: number
   commentTimeoutSeconds: number
+  /** What the approval is bound to (JP-374); null = unbound, never consumable. */
+  binding: ApprovalBinding | null
 }
 
 export type CreateApprovalError = 'duplicate_id' | 'no_recipient' | 'telegram_send_failed' | 'too_many_requests'
@@ -125,6 +129,16 @@ export type ApprovalService = {
   sweep: () => Promise<void>
   /** Start the background sweep. @returns A function that stops it. */
   start: () => () => void
+  /**
+   * Use up an approved, bound request once, with the clock applied first.
+   * Never produces `approved`, never calls the Bot API before answering.
+   *
+   * @param id - Request id.
+   * @param binding - Session and subject of what the caller is about to do; the
+   *   key is derived from them and compared with the one stored at create.
+   * @returns The store's outcome; only `consumed` means the caller may act.
+   */
+  consume: (id: string, binding: ApprovalBinding) => ConsumeOutcome
 }
 
 function buttonsFor(request: Pick<ApprovalRequest, 'id' | 'kind'>): ApprovalButton[] {
@@ -146,13 +160,15 @@ function outcomeLabel(request: ApprovalRequest): string {
 
 /**
  * The text a request message shows once it is no longer plain pending: the
- * original text followed by its outcome, cut to Telegram's message limit.
+ * message as first sent (binding block, then free text) followed by its
+ * outcome, cut to Telegram's message limit. The binding block comes first, so
+ * a cut never reaches it.
  *
  * @param request - The request in its current state.
  * @returns Message text.
  */
 export function renderApprovalText(request: ApprovalRequest): string {
-  const rendered = `${request.text}\n\n${outcomeLabel(request)}`
+  const rendered = `${composeMessageText(request.bindingDisplay, request.text)}\n\n${outcomeLabel(request)}`
   if (rendered.length <= TELEGRAM_MESSAGE_LIMIT) return rendered
   return `${rendered.slice(0, TELEGRAM_MESSAGE_LIMIT - TRUNCATION_MARK.length)}${TRUNCATION_MARK}`
 }
@@ -211,10 +227,15 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     creating.add(input.id)
     try {
       const buttons = buttonsFor(input)
+      // The raw subject goes no further than this function: hashed into the
+      // key, masked into the display, never stored.
+      const bindingKey = input.binding === null ? null : computeBindingKey(input.binding)
+      const bindingDisplay = input.binding === null ? null : renderBindingDisplay(input.binding.subject)
+      const messageText = composeMessageText(bindingDisplay, input.text)
       const messages: SentMessage[] = []
       for (const chatId of recipients) {
         try {
-          messages.push({ chatId, messageId: await api.sendRequest(chatId, input.text, buttons) })
+          messages.push({ chatId, messageId: await api.sendRequest(chatId, messageText, buttons) })
         } catch (err) {
           log(`telegram poller: approval ${input.id} send to ${chatId} failed: ${err}`)
         }
@@ -227,6 +248,8 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
         id: input.id,
         kind: input.kind,
         text: input.text,
+        bindingKey,
+        bindingDisplay,
         createdAtMs,
         expiresAtMs: createdAtMs + input.timeoutSeconds * MS_PER_SECOND,
         commentTimeoutMs: input.commentTimeoutSeconds * MS_PER_SECOND,
@@ -341,5 +364,13 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     return () => clearInterval(timer)
   }
 
-  return { create, get, cancel, interceptUpdate, sweep, start }
+  // Like get(): the clock is applied first, but messages of whatever just
+  // timed out are rewritten in the background, so the answer does not wait on
+  // Telegram.
+  const consume = (id: string, binding: ApprovalBinding): ConsumeOutcome => {
+    for (const request of store.sweep()) void rewriteMessages(request)
+    return store.consume(id, computeBindingKey(binding))
+  }
+
+  return { create, get, cancel, interceptUpdate, sweep, start, consume }
 }

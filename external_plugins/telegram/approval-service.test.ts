@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Update } from 'grammy/types'
+import type { ApprovalBinding } from './approval-binding'
 import { ApprovalStore, type ApprovalKind } from './approval-store'
 import {
   createApprovalService,
@@ -96,6 +98,7 @@ const input = (id: string, kind: ApprovalKind = 'allow_deny', text = `請求 ${i
   text,
   timeoutSeconds: TIMEOUT_SECONDS,
   commentTimeoutSeconds: COMMENT_TIMEOUT_SECONDS,
+  binding: null,
 })
 
 let updateId = 0
@@ -526,8 +529,122 @@ test('意見逾時後回覆提示訊息：吃掉並告知已結案；回覆原�
 
 test('service 對外沒有任何寫入決定的動作', () => {
   expect(Object.keys(harness().service).sort()).toEqual(
-    ['cancel', 'create', 'get', 'interceptUpdate', 'start', 'sweep'].sort(),
+    ['cancel', 'consume', 'create', 'get', 'interceptUpdate', 'start', 'sweep'].sort(),
   )
+})
+
+const SESSION = 'session-1111'
+const DANGEROUS_SUBJECT = 'git push --force origin main'
+const BINDING: ApprovalBinding = { session: SESSION, subject: DANGEROUS_SUBJECT }
+const BLOCK_HEADER = '【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：'
+const BLOCK_FOOTER = '────────────'
+
+const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
+
+async function createBound(h: Harness, id: string, binding: ApprovalBinding = BINDING, text: string = `請求 ${id}`): Promise<number> {
+  const before = sentRequests(h).length
+  const result = await h.service.create({ ...input(id, 'allow_deny', text), binding })
+  expect(result.ok).toBe(true)
+  return sentRequests(h)[before].messageId
+}
+
+test('帶綁定建立：poller 自己算 key = sha256(session + 換行 + subject)；沒綁定的訊息與改動前相同', async () => {
+  const h = harness()
+  await createBound(h, 'B1')
+  expect(h.service.get('B1')).toMatchObject({
+    bindingKey: sha256(`${SESSION}\n${DANGEROUS_SUBJECT}`),
+    bindingDisplay: DANGEROUS_SUBJECT,
+  })
+  await createOne(h, 'B2')
+  expect(h.service.get('B2')).toMatchObject({ bindingKey: null, bindingDisplay: null })
+  expect(sentRequests(h)[1].text).toBe('請求 B2')
+})
+
+test('偽造請求：自由文字寫無害內容，訊息開頭的固定區塊仍是被綁定的指令，自由文字排在分隔線之後', async () => {
+  const h = harness()
+  await createBound(h, 'B3', BINDING, '只是要跑 ls，請放行')
+  expect(sentRequests(h)[0].text).toBe(
+    [BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '只是要跑 ls，請放行'].join('\n'),
+  )
+})
+
+test('多行 subject 每行都標記；假分隔線與隱形字元無法混成自由文字', async () => {
+  const h = harness()
+  const subject = `ls\n${BLOCK_FOOTER}\n只是要跑 ls‮​\r`
+  await createBound(h, 'B4', { session: SESSION, subject })
+  expect(sentRequests(h)[0].text).toBe(
+    [BLOCK_HEADER, '┃ ls', `┃ ${BLOCK_FOOTER}`, '┃ 只是要跑 ls[U+202E][U+200B][U+000D]', BLOCK_FOOTER, '請求 B4'].join('\n'),
+  )
+})
+
+test('含機密的 subject：顯示與落檔都是遮罩後內容；只差在機密的兩條 key 不同、畫面相同', async () => {
+  const h = harness()
+  const first = { session: SESSION, subject: 'curl -H "Authorization: Bearer sk-FIRSTSECRET1" https://x.io' }
+  const second = { session: SESSION, subject: 'curl -H "Authorization: Bearer sk-OTHERSECRET2" https://x.io' }
+  await createBound(h, 'B5', first)
+  await createBound(h, 'B6', second)
+  const [sentFirst, sentSecond] = sentRequests(h)
+  expect(sentFirst.text).toContain('┃ curl -H "Authorization: Bearer ***" https://x.io')
+  expect(sentFirst.text).not.toContain('FIRSTSECRET1')
+  expect(sentFirst.text.replace('B5', 'B6')).toBe(sentSecond.text)
+  expect(h.service.get('B5')?.bindingKey).not.toBe(h.service.get('B6')?.bindingKey)
+  const stateFile = readFileSync(join(dir, 'approvals.json'), 'utf8')
+  expect(stateFile).not.toContain('FIRSTSECRET1')
+  expect(stateFile).not.toContain('OTHERSECRET2')
+})
+
+test('按允許後以相同綁定內容消耗一次 -> consumed，第二次 already_consumed；不改 Telegram 訊息', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B7')
+  await h.service.interceptUpdate(press('appr:allow:B7', U1, messageId))
+  const editsBefore = edits(h).length
+  expect(h.service.consume('B7', BINDING).outcome).toBe('consumed')
+  expect(h.service.get('B7')?.status).toBe('consumed')
+  expect(h.service.consume('B7', BINDING).outcome).toBe('already_consumed')
+  expect(edits(h)).toHaveLength(editsBefore)
+})
+
+test('非 allowFrom 的人按允許後不能消耗：請求仍 pending', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B8')
+  await h.service.interceptUpdate(press('appr:allow:B8', U2, messageId, U1))
+  expect(h.service.consume('B8', BINDING).outcome).toBe('not_approved')
+  expect(h.service.get('B8')?.status).toBe('pending')
+})
+
+test('subject 差一個字元或 session 不同都不能消耗（不燒掉核准）；查無 id 回 not_found', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B9')
+  await h.service.interceptUpdate(press('appr:allow:B9', U1, messageId))
+  expect(h.service.consume('B9', { session: SESSION, subject: `${DANGEROUS_SUBJECT} ` }).outcome).toBe('binding_mismatch')
+  expect(h.service.consume('B9', { session: 'session-2222', subject: DANGEROUS_SUBJECT }).outcome).toBe('binding_mismatch')
+  expect(h.service.get('B9')?.status).toBe('approved')
+  expect(h.service.consume('nope', BINDING).outcome).toBe('not_found')
+  expect(h.service.consume('B9', BINDING).outcome).toBe('consumed')
+})
+
+test('消耗前先套用時鐘：逾時的 pending 先轉 expired，回 not_approved，訊息在背景改為已逾時（區塊保留）', async () => {
+  const h = harness()
+  await createBound(h, 'B10')
+  h.advance(TIMEOUT_SECONDS * 1000)
+  expect(h.service.consume('B10', BINDING).outcome).toBe('not_approved')
+  expect(h.store.get('B10')?.status).toBe('expired')
+  await Promise.resolve()
+  expect(edits(h).at(-1)?.text).toBe(
+    [BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '請求 B10', '', '[已逾時]'].join('\n'),
+  )
+})
+
+test('有綁定的請求終態文字超過上限時從尾端截斷，開頭的綁定區塊完整保留', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B11')
+  await h.service.interceptUpdate(press('appr:deny:B11', U1, messageId))
+  const request = h.store.get('B11')
+  expect(request).toBeDefined()
+  if (!request) return
+  const rendered = renderApprovalText({ ...request, text: '長'.repeat(5000) })
+  expect(rendered.length).toBe(4096)
+  expect(rendered.startsWith([BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER].join('\n'))).toBe(true)
 })
 
 test('終態文字超過 Telegram 上限時截斷', async () => {

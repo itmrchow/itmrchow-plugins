@@ -6,13 +6,20 @@
  * caller-supplied value. The only ways a request leaves `pending` are a button
  * press, a written comment, a cancel and the clock — and the first two are only
  * ever called from the Telegram update path. That is what keeps a session from
- * approving its own request: the loopback interface can reach create(), get()
- * and cancel(), none of which can produce `approved`.
+ * approving its own request: the loopback interface can reach create(), get(),
+ * cancel() and consume(), none of which can produce `approved`.
+ *
+ * consume() (JP-374) only ever moves an approval the other way: an `approved`
+ * request created with a binding becomes `consumed` the first time a caller
+ * presents the same key, so one approval authorises one command, once. It is
+ * also the one transition that reports a failed save to its caller, because
+ * rolling it back would bring an approval back to life.
  *
  * IO is limited to the one state file, so every transition can be pinned by
  * plain tests with an injected clock.
  */
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 export type ApprovalKind = 'allow_deny' | 'approve_reject'
 export type ApprovalAction = 'allow' | 'deny' | 'approve' | 'reject'
@@ -23,6 +30,8 @@ export type ApprovalStatus =
   | 'denied'
   | 'cancelled'
   | 'expired'
+  /** Approved, then used up through consume(). Final. */
+  | 'consumed'
 
 /** One Telegram message this request owns. */
 export type SentMessage = { chatId: number; messageId: number }
@@ -31,6 +40,10 @@ export type ApprovalRequest = {
   id: string
   kind: ApprovalKind
   text: string
+  /** Key the approval is bound to, derived by the poller (JP-374); null when created without a binding. */
+  bindingKey: string | null
+  /** The bound content as shown to the user, secrets masked; null exactly when bindingKey is. */
+  bindingDisplay: string | null
   status: ApprovalStatus
   /** The button that settled it; null until one does, and for cancelled / expired. */
   decision: ApprovalAction | null
@@ -50,7 +63,7 @@ export type ApprovalRequest = {
 
 export type NewApproval = Pick<
   ApprovalRequest,
-  'id' | 'kind' | 'text' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
+  'id' | 'kind' | 'text' | 'bindingKey' | 'bindingDisplay' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
 >
 
 export type PressOutcome =
@@ -59,6 +72,13 @@ export type PressOutcome =
 
 export type CancelOutcome =
   | { outcome: 'cancelled' | 'unchanged'; request: ApprovalRequest }
+  | { outcome: 'not_found' }
+
+export type ConsumeOutcome =
+  | {
+      outcome: 'consumed' | 'binding_mismatch' | 'already_consumed' | 'not_approved' | 'persist_failed'
+      request: ApprovalRequest
+    }
   | { outcome: 'not_found' }
 
 /** Buttons each kind offers; a press outside this set is forged or stale. */
@@ -70,7 +90,7 @@ export const ACTIONS_BY_KIND: Readonly<Record<ApprovalKind, readonly ApprovalAct
 const APPROVING_ACTIONS: ReadonlySet<ApprovalAction> = new Set(['allow', 'approve'])
 const OPEN_STATUSES: ReadonlySet<ApprovalStatus> = new Set(['pending', 'awaiting_comment'])
 const ALL_STATUSES: ReadonlySet<string> = new Set([
-  'pending', 'awaiting_comment', 'approved', 'denied', 'cancelled', 'expired',
+  'pending', 'awaiting_comment', 'approved', 'denied', 'cancelled', 'expired', 'consumed',
 ])
 /** Every button there is, derived from the kinds so the two cannot drift apart. */
 export const ALL_ACTIONS: readonly ApprovalAction[] = Object.values(ACTIONS_BY_KIND).flat()
@@ -110,6 +130,11 @@ function isNumberOrNull(value: unknown): value is number | null {
   return value === null || typeof value === 'number'
 }
 
+/** Fields added after JP-315 may be missing from an older state file. */
+function isOptionalStringOrNull(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'string'
+}
+
 function isApprovalRequest(value: unknown): value is ApprovalRequest {
   if (typeof value !== 'object' || value === null) return false
   const request = value as Record<string, unknown>
@@ -117,6 +142,8 @@ function isApprovalRequest(value: unknown): value is ApprovalRequest {
     typeof request.id === 'string' &&
     typeof request.kind === 'string' && Object.hasOwn(ACTIONS_BY_KIND, request.kind) &&
     typeof request.text === 'string' &&
+    isOptionalStringOrNull(request.bindingKey) &&
+    isOptionalStringOrNull(request.bindingDisplay) &&
     typeof request.status === 'string' && ALL_STATUSES.has(request.status) &&
     (request.decision === null || (typeof request.decision === 'string' && KNOWN_ACTIONS.has(request.decision))) &&
     (request.comment === null || typeof request.comment === 'string') &&
@@ -340,6 +367,35 @@ export class ApprovalStore {
     return changed
   }
 
+  /**
+   * Use up an approval: the one way out of `approved`. The key must equal the
+   * one the request was created with, so an approval cannot be borrowed by a
+   * caller presenting a different key, and a request created without a key can
+   * never be consumed.
+   *
+   * Fails closed on a failed save: the request stays `consumed` in memory (it
+   * cannot be used again while this process lives) but the caller is told
+   * `persist_failed`, so it must not act on the approval. A restart may then
+   * bring the request back as `approved` from the last saved state — still
+   * used at most once, since no caller ever got `consumed` for it.
+   *
+   * @param id - Request id.
+   * @param bindingKey - Key derived from what the caller is about to do (approval-binding.ts).
+   * @returns `consumed` only when the request just turned `consumed` and that
+   *   is on disk; `persist_failed` when it turned `consumed` but the save
+   *   failed; anything else left the request untouched.
+   */
+  consume(id: string, bindingKey: string): ConsumeOutcome {
+    const request = this.#requests.get(id)
+    if (!request) return { outcome: 'not_found' }
+    if (request.bindingKey !== bindingKey) return { outcome: 'binding_mismatch', request }
+    if (request.status === 'consumed') return { outcome: 'already_consumed', request }
+    if (request.status !== 'approved') return { outcome: 'not_approved', request }
+    request.status = 'consumed'
+    if (!this.#save()) return { outcome: 'persist_failed', request }
+    return { outcome: 'consumed', request }
+  }
+
   #load(): void {
     if (!existsSync(this.#filePath)) return
     try {
@@ -348,7 +404,14 @@ export class ApprovalStore {
         throw new Error('unexpected shape')
       }
       if (!parsed.requests.every(isApprovalRequest)) throw new Error('invalid request entry')
-      for (const request of parsed.requests) this.#requests.set(request.id, request)
+      // Files written before JP-374 carry no binding fields: those requests are unbound.
+      for (const request of parsed.requests) {
+        this.#requests.set(request.id, {
+          ...request,
+          bindingKey: request.bindingKey ?? null,
+          bindingDisplay: request.bindingDisplay ?? null,
+        })
+      }
     } catch (err) {
       // Starting empty is the safe direction: a request nobody can find is
       // answered "not found", never "approved". The bad file is moved aside
@@ -362,24 +425,42 @@ export class ApprovalStore {
     }
   }
 
-  // Synchronous and atomic (tmp + rename), and called before the Telegram
-  // message is rewritten: in the normal case a decision is on disk before the
-  // user is shown it, so a crash in between cannot bring it back as pending.
+  // Synchronous and atomic (tmp + fsync + rename + fsync of the directory),
+  // and called before the Telegram message is rewritten: in the normal case a
+  // decision is on disk before the user is shown it, so a crash or power loss
+  // in between cannot bring it back as pending.
   //
-  // A failed write (disk full, permissions) is only logged: the decision stands
-  // in memory and the message is still rewritten. If the poller then restarts,
-  // that request comes back in its last saved state — never as approved, since
-  // nothing but a button press writes that. There is no fsync either, so power
-  // loss can likewise roll a request back to its previous saved state.
-  #save(): void {
+  // A failed write (disk full, permissions) is logged and reported as false.
+  // Every transition except consume() ignores that: the decision stands in
+  // memory and the message is still rewritten, and if the poller then restarts
+  // the request comes back in its last saved state, which for those
+  // transitions is never more permissive (nothing but a button press writes
+  // `approved`). consume() is the exception — its last saved state is
+  // `approved` — so it hands the failure to its caller instead.
+  #save(): boolean {
     const state: StateFile = { version: STATE_FILE_VERSION, requests: [...this.#requests.values()] }
     const tmp = `${this.#filePath}.tmp`
     try {
-      writeFileSync(tmp, JSON.stringify(state), { mode: STATE_FILE_MODE })
+      const fd = openSync(tmp, 'w', STATE_FILE_MODE)
+      try {
+        writeFileSync(fd, JSON.stringify(state))
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
       chmodSync(tmp, STATE_FILE_MODE)
       renameSync(tmp, this.#filePath)
+      // The rename itself lives in the directory entry.
+      const dirFd = openSync(dirname(this.#filePath), 'r')
+      try {
+        fsyncSync(dirFd)
+      } finally {
+        closeSync(dirFd)
+      }
+      return true
     } catch (err) {
       this.#log(`telegram poller: approvals state save failed: ${err}`)
+      return false
     }
   }
 }
