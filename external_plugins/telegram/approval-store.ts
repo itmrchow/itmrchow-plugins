@@ -10,8 +10,8 @@
  * cancel() and consume(), none of which can produce `approved`.
  *
  * consume() (JP-374) only ever moves an approval the other way: an `approved`
- * request created with a binding key becomes `consumed` the first time a caller
- * presents that same key, so one approval authorises one command, once. It is
+ * request created with a binding becomes `consumed` the first time a caller
+ * presents the same key, so one approval authorises one command, once. It is
  * also the one transition that reports a failed save to its caller, because
  * rolling it back would bring an approval back to life.
  *
@@ -40,8 +40,10 @@ export type ApprovalRequest = {
   id: string
   kind: ApprovalKind
   text: string
-  /** Caller-supplied key the approval is bound to (JP-374); null when created without one. */
+  /** Key the approval is bound to, derived by the poller (JP-374); null when created without a binding. */
   bindingKey: string | null
+  /** The bound content as shown to the user, secrets masked; null exactly when bindingKey is. */
+  bindingDisplay: string | null
   status: ApprovalStatus
   /** The button that settled it; null until one does, and for cancelled / expired. */
   decision: ApprovalAction | null
@@ -61,7 +63,7 @@ export type ApprovalRequest = {
 
 export type NewApproval = Pick<
   ApprovalRequest,
-  'id' | 'kind' | 'text' | 'bindingKey' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
+  'id' | 'kind' | 'text' | 'bindingKey' | 'bindingDisplay' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
 >
 
 export type PressOutcome =
@@ -128,6 +130,11 @@ function isNumberOrNull(value: unknown): value is number | null {
   return value === null || typeof value === 'number'
 }
 
+/** Fields added after JP-315 may be missing from an older state file. */
+function isOptionalStringOrNull(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'string'
+}
+
 function isApprovalRequest(value: unknown): value is ApprovalRequest {
   if (typeof value !== 'object' || value === null) return false
   const request = value as Record<string, unknown>
@@ -135,7 +142,8 @@ function isApprovalRequest(value: unknown): value is ApprovalRequest {
     typeof request.id === 'string' &&
     typeof request.kind === 'string' && Object.hasOwn(ACTIONS_BY_KIND, request.kind) &&
     typeof request.text === 'string' &&
-    (request.bindingKey === undefined || request.bindingKey === null || typeof request.bindingKey === 'string') &&
+    isOptionalStringOrNull(request.bindingKey) &&
+    isOptionalStringOrNull(request.bindingDisplay) &&
     typeof request.status === 'string' && ALL_STATUSES.has(request.status) &&
     (request.decision === null || (typeof request.decision === 'string' && KNOWN_ACTIONS.has(request.decision))) &&
     (request.comment === null || typeof request.comment === 'string') &&
@@ -372,7 +380,7 @@ export class ApprovalStore {
    * used at most once, since no caller ever got `consumed` for it.
    *
    * @param id - Request id.
-   * @param bindingKey - The key the caller computed for what it is about to do.
+   * @param bindingKey - Key derived from what the caller is about to do (approval-binding.ts).
    * @returns `consumed` only when the request just turned `consumed` and that
    *   is on disk; `persist_failed` when it turned `consumed` but the save
    *   failed; anything else left the request untouched.
@@ -396,8 +404,14 @@ export class ApprovalStore {
         throw new Error('unexpected shape')
       }
       if (!parsed.requests.every(isApprovalRequest)) throw new Error('invalid request entry')
-      // Files written before JP-374 carry no bindingKey: those requests are unbound.
-      for (const request of parsed.requests) this.#requests.set(request.id, { ...request, bindingKey: request.bindingKey ?? null })
+      // Files written before JP-374 carry no binding fields: those requests are unbound.
+      for (const request of parsed.requests) {
+        this.#requests.set(request.id, {
+          ...request,
+          bindingKey: request.bindingKey ?? null,
+          bindingDisplay: request.bindingDisplay ?? null,
+        })
+      }
     } catch (err) {
       // Starting empty is the safe direction: a request nobody can find is
       // answered "not found", never "approved". The bad file is moved aside

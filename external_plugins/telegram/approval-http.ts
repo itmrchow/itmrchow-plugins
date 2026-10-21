@@ -11,13 +11,19 @@
  * byte-for-byte with the discord plugin, and this feature is telegram-only.
  */
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
+import {
+  BINDING_SESSION_PATTERN,
+  BINDING_SESSION_RE,
+  composeMessageText,
+  renderBindingDisplay,
+  type ApprovalBinding,
+} from './approval-binding'
 import { isValidTimeoutSeconds } from './approval-config'
 import {
   APPROVAL_ID_PATTERN,
   APPROVAL_ID_RE,
-  BINDING_KEY_PATTERN,
-  BINDING_KEY_RE,
   MAX_APPROVAL_TEXT_LENGTH,
+  TELEGRAM_MESSAGE_LIMIT,
   type ApprovalService,
   type CreateApprovalError,
   type CreateApprovalInput,
@@ -59,8 +65,9 @@ const CONSUME_REFUSAL_STATUS: Readonly<Record<ConsumeRefusal, number>> = {
 
 /**
  * What a caller sees of a request. Message ids and chat ids stay inside the poller.
- * `binding_key` is present only for a request created with one, so an unbound
- * request reads exactly as it did before JP-374.
+ * `binding_key` (derived by the poller) is present only for a bound request, so
+ * an unbound request reads exactly as it did before JP-374. The subject itself
+ * is never returned.
  */
 export type ApprovalView = {
   id: string
@@ -77,9 +84,13 @@ export type ApprovalView = {
 export type ApprovalHttpDefaults = { timeoutSeconds: number; commentTimeoutSeconds: number }
 
 type ParsedCreate = { ok: true; input: CreateApprovalInput } | { ok: false; detail: string }
-type ParsedConsume = { ok: true; bindingKey: string } | { ok: false; detail: string }
+type ParsedConsume = { ok: true; binding: ApprovalBinding } | { ok: false; detail: string }
+type ParsedBinding = { ok: true; binding: ApprovalBinding | null } | { ok: false; detail: string }
 
-const BINDING_KEY_DETAIL = `binding_key must match ${BINDING_KEY_PATTERN}`
+const BINDING_REQUIRED_DETAIL = 'binding_session and binding_subject are required'
+const BINDING_SESSION_DETAIL = `binding_session must match ${BINDING_SESSION_PATTERN}`
+const BINDING_SUBJECT_DETAIL = 'binding_subject must be a non-empty string'
+const MESSAGE_TOO_LONG_DETAIL = `text and binding_subject together must fit in one Telegram message (${TELEGRAM_MESSAGE_LIMIT} characters)`
 
 /**
  * Reduce a stored request to what a caller may see.
@@ -129,23 +140,30 @@ export function parseCreateBody(raw: string, defaults: ApprovalHttpDefaults): Pa
   if (!isValidTimeoutSeconds(commentTimeoutSeconds)) {
     return { ok: false, detail: 'comment_timeout_seconds is out of range' }
   }
-  const rawBindingKey = fields.binding_key
-  if (rawBindingKey !== undefined && !isBindingKey(rawBindingKey)) return { ok: false, detail: BINDING_KEY_DETAIL }
-  const bindingKey = rawBindingKey ?? null
-  return { ok: true, input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds, bindingKey } }
+  const parsedBinding = parseBindingFields(fields, false)
+  if (!parsedBinding.ok) return parsedBinding
+  const { binding } = parsedBinding
+  // The message the user approves on must be whole: refuse rather than cut it.
+  if (binding !== null && composeMessageText(renderBindingDisplay(binding.subject), text).length > TELEGRAM_MESSAGE_LIMIT) {
+    return { ok: false, detail: MESSAGE_TOO_LONG_DETAIL }
+  }
+  return { ok: true, input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds, binding } }
 }
 
 /**
- * Validate a consume body: one required `binding_key`; anything else is ignored.
+ * Validate a consume body: `binding_session` and `binding_subject`, both
+ * required; anything else is ignored.
  *
  * @param raw - Request body text.
- * @returns The key, or what was wrong.
+ * @returns The binding, or what was wrong.
  */
 export function parseConsumeBody(raw: string): ParsedConsume {
   const fields = parseJsonObject(raw)
   if (typeof fields === 'string') return { ok: false, detail: fields }
-  if (!isBindingKey(fields.binding_key)) return { ok: false, detail: BINDING_KEY_DETAIL }
-  return { ok: true, bindingKey: fields.binding_key }
+  const parsedBinding = parseBindingFields(fields, true)
+  if (!parsedBinding.ok) return parsedBinding
+  if (parsedBinding.binding === null) return { ok: false, detail: BINDING_REQUIRED_DETAIL }
+  return { ok: true, binding: parsedBinding.binding }
 }
 
 function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
@@ -164,8 +182,15 @@ function parseJsonObject(raw: string): Record<string, unknown> | string {
   return body as Record<string, unknown>
 }
 
-function isBindingKey(value: unknown): value is string {
-  return typeof value === 'string' && BINDING_KEY_RE.test(value)
+/** Both binding fields or neither; `required` makes neither an error. */
+function parseBindingFields(fields: Record<string, unknown>, required: boolean): ParsedBinding {
+  const { binding_session: session, binding_subject: subject } = fields
+  if (session === undefined && subject === undefined) {
+    return required ? { ok: false, detail: BINDING_REQUIRED_DETAIL } : { ok: true, binding: null }
+  }
+  if (typeof session !== 'string' || !BINDING_SESSION_RE.test(session)) return { ok: false, detail: BINDING_SESSION_DETAIL }
+  if (typeof subject !== 'string' || subject.trim() === '') return { ok: false, detail: BINDING_SUBJECT_DETAIL }
+  return { ok: true, binding: { session, subject } }
 }
 
 function readBody(req: IncomingMessage): Promise<string | null> {
@@ -226,7 +251,7 @@ export function createApprovalHandler(
     if (raw === null) return sendJson(res, HTTP_BAD_REQUEST, { error: 'invalid_request', detail: 'body too large' })
     const parsed = parseConsumeBody(raw)
     if (!parsed.ok) return sendJson(res, HTTP_BAD_REQUEST, { error: 'invalid_request', detail: parsed.detail })
-    const result = service.consume(id, parsed.bindingKey)
+    const result = service.consume(id, parsed.binding)
     if (result.outcome === 'not_found') return sendJson(res, HTTP_NOT_FOUND, { error: 'not_found' })
     if (result.outcome === 'consumed') return sendJson(res, HTTP_OK, toApprovalView(result.request))
     sendJson(res, CONSUME_REFUSAL_STATUS[result.outcome], {

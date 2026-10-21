@@ -152,12 +152,41 @@ feature is off.
 | `kind` | yes | `allow_deny` (buttons 允許 / 拒絕) or `approve_reject` (buttons approve / 退回). |
 | `timeout_seconds` | no | Number, `0 < n <= 604800`. |
 | `comment_timeout_seconds` | no | Number, `0 < n <= 604800`. |
-| `binding_key` | no | `[A-Za-z0-9_-]{64,128}`, e.g. a hex sha256 of the command the approval is for. Binds the approval to that key so it can be **consumed** once (see Consume). Not shown in Telegram — put what the user should read in `text`. Omitted: the request is unbound and can never be consumed. |
+| `binding_session` | with `binding_subject` | The caller's session id, `[A-Za-z0-9_-]{1,128}` (so it can hold no newline). |
+| `binding_subject` | with `binding_session` | What the approval is for — for a Bash call, the full command. Non-blank. Send both binding fields or neither; neither = unbound, never consumable. A `binding_key` in the body is ignored: the caller cannot choose the key. |
+
+**Binding (JP-374).** For a bound request the poller derives the key itself,
+`sha256(binding_session + "\n" + binding_subject)` (hex), and shows the subject
+in a block it writes at the **top** of the message, before the caller's `text`:
+
+```
+【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：
+┃ <subject, line 1>
+┃ <subject, line 2>
+────────────
+<text>
+```
+
+- Every subject line starts with `┃ `, so nothing in `text` (a look-alike
+  block, a fake separator) can pass for part of the subject, and a subject line
+  that looks like the separator still carries the marker.
+- Secrets are masked first, with the same rules as tg-notify's permission
+  notice (`secret-mask.ts`); then control, zero-width and bidi characters are
+  written out as `[U+XXXX]` so they cannot hide or reorder what is shown. The
+  key is computed from the raw subject, so two subjects that differ only inside
+  a masked secret get different keys but look the same.
+- Masking can also hide a part that is not a secret: `TOKEN=$(some command)`
+  shows as `TOKEN=*** command)`. A `***` where no secret is expected is a reason
+  to deny.
+- The raw subject is not stored: the poller keeps the key and the masked
+  display only.
+- The message is never cut: if the block plus `text` does not fit in one
+  Telegram message (4096 characters), the create is refused with `400`.
 
 | Reply | Body | When |
 | --- | --- | --- |
 | `201` | the request (see below), `status: "pending"` | Sent to at least one recipient. |
-| `400` | `{"error":"invalid_request","detail":"..."}` | Missing / invalid field, malformed JSON, or a body over 32 KB. Nothing was sent. |
+| `400` | `{"error":"invalid_request","detail":"..."}` | Missing / invalid field, a bound message that would not fit in one Telegram message, malformed JSON, or a body over 32 KB. Nothing was sent. |
 | `409` | `{"error":"duplicate_id","request":{...}}` | The id exists. The existing request is returned untouched (never reset, never re-sent). `request` is absent only if the same id is still being created. **This is not your request** — see "Rules for callers". |
 | `502` | `{"error":"telegram_send_failed"}` | Telegram refused every send. Nothing is stored; the id stays free. |
 | `503` | `{"error":"no_recipient"}` | `access.json` has no `allowFrom` entry (or is unreadable). |
@@ -201,9 +230,9 @@ failed, state file lost, or dropped 24 hours after it settled).
 }
 ```
 
-A request created with a `binding_key` carries it back as one more field,
-`"binding_key": "<key>"`, in every reply that returns the request. A request
-created without one has exactly the fields above.
+A bound request carries its key back as one more field, `"binding_key": "<key>"`,
+in every reply that returns the request (never the subject). An unbound request
+has exactly the fields above.
 
 | `status` | Meaning | `decision` | `comment` |
 | --- | --- | --- | --- |
@@ -228,30 +257,34 @@ button that approved it.
 
 **Consume — `POST /approvals/<id>/consume`** (JP-374)
 
-Uses up an approval once. Body: `{"binding_key":"<key>"}` (required, same
-format as on create; other fields are ignored). The check and the change are one
-step inside the poller: the request turns `consumed` only if its `binding_key`
-equals the one sent **and** its status is `approved`. Consume can only take an
+Uses up an approval once. Body: `{"binding_session":"...","binding_subject":"..."}`
+(both required, same format as on create; other fields, `binding_key` included,
+are ignored). The poller recomputes the key from them; the check and the change
+are one step: the request turns `consumed` only if that key equals the stored
+one **and** its status is `approved`. Consume can only take an
 approval away — it never produces `approved`. The Telegram message is not
 touched.
 
 | Reply | When |
 | --- | --- |
-| `200` with the request, `status: "consumed"` | It was `approved` with this key. It now no longer counts as approved. |
-| `409 {"error":"binding_mismatch","request":{...}}` | The request has no `binding_key`, or a different one. Nothing changed — an approval cannot be borrowed for another key. |
+| `200` with the request, `status: "consumed"` | It was `approved` for this session and subject. It now no longer counts as approved. |
+| `409 {"error":"binding_mismatch","request":{...}}` | The request is unbound, or was bound to another session or subject (one character is enough). Nothing changed — an approval cannot be borrowed for something else. |
 | `409 {"error":"already_consumed","request":{...}}` | It was consumed before. |
 | `409 {"error":"not_approved","request":{...}}` | It is `pending`, `awaiting_comment`, `denied`, `cancelled` or `expired`. Nothing changed. |
-| `503 {"error":"persist_failed","request":{...}}` | It was `approved` with this key, but the state file could not be written. **Do not act on the approval.** It stays used up while the poller runs; after a restart it may read `approved` again (the last saved state) and can then be consumed once. Either way it is used at most once. |
-| `400 {"error":"invalid_request","detail":"..."}` | Missing / invalid `binding_key`, malformed JSON, or a body over 32 KB. |
+| `503 {"error":"persist_failed","request":{...}}` | It was `approved` for this session and subject, but the state file could not be written. **Do not act on the approval.** It stays used up while the poller runs; after a restart it may read `approved` again (the last saved state) and can then be consumed once. Either way it is used at most once. |
+| `400 {"error":"invalid_request","detail":"..."}` | Missing / invalid `binding_session` or `binding_subject`, malformed JSON, or a body over 32 KB. |
 | `404 {"error":"not_found"}` | Unknown id. |
 
 The checks run in that order (key, then consumed, then approved). An approved
 request that is never consumed stays `approved` until it is dropped, 24 hours
 after the button was pressed. Only `200` means the caller may go ahead.
 
-`binding_key` is returned by the query, so any local process can consume an
+Any local process that knows the session id and the subject can consume an
 approval it did not ask for. That only ever takes an approval away (the real
 caller then gets `already_consumed` and does not proceed); it cannot grant one.
+What it cannot do is get the user to approve one thing and consume the approval
+for another: the subject the key stands for is the one shown at the top of the
+message the user pressed on.
 
 **Anything else** under `/approvals`: a known path with the wrong method answers
 `405 {"error":"method_not_allowed"}`; an unknown path answers
@@ -263,7 +296,7 @@ curl -s -X POST http://127.0.0.1:7852/approvals \
 curl -s http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f
 curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/cancel
 curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/consume \
-  -d '{"binding_key":"<hex sha256 the request was created with>"}'
+  -d '{"binding_session":"<session id>","binding_subject":"<the subject sent on create>"}'
 ```
 
 ### What the user sees, and what counts as a decision
@@ -305,7 +338,7 @@ was down is handled when it comes back; a request whose deadline passed
 meanwhile becomes `expired`. If the file is missing or unreadable the poller
 starts with no requests (the unreadable file is kept as
 `approvals.json.corrupt-<timestamp>`), so earlier ids answer `not_found`.
-`binding_key` and `consumed` are kept across restarts like every other field.
+The binding key, the masked display and `consumed` are kept across restarts like every other field.
 A file written before JP-374 loads as-is (its requests are unbound); a poller
 older than JP-374 reading a file that holds a `consumed` request treats the file
 as unreadable and starts empty — never as approved.

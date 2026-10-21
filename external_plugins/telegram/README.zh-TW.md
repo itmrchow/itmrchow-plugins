@@ -141,12 +141,32 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `kind` | 是 | `allow_deny`（按鈕：允許 / 拒絕）或 `approve_reject`（按鈕：approve / 退回）。 |
 | `timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
 | `comment_timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
-| `binding_key` | 否 | `[A-Za-z0-9_-]{64,128}`，例如該核准要放行的指令全文的 sha256 十六進位字串。把核准綁到這個 key，之後可**消耗**一次（見「消耗」）。不會顯示在 Telegram 上，給 user 看的內容請放 `text`。不帶 = 未綁定，永遠不能消耗。 |
+| `binding_session` | 與 `binding_subject` 同時帶 | 呼叫方的 session id，`[A-Za-z0-9_-]{1,128}`（不可能含換行）。 |
+| `binding_subject` | 與 `binding_session` 同時帶 | 這筆核准要放行的內容 —— Bash 呼叫就是指令全文。不可空白。兩個綁定欄位要嘛都帶、要嘛都不帶；都不帶 = 未綁定，永遠不能消耗。body 裡的 `binding_key` 一律忽略：key 不能由呼叫方指定。 |
+
+**綁定（JP-374）。** 有綁定的請求由 poller 自己算 key：`sha256(binding_session + "\n" + binding_subject)`（十六進位），
+並把 subject 顯示在訊息**最上方**、由 poller 寫的區塊裡，呼叫方的 `text` 排在後面：
+
+```
+【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：
+┃ <subject 第 1 行>
+┃ <subject 第 2 行>
+────────────
+<text>
+```
+
+- subject 每一行都以 `┃ ` 開頭，所以 `text` 裡的任何東西（長得一樣的假區塊、假分隔線）都冒充不了 subject；
+  subject 裡長得像分隔線的行也一樣帶著標記。
+- 先套機密遮罩（規則與 tg-notify 權限通知相同，見 `secret-mask.ts`），再把控制字元、零寬字元、雙向文字控制字元
+  寫成 `[U+XXXX]`，讓它們無法隱藏或重排顯示內容。key 用原文算，所以只差在被遮機密段的兩個 subject key 不同、畫面相同。
+- 遮罩也可能蓋掉不是機密的部分：`TOKEN=$(某指令)` 會顯示成 `TOKEN=*** ...)`。不該有機密的地方出現 `***`，就應該拒絕。
+- subject 原文不落盤：poller 只保存 key 與遮罩後的顯示文字。
+- 訊息絕不截斷：區塊加上 `text` 放不進一則 Telegram 訊息（4096 字元）時，建立直接回 `400`。
 
 | 回應 | body | 何時 |
 | --- | --- | --- |
 | `201` | 該請求（格式見下），`status: "pending"` | 至少發給一位收件人。 |
-| `400` | `{"error":"invalid_request","detail":"..."}` | 欄位缺漏 / 不合法、JSON 格式錯誤、body 超過 32 KB。沒有發出任何訊息。 |
+| `400` | `{"error":"invalid_request","detail":"..."}` | 欄位缺漏 / 不合法、有綁定的訊息放不進一則 Telegram 訊息、JSON 格式錯誤、body 超過 32 KB。沒有發出任何訊息。 |
 | `409` | `{"error":"duplicate_id","request":{...}}` | id 已存在。回傳既有請求的現況，不重置、不重發。只有同一 id 仍在建立中時才沒有 `request`。**這不是你的請求**，見「呼叫方必須遵守的規則」。 |
 | `502` | `{"error":"telegram_send_failed"}` | Telegram 全部發送失敗。不留下請求，該 id 可再用。 |
 | `503` | `{"error":"no_recipient"}` | `access.json` 的 `allowFrom` 為空（或讀不到）。 |
@@ -183,8 +203,8 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 }
 ```
 
-建立時帶了 `binding_key` 的請求，所有回傳該請求的回應都多一個欄位 `"binding_key": "<key>"`；
-沒帶的請求，欄位與上面完全相同。
+有綁定的請求，所有回傳該請求的回應都多一個欄位 `"binding_key": "<key>"`（不回傳 subject）；
+未綁定的請求，欄位與上面完全相同。
 
 | `status` | 意思 | `decision` | `comment` |
 | --- | --- | --- | --- |
@@ -208,25 +228,27 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 
 **消耗 —— `POST /approvals/<id>/consume`**（JP-374）
 
-把一筆核准用掉一次。body：`{"binding_key":"<key>"}`（必填，格式同建立；其他欄位忽略）。比對與轉換在
-poller 內一步完成：只有請求的 `binding_key` 與送來的相同、**且**狀態為 `approved`，才會轉為 `consumed`。
+把一筆核准用掉一次。body：`{"binding_session":"...","binding_subject":"..."}`（兩個都必填，格式同建立；其他欄位
+（含 `binding_key`）忽略）。poller 由這兩個欄位重算 key，比對與轉換一步完成：只有重算出的 key 與保存的相同、
+**且**狀態為 `approved`，才會轉為 `consumed`。
 消耗只能拿走核准，永遠不會產生 `approved`；不改 Telegram 訊息。
 
 | 回應 | 何時 |
 | --- | --- |
-| `200` 與該請求，`status: "consumed"` | 原為 `approved` 且 key 相符。之後不再算核准。 |
-| `409 {"error":"binding_mismatch","request":{...}}` | 請求沒有 `binding_key`，或 key 不同。不改任何東西 —— 核准不能借給別的 key 用。 |
+| `200` 與該請求，`status: "consumed"` | 原為 `approved`，且 session 與 subject 都相符。之後不再算核准。 |
+| `409 {"error":"binding_mismatch","request":{...}}` | 請求未綁定，或綁的是別的 session / subject（差一個字元就算）。不改任何東西 —— 核准不能借給別的內容用。 |
 | `409 {"error":"already_consumed","request":{...}}` | 先前已消耗過。 |
 | `409 {"error":"not_approved","request":{...}}` | 狀態為 `pending`、`awaiting_comment`、`denied`、`cancelled` 或 `expired`。不改任何東西。 |
-| `503 {"error":"persist_failed","request":{...}}` | 原為 `approved` 且 key 相符，但狀態檔寫不進去。**不得依這筆核准行事。** poller 執行期間它維持已用掉；重啟後可能回到最後落檔的 `approved`，此時可再成功消耗一次。不論哪種都最多用一次。 |
-| `400 {"error":"invalid_request","detail":"..."}` | 缺 `binding_key` / 格式不合法、JSON 格式錯誤、body 超過 32 KB。 |
+| `503 {"error":"persist_failed","request":{...}}` | 原為 `approved` 且 session 與 subject 相符，但狀態檔寫不進去。**不得依這筆核准行事。** poller 執行期間它維持已用掉；重啟後可能回到最後落檔的 `approved`，此時可再成功消耗一次。不論哪種都最多用一次。 |
+| `400 {"error":"invalid_request","detail":"..."}` | 缺 `binding_session` / `binding_subject` 或格式不合法、JSON 格式錯誤、body 超過 32 KB。 |
 | `404 {"error":"not_found"}` | 查無此 id。 |
 
 檢查依上表順序（先比 key、再看是否已消耗、最後看是否 approved）。核准後一直沒被消耗的請求維持
 `approved`，直到按下按鈕滿 24 小時被清除。只有 `200` 代表呼叫方可以照做。
 
-查詢會回傳 `binding_key`，所以本機任何程序都能消耗一筆不是自己要的核准。這只會拿走核准（真正的呼叫方會拿到
-`already_consumed` 而不執行），不可能多給出核准。
+本機任何知道 session id 與 subject 的程序，都能消耗一筆不是自己要的核准。這只會拿走核准（真正的呼叫方會拿到
+`already_consumed` 而不執行），不可能多給出核准。做不到的是「讓 user 核准一件事、再拿去放行另一件事」：key 代表的
+subject，就是 user 按下按鈕的那則訊息最上方顯示的內容。
 
 **其他** `/approvals` 底下的請求：路徑對但方法錯回 `405 {"error":"method_not_allowed"}`；路徑不存在回
 `404 {"error":"not_found"}`。
@@ -237,7 +259,7 @@ curl -s -X POST http://127.0.0.1:7852/approvals \
 curl -s http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f
 curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/cancel
 curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/consume \
-  -d '{"binding_key":"<建立時帶的 sha256 十六進位字串>"}'
+  -d '{"binding_session":"<session id>","binding_subject":"<建立時送的 subject>"}'
 ```
 
 ### user 看到什麼、什麼才算決定
@@ -262,7 +284,7 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
 記憶體內的結果在下次重啟前仍有效 —— 消耗例外：寫檔失敗回 `503 persist_failed`，不回 `200`），只有 poller 讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
 重啟後處理；期間跨過期限的請求變成 `expired`。檔案遺失或讀不了時 poller 從空狀態啟動（壞檔保留為
 `approvals.json.corrupt-<時間戳>`），先前的 id 查詢為 `not_found`。
-`binding_key` 與 `consumed` 跟其他欄位一樣跨重啟保留。JP-374 之前寫的狀態檔照常載入（其中的請求視為未綁定）；
+綁定 key、遮罩後的顯示文字與 `consumed` 跟其他欄位一樣跨重啟保留。JP-374 之前寫的狀態檔照常載入（其中的請求視為未綁定）；
 JP-374 之前版本的 poller 讀到含 `consumed` 請求的檔案時，會判為讀不了而從空狀態啟動 —— 不會當成核准。
 
 ## 提供給 assistant 的工具

@@ -29,6 +29,7 @@ const newApproval = (id: string, kind: ApprovalKind = 'allow_deny', messageId = 
   kind,
   text: `請求 ${id}`,
   bindingKey: null,
+  bindingDisplay: null,
   createdAtMs: clock,
   expiresAtMs: clock + TIMEOUT_MS,
   commentTimeoutMs: COMMENT_TIMEOUT_MS,
@@ -248,12 +249,13 @@ const OTHER_KEY = 'b'.repeat(64)
 const buildBoundApproval = (id: string, bindingKey: string = KEY, messageId: number = 10): NewApproval => ({
   ...newApproval(id, 'allow_deny', messageId),
   bindingKey,
+  bindingDisplay: `顯示 ${id}`,
 })
 
-test('建立時帶綁定 key 會存下來；沒帶時為 null', () => {
+test('建立時帶綁定 key 與顯示文字會存下來；沒帶時為 null', () => {
   const store = openStore()
-  expect(store.add(buildBoundApproval('a')).bindingKey).toBe(KEY)
-  expect(store.add(newApproval('b', 'allow_deny', 11)).bindingKey).toBeNull()
+  expect(store.add(buildBoundApproval('a'))).toMatchObject({ bindingKey: KEY, bindingDisplay: '顯示 a' })
+  expect(store.add(newApproval('b', 'allow_deny', 11))).toMatchObject({ bindingKey: null, bindingDisplay: null })
 })
 
 test('approved 且 key 相同 -> 消耗成功轉 consumed，原按鈕保留', () => {
@@ -277,7 +279,7 @@ test('同一筆核准只能消耗一次', () => {
 
 test('approve_reject 按 approve 後同樣可消耗', () => {
   const store = openStore()
-  store.add({ ...newApproval('a', 'approve_reject'), bindingKey: KEY })
+  store.add({ ...newApproval('a', 'approve_reject'), bindingKey: KEY, bindingDisplay: 'd' })
   store.press('a', 'approve', on())
   expect(store.consume('a', KEY).outcome).toBe('consumed')
 })
@@ -287,7 +289,7 @@ test('未 approved 的請求不能消耗，狀態不變', () => {
   store.add(buildBoundApproval('pending'))
   store.add(buildBoundApproval('denied', KEY, 11))
   store.add(buildBoundApproval('cancelled', KEY, 12))
-  store.add({ ...newApproval('waiting', 'approve_reject', 13), bindingKey: KEY })
+  store.add({ ...newApproval('waiting', 'approve_reject', 13), bindingKey: KEY, bindingDisplay: 'd' })
   store.add(buildBoundApproval('expired', KEY, 14))
   store.press('denied', 'deny', on(11))
   store.cancel('cancelled')
@@ -349,7 +351,7 @@ test('consumed 與綁定 key 重開後保留；consumed 過了保留期一樣清
   store.consume('used', KEY)
 
   const reopened = openStore()
-  expect(reopened.get('used')).toMatchObject({ status: 'consumed', bindingKey: KEY })
+  expect(reopened.get('used')).toMatchObject({ status: 'consumed', bindingKey: KEY, bindingDisplay: '顯示 used' })
   expect(reopened.consume('used', KEY).outcome).toBe('already_consumed')
   expect(reopened.get('fresh')).toMatchObject({ status: 'approved', bindingKey: OTHER_KEY })
   expect(reopened.consume('fresh', OTHER_KEY).outcome).toBe('consumed')
@@ -359,7 +361,7 @@ test('consumed 與綁定 key 重開後保留；consumed 過了保留期一樣清
   expect(reopened.get('used')).toBeUndefined()
 })
 
-test('舊版狀態檔（沒有 bindingKey 欄位）照常載入，綁定 key 視為 null', () => {
+test('舊版狀態檔（沒有綁定欄位）照常載入，綁定 key 與顯示文字視為 null', () => {
   const legacy = {
     id: 'old', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
     createdAtMs: clock, expiresAtMs: clock + TIMEOUT_MS, commentTimeoutMs: COMMENT_TIMEOUT_MS,
@@ -367,16 +369,16 @@ test('舊版狀態檔（沒有 bindingKey 欄位）照常載入，綁定 key 視
   }
   writeFileSync(filePath, JSON.stringify({ version: 1, requests: [legacy] }))
   const store = openStore()
-  expect(store.get('old')).toMatchObject({ status: 'approved', bindingKey: null })
+  expect(store.get('old')).toMatchObject({ status: 'approved', bindingKey: null, bindingDisplay: null })
   expect(store.consume('old', KEY).outcome).toBe('binding_mismatch')
   expect(readdirSync(dir).some(name => name.startsWith('approvals.json.corrupt-'))).toBe(false)
 })
 
-test('狀態檔裡 bindingKey 型別不對視為損毀', () => {
+test.each([['bindingKey'], ['bindingDisplay']])('狀態檔裡 %s 型別不對視為損毀', (field: string) => {
   const bad = {
     id: 'a', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
     createdAtMs: 1, expiresAtMs: 2, commentTimeoutMs: 3, commentDeadlineMs: null, resolvedAtMs: 1,
-    messages: [], prompts: [], bindingKey: 42,
+    messages: [], prompts: [], [field]: 42,
   }
   writeFileSync(filePath, JSON.stringify({ version: 1, requests: [bad] }))
   expect(openStore().size()).toBe(0)
