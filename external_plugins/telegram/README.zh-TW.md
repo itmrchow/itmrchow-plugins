@@ -107,7 +107,7 @@ poller 設了 `REAUTH_BIN`（指向 im-core 的 `scripts/reauth.sh`）時，會�
 預設關閉。poller 的 `TELEGRAM_APPROVAL_BUTTONS` 設為 `1` 或 `true` 時，本機程序可以請
 bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆。
 
-決定在 Telegram 上產生、保管在 poller 程序內。下面的介面只能建立、查詢、取消 ——
+決定在 Telegram 上產生、保管在 poller 程序內。下面的介面只能建立、查詢、取消、消耗已綁定的核准 ——
 **沒有任何寫入決定的呼叫**，請求 body 內多帶的欄位一律忽略。
 
 ### 環境變數（`poller.ts` 讀取；可放環境或 `$TELEGRAM_STATE_DIR/.env`）
@@ -122,7 +122,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 
 兩個逾時都接受小數，須大於 0 且不超過 604800（7 天）；不合法時在 stderr 警告並退回預設值。
 
-開關關閉時 poller 行為與先前完全相同：下面三個路徑回 server 原本的 `404 not found`（純文字）、
+開關關閉時 poller 行為與先前完全相同：下面四個路徑回 server 原本的 `404 not found`（純文字）、
 不攔截任何 update、不讀 `access.json`、不寫狀態檔。本功能沒有改 `server.ts`，poller 與 server
 新舊版本任意混搭都不受影響。
 
@@ -141,6 +141,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `kind` | 是 | `allow_deny`（按鈕：允許 / 拒絕）或 `approve_reject`（按鈕：approve / 退回）。 |
 | `timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
 | `comment_timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
+| `binding_key` | 否 | `[A-Za-z0-9_-]{1,128}`，例如該核准要放行的指令全文的 sha256 十六進位字串。把核准綁到這個 key，之後可**消耗**一次（見「消耗」）。不會顯示在 Telegram 上，給 user 看的內容請放 `text`。不帶 = 未綁定，永遠不能消耗。 |
 
 | 回應 | body | 何時 |
 | --- | --- | --- |
@@ -182,6 +183,9 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 }
 ```
 
+建立時帶了 `binding_key` 的請求，所有回傳該請求的回應都多一個欄位 `"binding_key": "<key>"`；
+沒帶的請求，欄位與上面完全相同。
+
 | `status` | 意思 | `decision` | `comment` |
 | --- | --- | --- | --- |
 | `pending` | 等按鈕。 | `null` | `null` |
@@ -190,14 +194,35 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `denied` | 按了「拒絕」，或「退回」已完成。 | `deny` / `reject` | `deny` 為 `null`；`reject` 為意見文字，逾時沒寫則為 `""` |
 | `cancelled` | 經本介面取消。 | `null` | `null` |
 | `expired` | 期限內沒人按。 | `null` | `null` |
+| `consumed` | 原為 `approved`，已經由「消耗」用掉。終態，不再算核准。 | `allow` / `approve`（保留當初核准的按鈕當紀錄） | `null` |
+
+判斷請以 `status` 為準，不要看 `decision`：`consumed` 的請求仍顯示當初核准的按鈕。
 
 **取消 —— `POST /approvals/<id>/cancel`**（不需 body）
 
 | 回應 | 何時 |
 | --- | --- |
 | `200` 與該請求，`status: "cancelled"` | 原為 `pending` 或 `awaiting_comment`。Telegram 訊息改為 `[已在電腦處理]` 並移除按鈕。 |
-| `200` 與該請求，狀態不變 | 已有結果（`approved` / `denied` / `expired` / `cancelled`）。保留原結果、不動訊息，重複取消是安全的。 |
+| `200` 與該請求，狀態不變 | 已有結果（`approved` / `denied` / `expired` / `cancelled` / `consumed`）。保留原結果、不動訊息，重複取消是安全的。 |
 | `404 {"error":"not_found"}` | 查無此 id。 |
+
+**消耗 —— `POST /approvals/<id>/consume`**（JP-374）
+
+把一筆核准用掉一次。body：`{"binding_key":"<key>"}`（必填，格式同建立；其他欄位忽略）。比對與轉換在
+poller 內一步完成：只有請求的 `binding_key` 與送來的相同、**且**狀態為 `approved`，才會轉為 `consumed`。
+消耗只能拿走核准，永遠不會產生 `approved`；不改 Telegram 訊息。
+
+| 回應 | 何時 |
+| --- | --- |
+| `200` 與該請求，`status: "consumed"` | 原為 `approved` 且 key 相符。之後不再算核准。 |
+| `409 {"error":"binding_mismatch","request":{...}}` | 請求沒有 `binding_key`，或 key 不同。不改任何東西 —— 核准不能借給別的 key 用。 |
+| `409 {"error":"already_consumed","request":{...}}` | 先前已消耗過。 |
+| `409 {"error":"not_approved","request":{...}}` | 狀態為 `pending`、`awaiting_comment`、`denied`、`cancelled` 或 `expired`。不改任何東西。 |
+| `400 {"error":"invalid_request","detail":"..."}` | 缺 `binding_key` / 格式不合法、JSON 格式錯誤、body 超過 32 KB。 |
+| `404 {"error":"not_found"}` | 查無此 id。 |
+
+檢查依上表順序（先比 key、再看是否已消耗、最後看是否 approved）。核准後一直沒被消耗的請求維持
+`approved`，直到按下按鈕滿 24 小時被清除。
 
 **其他** `/approvals` 底下的請求：路徑對但方法錯回 `405 {"error":"method_not_allowed"}`；路徑不存在回
 `404 {"error":"not_found"}`。
@@ -207,6 +232,8 @@ curl -s -X POST http://127.0.0.1:7852/approvals \
   -d '{"id":"appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
 curl -s http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f
 curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/cancel
+curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/consume \
+  -d '{"binding_key":"<建立時帶的 sha256 十六進位字串>"}'
 ```
 
 ### user 看到什麼、什麼才算決定
@@ -231,6 +258,8 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
 記憶體內的結果在下次重啟前仍有效），只有 poller 讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
 重啟後處理；期間跨過期限的請求變成 `expired`。檔案遺失或讀不了時 poller 從空狀態啟動（壞檔保留為
 `approvals.json.corrupt-<時間戳>`），先前的 id 查詢為 `not_found`。
+`binding_key` 與 `consumed` 跟其他欄位一樣跨重啟保留。JP-374 之前寫的狀態檔照常載入（其中的請求視為未綁定）；
+JP-374 之前版本的 poller 讀到含 `consumed` 請求的檔案時，會判為讀不了而從空狀態啟動 —— 不會當成核准。
 
 ## 提供給 assistant 的工具
 

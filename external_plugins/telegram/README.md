@@ -112,8 +112,9 @@ Off by default. When the poller has `TELEGRAM_APPROVAL_BUTTONS` set to `1` or
 message with two buttons, and read back what was pressed.
 
 The decision is made in Telegram and kept inside the poller process. The
-interface below can create a request, read it and cancel it — **there is no
-call that sets a decision**, and extra fields in a request body are ignored.
+interface below can create a request, read it, cancel it and consume a bound
+approval — **there is no call that sets a decision**, and extra fields in a
+request body are ignored.
 
 ### Environment variables (read by `poller.ts`, from the environment or `$TELEGRAM_STATE_DIR/.env`)
 
@@ -128,7 +129,7 @@ call that sets a decision**, and extra fields in a request body are ignored.
 Both timeouts accept fractions and must be above 0 and at most 604800 (7 days);
 an unusable value falls back to the default with a warning on stderr.
 
-With the switch off, the poller behaves exactly as before: the three paths
+With the switch off, the poller behaves exactly as before: the four paths
 below answer the server's ordinary `404 not found` (plain text), no update is
 intercepted, `access.json` is not read and no state file is written. `server.ts`
 is unchanged by this feature, so any mix of poller and server versions is fine.
@@ -151,6 +152,7 @@ feature is off.
 | `kind` | yes | `allow_deny` (buttons 允許 / 拒絕) or `approve_reject` (buttons approve / 退回). |
 | `timeout_seconds` | no | Number, `0 < n <= 604800`. |
 | `comment_timeout_seconds` | no | Number, `0 < n <= 604800`. |
+| `binding_key` | no | `[A-Za-z0-9_-]{1,128}`, e.g. a hex sha256 of the command the approval is for. Binds the approval to that key so it can be **consumed** once (see Consume). Not shown in Telegram — put what the user should read in `text`. Omitted: the request is unbound and can never be consumed. |
 
 | Reply | Body | When |
 | --- | --- | --- |
@@ -199,6 +201,10 @@ failed, state file lost, or dropped 24 hours after it settled).
 }
 ```
 
+A request created with a `binding_key` carries it back as one more field,
+`"binding_key": "<key>"`, in every reply that returns the request. A request
+created without one has exactly the fields above.
+
 | `status` | Meaning | `decision` | `comment` |
 | --- | --- | --- | --- |
 | `pending` | Waiting for a button. | `null` | `null` |
@@ -207,14 +213,40 @@ failed, state file lost, or dropped 24 hours after it settled).
 | `denied` | 拒絕 was pressed, or a 退回 was completed. | `deny` / `reject` | `null` for `deny`; for `reject` the comment text, or `""` when none came in time |
 | `cancelled` | Cancelled through this interface. | `null` | `null` |
 | `expired` | Nobody pressed a button in time. | `null` | `null` |
+| `consumed` | Was `approved`, then used up through Consume. Final; no longer counts as approved. | `allow` / `approve` (the button that approved it, kept as the record) | `null` |
+
+Judge by `status`, not by `decision`: a `consumed` request still shows the
+button that approved it.
 
 **Cancel — `POST /approvals/<id>/cancel`** (no body needed)
 
 | Reply | When |
 | --- | --- |
 | `200` with the request, `status: "cancelled"` | It was `pending` or `awaiting_comment`. The Telegram message is rewritten to `[已在電腦處理]` and loses its buttons. |
-| `200` with the request, status unchanged | It had already settled (`approved` / `denied` / `expired` / `cancelled`). The result is kept and the message is not touched, so repeating a cancel is safe. |
+| `200` with the request, status unchanged | It had already settled (`approved` / `denied` / `expired` / `cancelled` / `consumed`). The result is kept and the message is not touched, so repeating a cancel is safe. |
 | `404 {"error":"not_found"}` | Unknown id. |
+
+**Consume — `POST /approvals/<id>/consume`** (JP-374)
+
+Uses up an approval once. Body: `{"binding_key":"<key>"}` (required, same
+format as on create; other fields are ignored). The check and the change are one
+step inside the poller: the request turns `consumed` only if its `binding_key`
+equals the one sent **and** its status is `approved`. Consume can only take an
+approval away — it never produces `approved`. The Telegram message is not
+touched.
+
+| Reply | When |
+| --- | --- |
+| `200` with the request, `status: "consumed"` | It was `approved` with this key. It now no longer counts as approved. |
+| `409 {"error":"binding_mismatch","request":{...}}` | The request has no `binding_key`, or a different one. Nothing changed — an approval cannot be borrowed for another key. |
+| `409 {"error":"already_consumed","request":{...}}` | It was consumed before. |
+| `409 {"error":"not_approved","request":{...}}` | It is `pending`, `awaiting_comment`, `denied`, `cancelled` or `expired`. Nothing changed. |
+| `400 {"error":"invalid_request","detail":"..."}` | Missing / invalid `binding_key`, malformed JSON, or a body over 32 KB. |
+| `404 {"error":"not_found"}` | Unknown id. |
+
+The checks run in that order (key, then consumed, then approved). An approved
+request that is never consumed stays `approved` until it is dropped, 24 hours
+after the button was pressed.
 
 **Anything else** under `/approvals`: a known path with the wrong method answers
 `405 {"error":"method_not_allowed"}`; an unknown path answers
@@ -225,6 +257,8 @@ curl -s -X POST http://127.0.0.1:7852/approvals \
   -d '{"id":"appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f","text":"JP-123 Spec 可以 approve 嗎？","kind":"approve_reject"}'
 curl -s http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f
 curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/cancel
+curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4c5e6f/consume \
+  -d '{"binding_key":"<hex sha256 the request was created with>"}'
 ```
 
 ### What the user sees, and what counts as a decision
@@ -265,6 +299,10 @@ was down is handled when it comes back; a request whose deadline passed
 meanwhile becomes `expired`. If the file is missing or unreadable the poller
 starts with no requests (the unreadable file is kept as
 `approvals.json.corrupt-<timestamp>`), so earlier ids answer `not_found`.
+`binding_key` and `consumed` are kept across restarts like every other field.
+A file written before JP-374 loads as-is (its requests are unbound); a poller
+older than JP-374 reading a file that holds a `consumed` request treats the file
+as unreadable and starts empty — never as approved.
 
 ## Tools exposed to the assistant
 
