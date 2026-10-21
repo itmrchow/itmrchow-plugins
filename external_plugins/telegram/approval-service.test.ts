@@ -526,8 +526,63 @@ test('意見逾時後回覆提示訊息：吃掉並告知已結案；回覆原�
 
 test('service 對外沒有任何寫入決定的動作', () => {
   expect(Object.keys(harness().service).sort()).toEqual(
-    ['cancel', 'create', 'get', 'interceptUpdate', 'start', 'sweep'].sort(),
+    ['cancel', 'consume', 'create', 'get', 'interceptUpdate', 'start', 'sweep'].sort(),
   )
+})
+
+const KEY = 'a'.repeat(64)
+const OTHER_KEY = 'b'.repeat(64)
+
+async function createBound(h: Harness, id: string, bindingKey = KEY): Promise<number> {
+  const before = sentRequests(h).length
+  const result = await h.service.create({ ...input(id), bindingKey })
+  expect(result.ok).toBe(true)
+  return sentRequests(h)[before].messageId
+}
+
+test('建立時帶綁定 key：存下並可查回；綁定 key 不出現在 Telegram 訊息', async () => {
+  const h = harness()
+  await createBound(h, 'B1')
+  expect(h.service.get('B1')?.bindingKey).toBe(KEY)
+  expect(sentRequests(h)[0].text).toBe('請求 B1')
+  await createOne(h, 'B2')
+  expect(h.service.get('B2')?.bindingKey).toBeNull()
+})
+
+test('按允許後以相同 key 消耗一次 -> consumed，第二次 already_consumed；不改 Telegram 訊息', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B3')
+  await h.service.interceptUpdate(press('appr:allow:B3', U1, messageId))
+  const editsBefore = edits(h).length
+  expect((await h.service.consume('B3', KEY)).outcome).toBe('consumed')
+  expect(h.service.get('B3')?.status).toBe('consumed')
+  expect((await h.service.consume('B3', KEY)).outcome).toBe('already_consumed')
+  expect(edits(h)).toHaveLength(editsBefore)
+})
+
+test('非 allowFrom 的人按允許後不能消耗：請求仍 pending', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B4')
+  await h.service.interceptUpdate(press('appr:allow:B4', U2, messageId, U1))
+  expect((await h.service.consume('B4', KEY)).outcome).toBe('not_approved')
+  expect(h.service.get('B4')?.status).toBe('pending')
+})
+
+test('key 不同不能消耗；查無 id 回 not_found', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'B5')
+  await h.service.interceptUpdate(press('appr:allow:B5', U1, messageId))
+  expect((await h.service.consume('B5', OTHER_KEY)).outcome).toBe('binding_mismatch')
+  expect(h.service.get('B5')?.status).toBe('approved')
+  expect((await h.service.consume('nope', KEY)).outcome).toBe('not_found')
+})
+
+test('消耗前先套用時鐘：逾時的 pending 先轉 expired，回 not_approved', async () => {
+  const h = harness()
+  await createBound(h, 'B6')
+  h.advance(TIMEOUT_SECONDS * 1000)
+  expect((await h.service.consume('B6', KEY)).outcome).toBe('not_approved')
+  expect(h.store.get('B6')?.status).toBe('expired')
 })
 
 test('終態文字超過 Telegram 上限時截斷', async () => {

@@ -237,6 +237,147 @@ test.each([
 test('store 沒有任何可直接寫入決定的公開方法', () => {
   const methods = Object.getOwnPropertyNames(ApprovalStore.prototype).filter(name => name !== 'constructor').sort()
   expect(methods).toEqual(
-    ['add', 'addPrompt', 'cancel', 'findAwaitingComment', 'findClosedByPrompt', 'get', 'press', 'recordComment', 'size', 'sweep'].sort(),
+    ['add', 'addPrompt', 'cancel', 'consume', 'findAwaitingComment', 'findClosedByPrompt', 'get', 'press', 'recordComment', 'size', 'sweep'].sort(),
   )
+})
+
+const KEY = 'a'.repeat(64)
+const OTHER_KEY = 'b'.repeat(64)
+
+const boundApproval = (id: string, bindingKey = KEY, messageId = 10): NewApproval => ({
+  ...newApproval(id, 'allow_deny', messageId),
+  bindingKey,
+})
+
+test('建立時帶綁定 key 會存下來；沒帶時為 null', () => {
+  const store = openStore()
+  expect(store.add(boundApproval('a')).bindingKey).toBe(KEY)
+  expect(store.add(newApproval('b', 'allow_deny', 11)).bindingKey).toBeNull()
+})
+
+test('approved 且 key 相同 -> 消耗成功轉 consumed，原按鈕保留', () => {
+  const store = openStore()
+  store.add(boundApproval('a'))
+  store.press('a', 'allow', on())
+  const resolvedAtMs = store.get('a')?.resolvedAtMs
+  clock += 1000
+  expect(store.consume('a', KEY).outcome).toBe('consumed')
+  expect(store.get('a')).toMatchObject({ status: 'consumed', decision: 'allow', resolvedAtMs })
+})
+
+test('同一筆核准只能消耗一次', () => {
+  const store = openStore()
+  store.add(boundApproval('a'))
+  store.press('a', 'allow', on())
+  expect(store.consume('a', KEY).outcome).toBe('consumed')
+  expect(store.consume('a', KEY).outcome).toBe('already_consumed')
+  expect(store.get('a')?.status).toBe('consumed')
+})
+
+test('approve_reject 按 approve 後同樣可消耗', () => {
+  const store = openStore()
+  store.add({ ...newApproval('a', 'approve_reject'), bindingKey: KEY })
+  store.press('a', 'approve', on())
+  expect(store.consume('a', KEY).outcome).toBe('consumed')
+})
+
+test('未 approved 的請求不能消耗，狀態不變', () => {
+  const store = openStore()
+  store.add(boundApproval('pending'))
+  store.add(boundApproval('denied', KEY, 11))
+  store.add(boundApproval('cancelled', KEY, 12))
+  store.add({ ...newApproval('waiting', 'approve_reject', 13), bindingKey: KEY })
+  store.add(boundApproval('expired', KEY, 14))
+  store.press('denied', 'deny', on(11))
+  store.cancel('cancelled')
+  store.press('waiting', 'reject', on(13))
+  clock += TIMEOUT_MS
+  store.sweep()
+  for (const [id, status] of [
+    ['pending', 'expired'],
+    ['denied', 'denied'],
+    ['cancelled', 'cancelled'],
+    ['waiting', 'denied'],
+    ['expired', 'expired'],
+  ] as const) {
+    expect(store.consume(id, KEY).outcome).toBe('not_approved')
+    expect(store.get(id)?.status).toBe(status)
+  }
+})
+
+test('pending 中的請求不能消耗（未逾時）', () => {
+  const store = openStore()
+  store.add(boundApproval('a'))
+  expect(store.consume('a', KEY).outcome).toBe('not_approved')
+  expect(store.get('a')?.status).toBe('pending')
+})
+
+test('key 不同或請求沒綁 key -> binding_mismatch，核准不被借用', () => {
+  const store = openStore()
+  store.add(boundApproval('a'))
+  store.add(newApproval('unbound', 'allow_deny', 11))
+  store.press('a', 'allow', on())
+  store.press('unbound', 'allow', on(11))
+  expect(store.consume('a', OTHER_KEY).outcome).toBe('binding_mismatch')
+  expect(store.consume('unbound', KEY).outcome).toBe('binding_mismatch')
+  expect(store.get('a')?.status).toBe('approved')
+  expect(store.get('unbound')?.status).toBe('approved')
+  expect(store.consume('a', KEY).outcome).toBe('consumed')
+})
+
+test('消耗查無的 id 回 not_found', () => {
+  expect(openStore().consume('nope', KEY).outcome).toBe('not_found')
+})
+
+test('consumed 之後按按鈕、取消都不翻盤', () => {
+  const store = openStore()
+  store.add(boundApproval('a'))
+  store.press('a', 'allow', on())
+  store.consume('a', KEY)
+  expect(store.press('a', 'allow', on()).outcome).toBe('already_settled')
+  expect(store.cancel('a').outcome).toBe('unchanged')
+  expect(store.get('a')?.status).toBe('consumed')
+})
+
+test('consumed 與綁定 key 重開後保留；consumed 過了保留期一樣清掉', () => {
+  const store = openStore()
+  store.add(boundApproval('used'))
+  store.add(boundApproval('fresh', OTHER_KEY, 11))
+  store.press('used', 'allow', on())
+  store.press('fresh', 'allow', on(11))
+  store.consume('used', KEY)
+
+  const reopened = openStore()
+  expect(reopened.get('used')).toMatchObject({ status: 'consumed', bindingKey: KEY })
+  expect(reopened.consume('used', KEY).outcome).toBe('already_consumed')
+  expect(reopened.get('fresh')).toMatchObject({ status: 'approved', bindingKey: OTHER_KEY })
+  expect(reopened.consume('fresh', OTHER_KEY).outcome).toBe('consumed')
+
+  clock += SETTLED_RETENTION_MS
+  reopened.sweep()
+  expect(reopened.get('used')).toBeUndefined()
+})
+
+test('舊版狀態檔（沒有 bindingKey 欄位）照常載入，綁定 key 視為 null', () => {
+  const legacy = {
+    id: 'old', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
+    createdAtMs: clock, expiresAtMs: clock + TIMEOUT_MS, commentTimeoutMs: COMMENT_TIMEOUT_MS,
+    commentDeadlineMs: null, resolvedAtMs: clock, messages: [{ chatId: CHAT_ID, messageId: 10 }], prompts: [],
+  }
+  writeFileSync(filePath, JSON.stringify({ version: 1, requests: [legacy] }))
+  const store = openStore()
+  expect(store.get('old')).toMatchObject({ status: 'approved', bindingKey: null })
+  expect(store.consume('old', KEY).outcome).toBe('binding_mismatch')
+  expect(readdirSync(dir).some(name => name.startsWith('approvals.json.corrupt-'))).toBe(false)
+})
+
+test('狀態檔裡 bindingKey 型別不對視為損毀', () => {
+  const bad = {
+    id: 'a', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
+    createdAtMs: 1, expiresAtMs: 2, commentTimeoutMs: 3, commentDeadlineMs: null, resolvedAtMs: 1,
+    messages: [], prompts: [], bindingKey: 42,
+  }
+  writeFileSync(filePath, JSON.stringify({ version: 1, requests: [bad] }))
+  expect(openStore().size()).toBe(0)
+  expect(readdirSync(dir).some(name => name.startsWith('approvals.json.corrupt-'))).toBe(true)
 })

@@ -7,7 +7,7 @@
  * against a fake in tests.
  *
  * Two entry points, on purpose kept apart:
- * - create / get / cancel — reachable from the loopback interface;
+ * - create / get / cancel / consume — reachable from the loopback interface;
  * - interceptUpdate — reachable only from the getUpdates loop.
  * Only the second one can produce a decision.
  */
@@ -19,6 +19,7 @@ import {
   type ApprovalKind,
   type ApprovalRequest,
   type ApprovalStore,
+  type ConsumeOutcome,
   type SentMessage,
 } from './approval-store'
 
@@ -27,6 +28,9 @@ export const APPROVAL_CALLBACK_PREFIX = 'appr:'
 /** Request ids: short enough that the longest callback_data stays under Telegram's 64 bytes. */
 export const APPROVAL_ID_PATTERN = '[A-Za-z0-9_-]{1,40}'
 export const APPROVAL_ID_RE = new RegExp(`^${APPROVAL_ID_PATTERN}$`)
+/** Binding keys (JP-374): room for a hex sha256 (64) or sha512 (128). */
+export const BINDING_KEY_PATTERN = '[A-Za-z0-9_-]{1,128}'
+export const BINDING_KEY_RE = new RegExp(`^${BINDING_KEY_PATTERN}$`)
 const CALLBACK_RE = new RegExp(`^${APPROVAL_CALLBACK_PREFIX}(${ALL_ACTIONS.join('|')}):(${APPROVAL_ID_PATTERN})$`)
 
 /** Telegram caps a message at 4096 UTF-16 code units. */
@@ -90,6 +94,8 @@ export type CreateApprovalInput = {
   text: string
   timeoutSeconds: number
   commentTimeoutSeconds: number
+  /** Ties the approval to what the caller will do with it; omitted = unbound, never consumable. */
+  bindingKey?: string
 }
 
 export type CreateApprovalError = 'duplicate_id' | 'no_recipient' | 'telegram_send_failed' | 'too_many_requests'
@@ -115,6 +121,8 @@ export type ApprovalService = {
   get: (id: string) => ApprovalRequest | undefined
   /** Cancel an open request and mark its message as handled locally. */
   cancel: (id: string) => Promise<ApprovalRequest | undefined>
+  /** Use up an approved, bound request once, with the clock applied first. Never produces `approved`. */
+  consume: (id: string, bindingKey: string) => Promise<ConsumeOutcome>
   /**
    * Handle an update that belongs to this feature.
    *
@@ -227,6 +235,7 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
         id: input.id,
         kind: input.kind,
         text: input.text,
+        bindingKey: input.bindingKey ?? null,
         createdAtMs,
         expiresAtMs: createdAtMs + input.timeoutSeconds * MS_PER_SECOND,
         commentTimeoutMs: input.commentTimeoutSeconds * MS_PER_SECOND,
@@ -249,6 +258,11 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     if (result.outcome === 'not_found') return undefined
     if (result.outcome === 'cancelled') await rewriteMessages(result.request)
     return result.request
+  }
+
+  const consume = async (id: string, bindingKey: string): Promise<ConsumeOutcome> => {
+    await sweep()
+    return store.consume(id, bindingKey)
   }
 
   const askForComment = async (request: ApprovalRequest, chatId: number, messageId: number): Promise<void> => {
@@ -341,5 +355,5 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     return () => clearInterval(timer)
   }
 
-  return { create, get, cancel, interceptUpdate, sweep, start }
+  return { create, get, cancel, consume, interceptUpdate, sweep, start }
 }

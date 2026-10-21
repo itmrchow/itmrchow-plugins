@@ -805,3 +805,104 @@ describe('poller 重啟', () => {
     expect((await statusOf(world, 'R60')).status).toBe('pending')
   }, TEST_TIMEOUT_MS)
 })
+
+describe('綁定與一次性消耗（JP-374）', () => {
+  const KEY = 'a'.repeat(64)
+  const OTHER_KEY = 'b'.repeat(64)
+  const consume = (world: World, id: string, bindingKey = KEY): Promise<Reply> =>
+    call(world, 'POST', `/approvals/${id}/consume`, { binding_key: bindingKey })
+
+  test('按允許後只能以相同 key 消耗一次；consumed 與未消耗的核准都跨重啟保留', async () => {
+    const world = await startWorld()
+    const used = await create(world, 'B1', 'allow_deny', { binding_key: KEY })
+    const fresh = await create(world, 'B2', 'allow_deny', { binding_key: OTHER_KEY })
+    expect(await statusOf(world, 'B1')).toMatchObject({ status: 'pending', binding_key: KEY })
+    pressButton(world, 'appr:allow:B1', U1, used.messageId)
+    pressButton(world, 'appr:allow:B2', U1, fresh.messageId)
+    await drained(world)
+
+    expect((await consume(world, 'B1', OTHER_KEY)).body).toMatchObject({ error: 'binding_mismatch' })
+    expect(await consume(world, 'B1')).toMatchObject({ status: 200, body: { status: 'consumed', binding_key: KEY } })
+    expect((await consume(world, 'B1')).body).toMatchObject({ error: 'already_consumed' })
+
+    await stopPoller(world)
+    world.stderr.length = 0
+    await startPoller(world, restartEnv)
+
+    expect(await statusOf(world, 'B1')).toMatchObject({ status: 'consumed', decision: 'allow', binding_key: KEY })
+    expect((await consume(world, 'B1')).status).toBe(409)
+    expect(await statusOf(world, 'B2')).toMatchObject({ status: 'approved', binding_key: OTHER_KEY })
+    expect((await consume(world, 'B2', OTHER_KEY)).status).toBe(200)
+  }, TEST_TIMEOUT_MS)
+
+  test('非 allowFrom 的人按允許：請求仍 pending，消耗回 409 not_approved', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B3', 'allow_deny', { binding_key: KEY })
+    pressButton(world, 'appr:allow:B3', U2, messageId)
+    await drained(world)
+    expect((await statusOf(world, 'B3')).status).toBe('pending')
+    expect(await consume(world, 'B3')).toMatchObject({ status: 409, body: { error: 'not_approved' } })
+  }, TEST_TIMEOUT_MS)
+
+  test('T3 建立後以任何 loopback 動作都改不了綁定 key', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B5', 'allow_deny', { binding_key: KEY })
+    expect((await call(world, 'POST', '/approvals', { id: 'B5', text: 't', kind: 'allow_deny', binding_key: OTHER_KEY })).status).toBe(409)
+    for (const verb of ['binding_key', 'rebind', 'update']) {
+      expect((await call(world, 'POST', `/approvals/B5/${verb}`, { binding_key: OTHER_KEY })).status).toBe(404)
+    }
+    for (const method of ['PUT', 'PATCH', 'POST']) {
+      expect((await call(world, method, '/approvals/B5', { binding_key: OTHER_KEY })).status).toBe(405)
+    }
+    expect((await call(world, 'GET', `/approvals/B5?binding_key=${OTHER_KEY}`)).body).toMatchObject({ binding_key: KEY })
+    expect((await consume(world, 'B5', OTHER_KEY)).body).toMatchObject({ error: 'binding_mismatch' })
+    pressButton(world, 'appr:allow:B5', U1, messageId)
+    await drained(world)
+    expect((await consume(world, 'B5', OTHER_KEY)).body).toMatchObject({ error: 'binding_mismatch' })
+    expect(await statusOf(world, 'B5')).toMatchObject({ status: 'approved', binding_key: KEY })
+    expect((await call(world, 'POST', '/approvals/B5/cancel', { binding_key: OTHER_KEY })).body).toMatchObject({ binding_key: KEY })
+  }, TEST_TIMEOUT_MS)
+
+  test('T7 非 allowFrom 的人按退回並回覆意見：請求仍 pending', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B6', 'approve_reject', { binding_key: KEY })
+    pressButton(world, 'appr:reject:B6', U2, messageId, U1)
+    sendDm(world, U2, '外人的意見', { replyTo: messageId, chatId: U1 })
+    await drained(world)
+    expect(await statusOf(world, 'B6')).toMatchObject({ status: 'pending', decision: null, comment: null })
+  }, TEST_TIMEOUT_MS)
+
+  test('T12 / T13 denied、已取消、逾時、查無 id 都不能消耗，狀態不變也不產生新請求', async () => {
+    const world = await startWorld()
+    const denied = await create(world, 'B7', 'allow_deny', { binding_key: KEY })
+    await create(world, 'B8', 'allow_deny', { binding_key: KEY })
+    await create(world, 'B9', 'allow_deny', { binding_key: KEY, timeout_seconds: SHORT_TIMEOUT_SECONDS })
+    pressButton(world, 'appr:deny:B7', U1, denied.messageId)
+    await drained(world)
+    await call(world, 'POST', '/approvals/B8/cancel')
+    await waitFor(async () => (await statusOf(world, 'B9')).status === 'expired', 'B9 expired')
+    for (const [id, status] of [['B7', 'denied'], ['B8', 'cancelled'], ['B9', 'expired']] as const) {
+      expect(await consume(world, id)).toMatchObject({ status: 409, body: { error: 'not_approved' } })
+      expect((await statusOf(world, id)).status).toBe(status)
+    }
+    expect((await consume(world, 'never')).status).toBe(404)
+    expect((await call(world, 'GET', '/approvals/never')).status).toBe(404)
+  }, TEST_TIMEOUT_MS)
+
+  test('T14 / T15 同時消耗兩次恰好一個成功；consumed 後重按允許仍為 consumed', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'B10', 'allow_deny', { binding_key: KEY })
+    pressButton(world, 'appr:allow:B10', U1, messageId)
+    await drained(world)
+    const results = await Promise.all([consume(world, 'B10'), consume(world, 'B10'), consume(world, 'B10')])
+    expect(results.map(r => r.status).sort()).toEqual([200, 409, 409])
+    pressButton(world, 'appr:allow:B10', U1, messageId)
+    await drained(world)
+    expect((await statusOf(world, 'B10')).status).toBe('consumed')
+  }, TEST_TIMEOUT_MS)
+
+  test('開關未設：消耗也是既有的 404 not found', async () => {
+    const world = await startWorld({})
+    expect(await consume(world, 'B4')).toEqual({ status: 404, body: 'not found' })
+  }, TEST_TIMEOUT_MS)
+})

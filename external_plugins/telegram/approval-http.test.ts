@@ -271,3 +271,123 @@ test('parseCreateBody 只讀取文件化的欄位，未帶逾時用預設值', (
   )
   expect(custom).toMatchObject({ ok: true, input: { timeoutSeconds: 0.5, commentTimeoutSeconds: 0.1 } })
 })
+
+const KEY = 'a'.repeat(64)
+const OTHER_KEY = 'b'.repeat(64)
+
+async function createBound(ctx: Context, id: string, bindingKey: unknown = KEY): Promise<Reply> {
+  return call(ctx.port, 'POST', '/approvals', { id, text: 't', kind: 'allow_deny', binding_key: bindingKey })
+}
+
+test('建立帶 binding_key：建立、查詢、取消的回應都帶回該 key', async () => {
+  const ctx = await startServer({ enabled: true })
+  const created = await createBound(ctx, 'K1')
+  expect(created.status).toBe(201)
+  expect(created.body).toMatchObject({ id: 'K1', status: 'pending', binding_key: KEY })
+  expect((await call(ctx.port, 'GET', '/approvals/K1')).body).toMatchObject({ binding_key: KEY })
+  expect((await call(ctx.port, 'POST', '/approvals/K1/cancel')).body).toMatchObject({ status: 'cancelled', binding_key: KEY })
+})
+
+test('沒帶 binding_key 的請求，回應欄位與既有格式完全相同', async () => {
+  const { port } = await startServer({ enabled: true })
+  await call(port, 'POST', '/approvals', { id: 'K2', text: 't', kind: 'allow_deny' })
+  const queried = await call(port, 'GET', '/approvals/K2')
+  expect(Object.keys(queried.body as object).sort()).toEqual(
+    ['comment', 'created_at_ms', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'],
+  )
+})
+
+test.each([
+  ['空字串', ''],
+  ['非字串', 42],
+  ['null', null],
+  ['含空白', 'a b'],
+  ['含冒號', 'sha256:abc'],
+  ['超過 128 字元', 'a'.repeat(129)],
+])('建立時 binding_key %s 回 400，不發訊息', async (_name, bindingKey) => {
+  const ctx = await startServer({ enabled: true })
+  const res = await createBound(ctx, 'bad', bindingKey)
+  expect(res.status).toBe(400)
+  expect(res.body).toMatchObject({ error: 'invalid_request' })
+  expect(ctx.sent).toEqual([])
+})
+
+test('消耗：按允許後以相同 key 消耗 -> 200 consumed，之後查詢為 consumed、再消耗回 409 already_consumed', async () => {
+  const ctx = await startServer({ enabled: true })
+  await createBound(ctx, 'K3')
+  await ctx.service?.interceptUpdate(pressAllow('K3', ctx.sent[0]))
+  const consumed = await call(ctx.port, 'POST', '/approvals/K3/consume', { binding_key: KEY })
+  expect(consumed.status).toBe(200)
+  expect(consumed.body).toMatchObject({ id: 'K3', status: 'consumed', decision: 'allow', binding_key: KEY })
+  expect(await statusOf(ctx.port, 'K3')).toBe('consumed')
+  const again = await call(ctx.port, 'POST', '/approvals/K3/consume', { binding_key: KEY })
+  expect(again.status).toBe(409)
+  expect(again.body).toMatchObject({ error: 'already_consumed', request: { id: 'K3', status: 'consumed' } })
+})
+
+test('消耗：未 approved 回 409 not_approved；key 不同或沒綁 key 回 409 binding_mismatch；狀態都不變', async () => {
+  const ctx = await startServer({ enabled: true })
+  await createBound(ctx, 'K4')
+  const pending = await call(ctx.port, 'POST', '/approvals/K4/consume', { binding_key: KEY })
+  expect(pending).toMatchObject({ status: 409, body: { error: 'not_approved', request: { status: 'pending' } } })
+
+  await ctx.service?.interceptUpdate(pressAllow('K4', ctx.sent[0]))
+  const borrowed = await call(ctx.port, 'POST', '/approvals/K4/consume', { binding_key: OTHER_KEY })
+  expect(borrowed).toMatchObject({ status: 409, body: { error: 'binding_mismatch' } })
+  expect(await statusOf(ctx.port, 'K4')).toBe('approved')
+
+  await call(ctx.port, 'POST', '/approvals', { id: 'K5', text: 't', kind: 'allow_deny' })
+  await ctx.service?.interceptUpdate(pressAllow('K5', ctx.sent[1]))
+  const unbound = await call(ctx.port, 'POST', '/approvals/K5/consume', { binding_key: KEY })
+  expect(unbound).toMatchObject({ status: 409, body: { error: 'binding_mismatch' } })
+  expect(await statusOf(ctx.port, 'K5')).toBe('approved')
+})
+
+test('消耗：查無 id 回 404；body 不合法回 400；非 POST 回 405', async () => {
+  const ctx = await startServer({ enabled: true })
+  await createBound(ctx, 'K6')
+  expect(await call(ctx.port, 'POST', '/approvals/never/consume', { binding_key: KEY })).toEqual({
+    status: 404,
+    body: { error: 'not_found' },
+  })
+  for (const body of [undefined, '{not json', '[1]', {}, { binding_key: '' }, { binding_key: 7 }, { binding_key: 'a b' }]) {
+    const res = await call(ctx.port, 'POST', '/approvals/K6/consume', body)
+    expect(res).toMatchObject({ status: 400, body: { error: 'invalid_request' } })
+  }
+  for (const method of ['GET', 'PUT', 'DELETE']) {
+    expect((await call(ctx.port, method, '/approvals/K6/consume')).status).toBe(405)
+  }
+  expect((await call(ctx.port, 'POST', '/approvals/K6/consume/x', { binding_key: KEY })).status).toBe(404)
+  expect(await statusOf(ctx.port, 'K6')).toBe('pending')
+})
+
+test('消耗夾帶結果欄位也不會讓 pending 變成 approved', async () => {
+  const ctx = await startServer({ enabled: true })
+  await createBound(ctx, 'K7')
+  const smuggled = { binding_key: KEY, status: 'approved', decision: 'allow' }
+  expect((await call(ctx.port, 'POST', '/approvals/K7/consume', smuggled)).status).toBe(409)
+  expect(await statusOf(ctx.port, 'K7')).toBe('pending')
+})
+
+test('消耗帶 Origin header 一律 403，不消耗', async () => {
+  const ctx = await startServer({ enabled: true })
+  await createBound(ctx, 'K8')
+  await ctx.service?.interceptUpdate(pressAllow('K8', ctx.sent[0]))
+  const res = await fetch(`http://127.0.0.1:${ctx.port}/approvals/K8/consume`, {
+    method: 'POST',
+    headers: { origin: 'https://evil.example', 'content-type': 'text/plain' },
+    body: JSON.stringify({ binding_key: KEY }),
+  })
+  expect(res.status).toBe(403)
+  expect(await statusOf(ctx.port, 'K8')).toBe('approved')
+})
+
+test('開關未設（未掛路由）時消耗也落到既有的 404 not found', async () => {
+  const { port } = await startServer({ enabled: false })
+  expect(await call(port, 'POST', '/approvals/R1/consume', { binding_key: KEY })).toEqual({ status: 404, body: 'not found' })
+})
+
+test('parseCreateBody 讀可選的 binding_key', () => {
+  const parsed = parseCreateBody(JSON.stringify({ id: 'a', text: 't', kind: 'allow_deny', binding_key: KEY }), DEFAULTS)
+  expect(parsed).toMatchObject({ ok: true, input: { bindingKey: KEY } })
+})
