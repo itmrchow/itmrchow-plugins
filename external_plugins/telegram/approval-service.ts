@@ -28,8 +28,11 @@ export const APPROVAL_CALLBACK_PREFIX = 'appr:'
 /** Request ids: short enough that the longest callback_data stays under Telegram's 64 bytes. */
 export const APPROVAL_ID_PATTERN = '[A-Za-z0-9_-]{1,40}'
 export const APPROVAL_ID_RE = new RegExp(`^${APPROVAL_ID_PATTERN}$`)
-/** Binding keys (JP-374): room for a hex sha256 (64) or sha512 (128). */
-export const BINDING_KEY_PATTERN = '[A-Za-z0-9_-]{1,128}'
+/**
+ * Binding keys (JP-374): a hex sha256 (64) up to a hex sha512 (128). The lower
+ * bound turns a caller that sends something other than a hash into a 400.
+ */
+export const BINDING_KEY_PATTERN = '[A-Za-z0-9_-]{64,128}'
 export const BINDING_KEY_RE = new RegExp(`^${BINDING_KEY_PATTERN}$`)
 const CALLBACK_RE = new RegExp(`^${APPROVAL_CALLBACK_PREFIX}(${ALL_ACTIONS.join('|')}):(${APPROVAL_ID_PATTERN})$`)
 
@@ -94,8 +97,8 @@ export type CreateApprovalInput = {
   text: string
   timeoutSeconds: number
   commentTimeoutSeconds: number
-  /** Ties the approval to what the caller will do with it; omitted = unbound, never consumable. */
-  bindingKey?: string
+  /** Ties the approval to what the caller will do with it; null = unbound, never consumable. */
+  bindingKey: string | null
 }
 
 export type CreateApprovalError = 'duplicate_id' | 'no_recipient' | 'telegram_send_failed' | 'too_many_requests'
@@ -121,8 +124,6 @@ export type ApprovalService = {
   get: (id: string) => ApprovalRequest | undefined
   /** Cancel an open request and mark its message as handled locally. */
   cancel: (id: string) => Promise<ApprovalRequest | undefined>
-  /** Use up an approved, bound request once, with the clock applied first. Never produces `approved`. */
-  consume: (id: string, bindingKey: string) => Promise<ConsumeOutcome>
   /**
    * Handle an update that belongs to this feature.
    *
@@ -133,6 +134,15 @@ export type ApprovalService = {
   sweep: () => Promise<void>
   /** Start the background sweep. @returns A function that stops it. */
   start: () => () => void
+  /**
+   * Use up an approved, bound request once, with the clock applied first.
+   * Never produces `approved`, never calls the Bot API before answering.
+   *
+   * @param id - Request id.
+   * @param bindingKey - The key the caller computed for what it is about to do.
+   * @returns The store's outcome; only `consumed` means the caller may act.
+   */
+  consume: (id: string, bindingKey: string) => ConsumeOutcome
 }
 
 function buttonsFor(request: Pick<ApprovalRequest, 'id' | 'kind'>): ApprovalButton[] {
@@ -235,7 +245,7 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
         id: input.id,
         kind: input.kind,
         text: input.text,
-        bindingKey: input.bindingKey ?? null,
+        bindingKey: input.bindingKey,
         createdAtMs,
         expiresAtMs: createdAtMs + input.timeoutSeconds * MS_PER_SECOND,
         commentTimeoutMs: input.commentTimeoutSeconds * MS_PER_SECOND,
@@ -258,11 +268,6 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     if (result.outcome === 'not_found') return undefined
     if (result.outcome === 'cancelled') await rewriteMessages(result.request)
     return result.request
-  }
-
-  const consume = async (id: string, bindingKey: string): Promise<ConsumeOutcome> => {
-    await sweep()
-    return store.consume(id, bindingKey)
   }
 
   const askForComment = async (request: ApprovalRequest, chatId: number, messageId: number): Promise<void> => {
@@ -355,5 +360,13 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     return () => clearInterval(timer)
   }
 
-  return { create, get, cancel, consume, interceptUpdate, sweep, start }
+  // Like get(): the clock is applied first, but messages of whatever just
+  // timed out are rewritten in the background, so the answer does not wait on
+  // Telegram.
+  const consume = (id: string, bindingKey: string): ConsumeOutcome => {
+    for (const request of store.sweep()) void rewriteMessages(request)
+    return store.consume(id, bindingKey)
+  }
+
+  return { create, get, cancel, interceptUpdate, sweep, start, consume }
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Update } from 'grammy/types'
@@ -263,7 +263,7 @@ test('parseCreateBody 只讀取文件化的欄位，未帶逾時用預設值', (
   const parsed = parseCreateBody(JSON.stringify({ id: 'a', text: 't', kind: 'approve_reject', status: 'approved' }), DEFAULTS)
   expect(parsed).toEqual({
     ok: true,
-    input: { id: 'a', text: 't', kind: 'approve_reject', timeoutSeconds: 60, commentTimeoutSeconds: 5 },
+    input: { id: 'a', text: 't', kind: 'approve_reject', timeoutSeconds: 60, commentTimeoutSeconds: 5, bindingKey: null },
   })
   const custom = parseCreateBody(
     JSON.stringify({ id: 'a', text: 't', kind: 'allow_deny', timeout_seconds: 0.5, comment_timeout_seconds: 0.1 }),
@@ -303,8 +303,9 @@ test.each([
   ['null', null],
   ['含空白', 'a b'],
   ['含冒號', 'sha256:abc'],
+  ['少於 64 字元', 'a'.repeat(63)],
   ['超過 128 字元', 'a'.repeat(129)],
-])('建立時 binding_key %s 回 400，不發訊息', async (_name, bindingKey) => {
+])('建立時 binding_key %s 回 400，不發訊息', async (_name: string, bindingKey: unknown) => {
   const ctx = await startServer({ enabled: true })
   const res = await createBound(ctx, 'bad', bindingKey)
   expect(res.status).toBe(400)
@@ -390,4 +391,16 @@ test('開關未設（未掛路由）時消耗也落到既有的 404 not found', 
 test('parseCreateBody 讀可選的 binding_key', () => {
   const parsed = parseCreateBody(JSON.stringify({ id: 'a', text: 't', kind: 'allow_deny', binding_key: KEY }), DEFAULTS)
   expect(parsed).toMatchObject({ ok: true, input: { bindingKey: KEY } })
+})
+
+test('消耗時狀態檔寫不進去 -> 503 persist_failed，之後同一筆也不能再消耗', async () => {
+  const ctx = await startServer({ enabled: true })
+  await createBound(ctx, 'K9')
+  await ctx.service?.interceptUpdate(pressAllow('K9', ctx.sent[0]))
+  mkdirSync(join(dir, 'approvals.json.tmp'))
+  const failed = await call(ctx.port, 'POST', '/approvals/K9/consume', { binding_key: KEY })
+  expect(failed).toMatchObject({ status: 503, body: { error: 'persist_failed', request: { status: 'consumed' } } })
+  expect((await call(ctx.port, 'POST', '/approvals/K9/consume', { binding_key: KEY })).body).toMatchObject({
+    error: 'already_consumed',
+  })
 })

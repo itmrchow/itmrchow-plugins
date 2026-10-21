@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ApprovalStore, SETTLED_RETENTION_MS, type ApprovalKind, type NewApproval } from './approval-store'
@@ -28,6 +28,7 @@ const newApproval = (id: string, kind: ApprovalKind = 'allow_deny', messageId = 
   id,
   kind,
   text: `請求 ${id}`,
+  bindingKey: null,
   createdAtMs: clock,
   expiresAtMs: clock + TIMEOUT_MS,
   commentTimeoutMs: COMMENT_TIMEOUT_MS,
@@ -244,20 +245,20 @@ test('store 沒有任何可直接寫入決定的公開方法', () => {
 const KEY = 'a'.repeat(64)
 const OTHER_KEY = 'b'.repeat(64)
 
-const boundApproval = (id: string, bindingKey = KEY, messageId = 10): NewApproval => ({
+const buildBoundApproval = (id: string, bindingKey: string = KEY, messageId: number = 10): NewApproval => ({
   ...newApproval(id, 'allow_deny', messageId),
   bindingKey,
 })
 
 test('建立時帶綁定 key 會存下來；沒帶時為 null', () => {
   const store = openStore()
-  expect(store.add(boundApproval('a')).bindingKey).toBe(KEY)
+  expect(store.add(buildBoundApproval('a')).bindingKey).toBe(KEY)
   expect(store.add(newApproval('b', 'allow_deny', 11)).bindingKey).toBeNull()
 })
 
 test('approved 且 key 相同 -> 消耗成功轉 consumed，原按鈕保留', () => {
   const store = openStore()
-  store.add(boundApproval('a'))
+  store.add(buildBoundApproval('a'))
   store.press('a', 'allow', on())
   const resolvedAtMs = store.get('a')?.resolvedAtMs
   clock += 1000
@@ -267,7 +268,7 @@ test('approved 且 key 相同 -> 消耗成功轉 consumed，原按鈕保留', ()
 
 test('同一筆核准只能消耗一次', () => {
   const store = openStore()
-  store.add(boundApproval('a'))
+  store.add(buildBoundApproval('a'))
   store.press('a', 'allow', on())
   expect(store.consume('a', KEY).outcome).toBe('consumed')
   expect(store.consume('a', KEY).outcome).toBe('already_consumed')
@@ -283,11 +284,11 @@ test('approve_reject 按 approve 後同樣可消耗', () => {
 
 test('未 approved 的請求不能消耗，狀態不變', () => {
   const store = openStore()
-  store.add(boundApproval('pending'))
-  store.add(boundApproval('denied', KEY, 11))
-  store.add(boundApproval('cancelled', KEY, 12))
+  store.add(buildBoundApproval('pending'))
+  store.add(buildBoundApproval('denied', KEY, 11))
+  store.add(buildBoundApproval('cancelled', KEY, 12))
   store.add({ ...newApproval('waiting', 'approve_reject', 13), bindingKey: KEY })
-  store.add(boundApproval('expired', KEY, 14))
+  store.add(buildBoundApproval('expired', KEY, 14))
   store.press('denied', 'deny', on(11))
   store.cancel('cancelled')
   store.press('waiting', 'reject', on(13))
@@ -307,14 +308,14 @@ test('未 approved 的請求不能消耗，狀態不變', () => {
 
 test('pending 中的請求不能消耗（未逾時）', () => {
   const store = openStore()
-  store.add(boundApproval('a'))
+  store.add(buildBoundApproval('a'))
   expect(store.consume('a', KEY).outcome).toBe('not_approved')
   expect(store.get('a')?.status).toBe('pending')
 })
 
 test('key 不同或請求沒綁 key -> binding_mismatch，核准不被借用', () => {
   const store = openStore()
-  store.add(boundApproval('a'))
+  store.add(buildBoundApproval('a'))
   store.add(newApproval('unbound', 'allow_deny', 11))
   store.press('a', 'allow', on())
   store.press('unbound', 'allow', on(11))
@@ -331,7 +332,7 @@ test('消耗查無的 id 回 not_found', () => {
 
 test('consumed 之後按按鈕、取消都不翻盤', () => {
   const store = openStore()
-  store.add(boundApproval('a'))
+  store.add(buildBoundApproval('a'))
   store.press('a', 'allow', on())
   store.consume('a', KEY)
   expect(store.press('a', 'allow', on()).outcome).toBe('already_settled')
@@ -341,8 +342,8 @@ test('consumed 之後按按鈕、取消都不翻盤', () => {
 
 test('consumed 與綁定 key 重開後保留；consumed 過了保留期一樣清掉', () => {
   const store = openStore()
-  store.add(boundApproval('used'))
-  store.add(boundApproval('fresh', OTHER_KEY, 11))
+  store.add(buildBoundApproval('used'))
+  store.add(buildBoundApproval('fresh', OTHER_KEY, 11))
   store.press('used', 'allow', on())
   store.press('fresh', 'allow', on(11))
   store.consume('used', KEY)
@@ -380,4 +381,31 @@ test('狀態檔裡 bindingKey 型別不對視為損毀', () => {
   writeFileSync(filePath, JSON.stringify({ version: 1, requests: [bad] }))
   expect(openStore().size()).toBe(0)
   expect(readdirSync(dir).some(name => name.startsWith('approvals.json.corrupt-'))).toBe(true)
+})
+
+test('消耗時寫檔失敗 -> persist_failed：記憶體維持 consumed，不能再用；重啟後回到最後落檔的 approved，仍只能成功消耗一次', () => {
+  const store = openStore()
+  store.add(buildBoundApproval('a'))
+  store.press('a', 'allow', on())
+  // A directory where the temp file goes makes the next save fail.
+  mkdirSync(`${filePath}.tmp`)
+  expect(store.consume('a', KEY).outcome).toBe('persist_failed')
+  expect(store.get('a')?.status).toBe('consumed')
+  expect(store.consume('a', KEY).outcome).toBe('already_consumed')
+
+  rmSync(`${filePath}.tmp`, { recursive: true })
+  const reopened = openStore()
+  expect(reopened.get('a')?.status).toBe('approved')
+  expect(reopened.consume('a', KEY).outcome).toBe('consumed')
+  expect(openStore().get('a')?.status).toBe('consumed')
+})
+
+test('其他轉換寫檔失敗時照舊：決定留在記憶體，重啟後回到較保守的落檔狀態', () => {
+  const store = openStore()
+  store.add(newApproval('a'))
+  mkdirSync(`${filePath}.tmp`)
+  expect(store.press('a', 'allow', on()).outcome).toBe('resolved')
+  expect(store.get('a')?.status).toBe('approved')
+  rmSync(`${filePath}.tmp`, { recursive: true })
+  expect(openStore().get('a')?.status).toBe('pending')
 })

@@ -141,7 +141,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `kind` | 是 | `allow_deny`（按鈕：允許 / 拒絕）或 `approve_reject`（按鈕：approve / 退回）。 |
 | `timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
 | `comment_timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
-| `binding_key` | 否 | `[A-Za-z0-9_-]{1,128}`，例如該核准要放行的指令全文的 sha256 十六進位字串。把核准綁到這個 key，之後可**消耗**一次（見「消耗」）。不會顯示在 Telegram 上，給 user 看的內容請放 `text`。不帶 = 未綁定，永遠不能消耗。 |
+| `binding_key` | 否 | `[A-Za-z0-9_-]{64,128}`，例如該核准要放行的指令全文的 sha256 十六進位字串。把核准綁到這個 key，之後可**消耗**一次（見「消耗」）。不會顯示在 Telegram 上，給 user 看的內容請放 `text`。不帶 = 未綁定，永遠不能消耗。 |
 
 | 回應 | body | 何時 |
 | --- | --- | --- |
@@ -218,11 +218,15 @@ poller 內一步完成：只有請求的 `binding_key` 與送來的相同、**�
 | `409 {"error":"binding_mismatch","request":{...}}` | 請求沒有 `binding_key`，或 key 不同。不改任何東西 —— 核准不能借給別的 key 用。 |
 | `409 {"error":"already_consumed","request":{...}}` | 先前已消耗過。 |
 | `409 {"error":"not_approved","request":{...}}` | 狀態為 `pending`、`awaiting_comment`、`denied`、`cancelled` 或 `expired`。不改任何東西。 |
+| `503 {"error":"persist_failed","request":{...}}` | 原為 `approved` 且 key 相符，但狀態檔寫不進去。**不得依這筆核准行事。** poller 執行期間它維持已用掉；重啟後可能回到最後落檔的 `approved`，此時可再成功消耗一次。不論哪種都最多用一次。 |
 | `400 {"error":"invalid_request","detail":"..."}` | 缺 `binding_key` / 格式不合法、JSON 格式錯誤、body 超過 32 KB。 |
 | `404 {"error":"not_found"}` | 查無此 id。 |
 
 檢查依上表順序（先比 key、再看是否已消耗、最後看是否 approved）。核准後一直沒被消耗的請求維持
-`approved`，直到按下按鈕滿 24 小時被清除。
+`approved`，直到按下按鈕滿 24 小時被清除。只有 `200` 代表呼叫方可以照做。
+
+查詢會回傳 `binding_key`，所以本機任何程序都能消耗一筆不是自己要的核准。這只會拿走核准（真正的呼叫方會拿到
+`already_consumed` 而不執行），不可能多給出核准。
 
 **其他** `/approvals` 底下的請求：路徑對但方法錯回 `405 {"error":"method_not_allowed"}`；路徑不存在回
 `404 {"error":"not_found"}`。
@@ -254,8 +258,8 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
 
 ### 重啟與狀態
 
-請求同步寫入 `$TELEGRAM_STATE_DIR/approvals.json`（權限 0600，先落檔再改 Telegram 訊息；寫檔失敗只記 log，
-記憶體內的結果在下次重啟前仍有效），只有 poller 讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
+請求同步寫入 `$TELEGRAM_STATE_DIR/approvals.json`（權限 0600，先落檔並 fsync 再改 Telegram 訊息；寫檔失敗只記 log，
+記憶體內的結果在下次重啟前仍有效 —— 消耗例外：寫檔失敗回 `503 persist_failed`，不回 `200`），只有 poller 讀寫。poller 重啟後結果保留，等待中的請求仍可用原本的按鈕完成，不重發訊息。停機期間按下的按鈕在
 重啟後處理；期間跨過期限的請求變成 `expired`。檔案遺失或讀不了時 poller 從空狀態啟動（壞檔保留為
 `approvals.json.corrupt-<時間戳>`），先前的 id 查詢為 `not_found`。
 `binding_key` 與 `consumed` 跟其他欄位一樣跨重啟保留。JP-374 之前寫的狀態檔照常載入（其中的請求視為未綁定）；

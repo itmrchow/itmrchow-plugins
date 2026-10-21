@@ -152,7 +152,7 @@ feature is off.
 | `kind` | yes | `allow_deny` (buttons 允許 / 拒絕) or `approve_reject` (buttons approve / 退回). |
 | `timeout_seconds` | no | Number, `0 < n <= 604800`. |
 | `comment_timeout_seconds` | no | Number, `0 < n <= 604800`. |
-| `binding_key` | no | `[A-Za-z0-9_-]{1,128}`, e.g. a hex sha256 of the command the approval is for. Binds the approval to that key so it can be **consumed** once (see Consume). Not shown in Telegram — put what the user should read in `text`. Omitted: the request is unbound and can never be consumed. |
+| `binding_key` | no | `[A-Za-z0-9_-]{64,128}`, e.g. a hex sha256 of the command the approval is for. Binds the approval to that key so it can be **consumed** once (see Consume). Not shown in Telegram — put what the user should read in `text`. Omitted: the request is unbound and can never be consumed. |
 
 | Reply | Body | When |
 | --- | --- | --- |
@@ -241,12 +241,17 @@ touched.
 | `409 {"error":"binding_mismatch","request":{...}}` | The request has no `binding_key`, or a different one. Nothing changed — an approval cannot be borrowed for another key. |
 | `409 {"error":"already_consumed","request":{...}}` | It was consumed before. |
 | `409 {"error":"not_approved","request":{...}}` | It is `pending`, `awaiting_comment`, `denied`, `cancelled` or `expired`. Nothing changed. |
+| `503 {"error":"persist_failed","request":{...}}` | It was `approved` with this key, but the state file could not be written. **Do not act on the approval.** It stays used up while the poller runs; after a restart it may read `approved` again (the last saved state) and can then be consumed once. Either way it is used at most once. |
 | `400 {"error":"invalid_request","detail":"..."}` | Missing / invalid `binding_key`, malformed JSON, or a body over 32 KB. |
 | `404 {"error":"not_found"}` | Unknown id. |
 
 The checks run in that order (key, then consumed, then approved). An approved
 request that is never consumed stays `approved` until it is dropped, 24 hours
-after the button was pressed.
+after the button was pressed. Only `200` means the caller may go ahead.
+
+`binding_key` is returned by the query, so any local process can consume an
+approval it did not ask for. That only ever takes an approval away (the real
+caller then gets `already_consumed` and does not proceed); it cannot grant one.
 
 **Anything else** under `/approvals`: a known path with the wrong method answers
 `405 {"error":"method_not_allowed"}`; an unknown path answers
@@ -290,9 +295,10 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
 ### Restarts and state
 
 Requests are mirrored to `$TELEGRAM_STATE_DIR/approvals.json` (mode 0600,
-written before the Telegram message is updated; a failed write is logged and
-the in-memory result still stands until the next restart), read only by the
-poller. After
+written and fsynced before the Telegram message is updated; a failed write is
+logged and the in-memory result still stands until the next restart — except
+for Consume, which answers `503 persist_failed` instead of `200`), read only by
+the poller. After
 a poller restart, results are kept and pending requests stay answerable through
 their original buttons — nothing is re-sent. A button pressed while the poller
 was down is handled when it comes back; a request whose deadline passed

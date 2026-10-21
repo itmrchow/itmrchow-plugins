@@ -11,12 +11,15 @@
  *
  * consume() (JP-374) only ever moves an approval the other way: an `approved`
  * request created with a binding key becomes `consumed` the first time a caller
- * presents that same key, so one approval authorises one command, once.
+ * presents that same key, so one approval authorises one command, once. It is
+ * also the one transition that reports a failed save to its caller, because
+ * rolling it back would bring an approval back to life.
  *
  * IO is limited to the one state file, so every transition can be pinned by
  * plain tests with an injected clock.
  */
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 export type ApprovalKind = 'allow_deny' | 'approve_reject'
 export type ApprovalAction = 'allow' | 'deny' | 'approve' | 'reject'
@@ -58,8 +61,8 @@ export type ApprovalRequest = {
 
 export type NewApproval = Pick<
   ApprovalRequest,
-  'id' | 'kind' | 'text' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
-> & { bindingKey?: string | null }
+  'id' | 'kind' | 'text' | 'bindingKey' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
+>
 
 export type PressOutcome =
   | { outcome: 'resolved' | 'awaiting_comment' | 'already_settled'; request: ApprovalRequest }
@@ -70,7 +73,10 @@ export type CancelOutcome =
   | { outcome: 'not_found' }
 
 export type ConsumeOutcome =
-  | { outcome: 'consumed' | 'binding_mismatch' | 'already_consumed' | 'not_approved'; request: ApprovalRequest }
+  | {
+      outcome: 'consumed' | 'binding_mismatch' | 'already_consumed' | 'not_approved' | 'persist_failed'
+      request: ApprovalRequest
+    }
   | { outcome: 'not_found' }
 
 /** Buttons each kind offers; a press outside this set is forged or stale. */
@@ -202,7 +208,6 @@ export class ApprovalStore {
     if (this.#requests.has(input.id)) throw new Error(`approval ${input.id} already exists`)
     const request: ApprovalRequest = {
       ...input,
-      bindingKey: input.bindingKey ?? null,
       status: 'pending',
       decision: null,
       comment: null,
@@ -322,28 +327,6 @@ export class ApprovalStore {
   }
 
   /**
-   * Use up an approval: the one way out of `approved`. The key must equal the
-   * one the request was created with, so an approval cannot be borrowed by a
-   * caller presenting a different key, and a request created without a key can
-   * never be consumed.
-   *
-   * @param id - Request id.
-   * @param bindingKey - The key the caller computed for what it is about to do.
-   * @returns `consumed` when it just turned `consumed`; anything else left the
-   *   request untouched.
-   */
-  consume(id: string, bindingKey: string): ConsumeOutcome {
-    const request = this.#requests.get(id)
-    if (!request) return { outcome: 'not_found' }
-    if (request.bindingKey !== bindingKey) return { outcome: 'binding_mismatch', request }
-    if (request.status === 'consumed') return { outcome: 'already_consumed', request }
-    if (request.status !== 'approved') return { outcome: 'not_approved', request }
-    request.status = 'consumed'
-    this.#save()
-    return { outcome: 'consumed', request }
-  }
-
-  /**
    * Apply the clock: expire overdue pending requests, settle rejects whose
    * comment never came, and drop settled requests past their retention.
    *
@@ -376,6 +359,35 @@ export class ApprovalStore {
     return changed
   }
 
+  /**
+   * Use up an approval: the one way out of `approved`. The key must equal the
+   * one the request was created with, so an approval cannot be borrowed by a
+   * caller presenting a different key, and a request created without a key can
+   * never be consumed.
+   *
+   * Fails closed on a failed save: the request stays `consumed` in memory (it
+   * cannot be used again while this process lives) but the caller is told
+   * `persist_failed`, so it must not act on the approval. A restart may then
+   * bring the request back as `approved` from the last saved state — still
+   * used at most once, since no caller ever got `consumed` for it.
+   *
+   * @param id - Request id.
+   * @param bindingKey - The key the caller computed for what it is about to do.
+   * @returns `consumed` only when the request just turned `consumed` and that
+   *   is on disk; `persist_failed` when it turned `consumed` but the save
+   *   failed; anything else left the request untouched.
+   */
+  consume(id: string, bindingKey: string): ConsumeOutcome {
+    const request = this.#requests.get(id)
+    if (!request) return { outcome: 'not_found' }
+    if (request.bindingKey !== bindingKey) return { outcome: 'binding_mismatch', request }
+    if (request.status === 'consumed') return { outcome: 'already_consumed', request }
+    if (request.status !== 'approved') return { outcome: 'not_approved', request }
+    request.status = 'consumed'
+    if (!this.#save()) return { outcome: 'persist_failed', request }
+    return { outcome: 'consumed', request }
+  }
+
   #load(): void {
     if (!existsSync(this.#filePath)) return
     try {
@@ -399,24 +411,42 @@ export class ApprovalStore {
     }
   }
 
-  // Synchronous and atomic (tmp + rename), and called before the Telegram
-  // message is rewritten: in the normal case a decision is on disk before the
-  // user is shown it, so a crash in between cannot bring it back as pending.
+  // Synchronous and atomic (tmp + fsync + rename + fsync of the directory),
+  // and called before the Telegram message is rewritten: in the normal case a
+  // decision is on disk before the user is shown it, so a crash or power loss
+  // in between cannot bring it back as pending.
   //
-  // A failed write (disk full, permissions) is only logged: the decision stands
-  // in memory and the message is still rewritten. If the poller then restarts,
-  // that request comes back in its last saved state — never as approved, since
-  // nothing but a button press writes that. There is no fsync either, so power
-  // loss can likewise roll a request back to its previous saved state.
-  #save(): void {
+  // A failed write (disk full, permissions) is logged and reported as false.
+  // Every transition except consume() ignores that: the decision stands in
+  // memory and the message is still rewritten, and if the poller then restarts
+  // the request comes back in its last saved state, which for those
+  // transitions is never more permissive (nothing but a button press writes
+  // `approved`). consume() is the exception — its last saved state is
+  // `approved` — so it hands the failure to its caller instead.
+  #save(): boolean {
     const state: StateFile = { version: STATE_FILE_VERSION, requests: [...this.#requests.values()] }
     const tmp = `${this.#filePath}.tmp`
     try {
-      writeFileSync(tmp, JSON.stringify(state), { mode: STATE_FILE_MODE })
+      const fd = openSync(tmp, 'w', STATE_FILE_MODE)
+      try {
+        writeFileSync(fd, JSON.stringify(state))
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
       chmodSync(tmp, STATE_FILE_MODE)
       renameSync(tmp, this.#filePath)
+      // The rename itself lives in the directory entry.
+      const dirFd = openSync(dirname(this.#filePath), 'r')
+      try {
+        fsyncSync(dirFd)
+      } finally {
+        closeSync(dirFd)
+      }
+      return true
     } catch (err) {
       this.#log(`telegram poller: approvals state save failed: ${err}`)
+      return false
     }
   }
 }

@@ -54,6 +54,7 @@ const CONSUME_REFUSAL_STATUS: Readonly<Record<ConsumeRefusal, number>> = {
   binding_mismatch: HTTP_CONFLICT,
   already_consumed: HTTP_CONFLICT,
   not_approved: HTTP_CONFLICT,
+  persist_failed: HTTP_SERVICE_UNAVAILABLE,
 }
 
 /**
@@ -100,21 +101,6 @@ export function toApprovalView(request: ApprovalRequest): ApprovalView {
   }
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> | string {
-  let body: unknown
-  try {
-    body = JSON.parse(raw)
-  } catch {
-    return 'body is not valid JSON'
-  }
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return 'body must be a JSON object'
-  return body as Record<string, unknown>
-}
-
-function isBindingKey(value: unknown): value is string {
-  return typeof value === 'string' && BINDING_KEY_RE.test(value)
-}
-
 /**
  * Validate a create body. Only the documented fields are read; anything else in
  * the body (a smuggled `status`, `decision`, …) is ignored, never applied.
@@ -143,19 +129,10 @@ export function parseCreateBody(raw: string, defaults: ApprovalHttpDefaults): Pa
   if (!isValidTimeoutSeconds(commentTimeoutSeconds)) {
     return { ok: false, detail: 'comment_timeout_seconds is out of range' }
   }
-  const bindingKey = fields.binding_key
-  if (bindingKey !== undefined && !isBindingKey(bindingKey)) return { ok: false, detail: BINDING_KEY_DETAIL }
-  return {
-    ok: true,
-    input: {
-      id,
-      text,
-      kind: kind as ApprovalKind,
-      timeoutSeconds,
-      commentTimeoutSeconds,
-      ...(bindingKey === undefined ? {} : { bindingKey }),
-    },
-  }
+  const rawBindingKey = fields.binding_key
+  if (rawBindingKey !== undefined && !isBindingKey(rawBindingKey)) return { ok: false, detail: BINDING_KEY_DETAIL }
+  const bindingKey = rawBindingKey ?? null
+  return { ok: true, input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds, bindingKey } }
 }
 
 /**
@@ -174,6 +151,21 @@ export function parseConsumeBody(raw: string): ParsedConsume {
 function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
   res.writeHead(status, { 'content-type': 'application/json' })
   res.end(JSON.stringify(body))
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | string {
+  let body: unknown
+  try {
+    body = JSON.parse(raw)
+  } catch {
+    return 'body is not valid JSON'
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return 'body must be a JSON object'
+  return body as Record<string, unknown>
+}
+
+function isBindingKey(value: unknown): value is string {
+  return typeof value === 'string' && BINDING_KEY_RE.test(value)
 }
 
 function readBody(req: IncomingMessage): Promise<string | null> {
@@ -234,7 +226,7 @@ export function createApprovalHandler(
     if (raw === null) return sendJson(res, HTTP_BAD_REQUEST, { error: 'invalid_request', detail: 'body too large' })
     const parsed = parseConsumeBody(raw)
     if (!parsed.ok) return sendJson(res, HTTP_BAD_REQUEST, { error: 'invalid_request', detail: parsed.detail })
-    const result = await service.consume(id, parsed.bindingKey)
+    const result = service.consume(id, parsed.bindingKey)
     if (result.outcome === 'not_found') return sendJson(res, HTTP_NOT_FOUND, { error: 'not_found' })
     if (result.outcome === 'consumed') return sendJson(res, HTTP_OK, toApprovalView(result.request))
     sendJson(res, CONSUME_REFUSAL_STATUS[result.outcome], {

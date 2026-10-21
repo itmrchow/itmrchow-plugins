@@ -809,7 +809,7 @@ describe('poller 重啟', () => {
 describe('綁定與一次性消耗（JP-374）', () => {
   const KEY = 'a'.repeat(64)
   const OTHER_KEY = 'b'.repeat(64)
-  const consume = (world: World, id: string, bindingKey = KEY): Promise<Reply> =>
+  const consume = (world: World, id: string, bindingKey: string = KEY): Promise<Reply> =>
     call(world, 'POST', `/approvals/${id}/consume`, { binding_key: bindingKey })
 
   test('按允許後只能以相同 key 消耗一次；consumed 與未消耗的核准都跨重啟保留', async () => {
@@ -880,7 +880,7 @@ describe('綁定與一次性消耗（JP-374）', () => {
     pressButton(world, 'appr:deny:B7', U1, denied.messageId)
     await drained(world)
     await call(world, 'POST', '/approvals/B8/cancel')
-    await waitFor(async () => (await statusOf(world, 'B9')).status === 'expired', 'B9 expired')
+    await waitFor(async (): Promise<boolean> => (await statusOf(world, 'B9')).status === 'expired', 'B9 expired')
     for (const [id, status] of [['B7', 'denied'], ['B8', 'cancelled'], ['B9', 'expired']] as const) {
       expect(await consume(world, id)).toMatchObject({ status: 409, body: { error: 'not_approved' } })
       expect((await statusOf(world, id)).status).toBe(status)

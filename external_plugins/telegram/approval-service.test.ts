@@ -96,6 +96,7 @@ const input = (id: string, kind: ApprovalKind = 'allow_deny', text = `請求 ${i
   text,
   timeoutSeconds: TIMEOUT_SECONDS,
   commentTimeoutSeconds: COMMENT_TIMEOUT_SECONDS,
+  bindingKey: null,
 })
 
 let updateId = 0
@@ -533,7 +534,7 @@ test('service 對外沒有任何寫入決定的動作', () => {
 const KEY = 'a'.repeat(64)
 const OTHER_KEY = 'b'.repeat(64)
 
-async function createBound(h: Harness, id: string, bindingKey = KEY): Promise<number> {
+async function createBound(h: Harness, id: string, bindingKey: string = KEY): Promise<number> {
   const before = sentRequests(h).length
   const result = await h.service.create({ ...input(id), bindingKey })
   expect(result.ok).toBe(true)
@@ -554,9 +555,9 @@ test('按允許後以相同 key 消耗一次 -> consumed，第二次 already_con
   const messageId = await createBound(h, 'B3')
   await h.service.interceptUpdate(press('appr:allow:B3', U1, messageId))
   const editsBefore = edits(h).length
-  expect((await h.service.consume('B3', KEY)).outcome).toBe('consumed')
+  expect(h.service.consume('B3', KEY).outcome).toBe('consumed')
   expect(h.service.get('B3')?.status).toBe('consumed')
-  expect((await h.service.consume('B3', KEY)).outcome).toBe('already_consumed')
+  expect(h.service.consume('B3', KEY).outcome).toBe('already_consumed')
   expect(edits(h)).toHaveLength(editsBefore)
 })
 
@@ -564,7 +565,7 @@ test('非 allowFrom 的人按允許後不能消耗：請求仍 pending', async (
   const h = harness()
   const messageId = await createBound(h, 'B4')
   await h.service.interceptUpdate(press('appr:allow:B4', U2, messageId, U1))
-  expect((await h.service.consume('B4', KEY)).outcome).toBe('not_approved')
+  expect(h.service.consume('B4', KEY).outcome).toBe('not_approved')
   expect(h.service.get('B4')?.status).toBe('pending')
 })
 
@@ -572,17 +573,19 @@ test('key 不同不能消耗；查無 id 回 not_found', async () => {
   const h = harness()
   const messageId = await createBound(h, 'B5')
   await h.service.interceptUpdate(press('appr:allow:B5', U1, messageId))
-  expect((await h.service.consume('B5', OTHER_KEY)).outcome).toBe('binding_mismatch')
+  expect(h.service.consume('B5', OTHER_KEY).outcome).toBe('binding_mismatch')
   expect(h.service.get('B5')?.status).toBe('approved')
-  expect((await h.service.consume('nope', KEY)).outcome).toBe('not_found')
+  expect(h.service.consume('nope', KEY).outcome).toBe('not_found')
 })
 
-test('消耗前先套用時鐘：逾時的 pending 先轉 expired，回 not_approved', async () => {
+test('消耗前先套用時鐘：逾時的 pending 先轉 expired，回 not_approved，訊息在背景改為已逾時', async () => {
   const h = harness()
   await createBound(h, 'B6')
   h.advance(TIMEOUT_SECONDS * 1000)
-  expect((await h.service.consume('B6', KEY)).outcome).toBe('not_approved')
+  expect(h.service.consume('B6', KEY).outcome).toBe('not_approved')
   expect(h.store.get('B6')?.status).toBe('expired')
+  await Promise.resolve()
+  expect(edits(h).at(-1)?.text).toBe('請求 B6\n\n[已逾時]')
 })
 
 test('終態文字超過 Telegram 上限時截斷', async () => {
