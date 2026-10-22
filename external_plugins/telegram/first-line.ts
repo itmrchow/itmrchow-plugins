@@ -15,6 +15,9 @@
  * a test.
  */
 
+import { MAX_APPROVAL_TEXT_LENGTH } from './approval-config'
+import { EXTRA_INVISIBLE_CHAR_CLASS, INVISIBLE_CHAR_CLASS, LINE_BREAK_CHAR_CLASS } from './invisible-chars'
+
 /** The fixed list of statuses (JP-379 Spec item 3). */
 export const FIRST_LINE_STATUS = {
   pendingAllow: '等核准',
@@ -34,7 +37,7 @@ export type FirstLineStatus = (typeof FIRST_LINE_STATUS)[keyof typeof FIRST_LINE
 export const HUB_SESSION_NAME = 'tg-hub'
 
 /** Same cap as a request's text: a name is never cut, only refused. */
-export const MAX_SESSION_NAME_LENGTH = 3500
+export const MAX_SESSION_NAME_LENGTH = MAX_APPROVAL_TEXT_LENGTH
 
 /** Half-width characters a session name may not show as-is, and what is shown instead. */
 const SESSION_NAME_DISPLAY_REPLACEMENTS: Readonly<Record<string, string>> = { ':': '：', '[': '［', ']': '］' }
@@ -46,10 +49,14 @@ const ENABLING_VALUES: ReadonlySet<string> = new Set(['1', 'true'])
 
 /**
  * Characters a session name may not carry: anything that breaks or hides the
- * first line — C0 controls (tab and newline included), DEL, C1 controls, the
- * Unicode line / paragraph separators, zero-width characters and bidi controls.
+ * first line — the binding block's invisible set (C0 / C1 controls, DEL,
+ * zero-width, bidi), plus tab, newline, the Unicode line / paragraph
+ * separators and the further invisible format characters. See invisible-chars.ts.
  */
-const SESSION_NAME_FORBIDDEN_RE = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/
+const SESSION_NAME_FORBIDDEN_RE = new RegExp(
+  `[${INVISIBLE_CHAR_CLASS}${LINE_BREAK_CHAR_CLASS}${EXTRA_INVISIBLE_CHAR_CLASS}]`,
+  'u',
+)
 
 export type ParsedSessionName = { ok: true; sessionName: string } | { ok: false; detail: string }
 
@@ -110,6 +117,20 @@ export function parseSessionName(raw: unknown): ParsedSessionName {
  */
 export function resolveFirstLineFormat(env: Record<string, string | undefined>): boolean {
   return ENABLING_VALUES.has((env[FIRST_LINE_SWITCH_ENV] ?? '').trim().toLowerCase())
+}
+
+/**
+ * Say how the switch was read, for one startup log line: `on`, `off (unset)`,
+ * or `off (value is not 1 / true)` — so a typo such as `on` or `yes` is not
+ * mistaken for a missing setting. Never echoes the value itself.
+ *
+ * @param env - Process environment.
+ * @returns The description.
+ */
+export function describeFirstLineSwitch(env: Record<string, string | undefined>): string {
+  if (resolveFirstLineFormat(env)) return 'on'
+  if ((env[FIRST_LINE_SWITCH_ENV] ?? '').trim() === '') return 'off (unset)'
+  return 'off (value is not 1 / true)'
 }
 
 /**

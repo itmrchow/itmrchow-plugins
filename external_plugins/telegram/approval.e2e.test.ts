@@ -1200,4 +1200,23 @@ describe('第一行格式（JP-379）', () => {
       rmSync(spawnBin, { force: true })
     }
   }, TEST_TIMEOUT_MS)
+
+  test('多行綁定內容：第一行摘要以「 ⏎ 」接成一行；截斷時加「…（共 N 行）」；只多結尾換行不算多行', async () => {
+    const world = await startWorld()
+    const multi = await create(world, 'F17', 'allow_deny', { ...DENIED, binding_subject: 'ls\nrm -rf ~', session_name: SESSION_NAME })
+    const trailing = await create(world, 'F18', 'allow_deny', { ...DENIED, binding_subject: 'git status\n', session_name: SESSION_NAME })
+    expect(firstLineOf(world, multi.messageId)).toBe(`[已被擋下] ${SESSION_NAME}: ls ⏎ rm -rf ~`)
+    const long = await create(world, 'F19', 'allow_deny', { ...DENIED, binding_subject: `${'x'.repeat(250)}\nrm -rf ~`, session_name: SESSION_NAME })
+    expect(firstLineOf(world, long.messageId)).toBe(`[已被擋下] ${SESSION_NAME}: ${'x'.repeat(200)}…（共 2 行）`)
+    expect(firstLineOf(world, trailing.messageId)).toBe(`[已被擋下] ${SESSION_NAME}: git status`)
+  }, TEST_TIMEOUT_MS)
+
+  test.each([
+    [{}, 'off (unset)'],
+    [{ TELEGRAM_FIRST_LINE_FORMAT: 'on' }, 'off (value is not 1 / true)'],
+    [{ TELEGRAM_FIRST_LINE_FORMAT: SWITCH_ON }, 'on'],
+  ])('poller 啟動時印出第一行開關狀態：%p -> %p', async (env, state) => {
+    const world = await startWorld({ TELEGRAM_APPROVAL_BUTTONS: SWITCH_ON, ...env })
+    expect(world.stderr.join('')).toContain(`telegram poller: first-line format ${state} (TELEGRAM_FIRST_LINE_FORMAT)`)
+  }, TEST_TIMEOUT_MS)
 })

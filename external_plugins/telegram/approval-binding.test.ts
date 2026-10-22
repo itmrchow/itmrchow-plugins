@@ -5,6 +5,7 @@ import {
   composeMessageText,
   computeBindingKey,
   renderBindingDisplay,
+  SUMMARY_LINE_JOINER,
   SUMMARY_MAX_LENGTH,
   summarizeBindingDisplay,
 } from './approval-binding'
@@ -38,7 +39,7 @@ test('沒有綁定時訊息就是自由文字本身（第一行由呼叫端寫�
 test('有綁定時第一行由 poller 組 [已被擋下]，區塊在第二行起、每行加標記，自由文字在分隔線之後', () => {
   expect(composeMessageText('line1\nline2', '說明', 'OP-8820')).toBe(
     [
-      '[已被擋下] OP-8820: line1…',
+      '[已被擋下] OP-8820: line1 ⏎ line2',
       '【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：',
       '┃ line1',
       '┃ line2',
@@ -54,13 +55,34 @@ test('呼叫端自由文字不會出現在第一行', () => {
   expect(firstLine).toBe('[已被擋下] s1: git push origin main')
 })
 
-test('摘要取第一個非空白行；單行且未超長時不加省略號', () => {
+test('單行：未超過上限原樣顯示，不加標記', () => {
   expect(summarizeBindingDisplay('git status')).toBe('git status')
-  expect(summarizeBindingDisplay('\n  \ngit status\nmore')).toBe('git status…')
+  expect(summarizeBindingDisplay('a'.repeat(81))).toBe('a'.repeat(81))
+  expect(summarizeBindingDisplay('a'.repeat(SUMMARY_MAX_LENGTH))).toBe('a'.repeat(SUMMARY_MAX_LENGTH))
 })
 
-test('摘要超過上限時依字元截斷並加省略號，不切斷代理對', () => {
-  expect(summarizeBindingDisplay('a'.repeat(SUMMARY_MAX_LENGTH + 5))).toBe(`${'a'.repeat(SUMMARY_MAX_LENGTH)}…`)
+test('單行超過上限：截到 200 字加「…」，不加行數', () => {
+  expect(summarizeBindingDisplay('a'.repeat(SUMMARY_MAX_LENGTH + 1))).toBe(`${'a'.repeat(SUMMARY_MAX_LENGTH)}…`)
+})
+
+test('多行未截斷：所有非空白行以「 ⏎ 」接成一行，不加行數', () => {
+  expect(SUMMARY_LINE_JOINER).toBe(' ⏎ ')
+  expect(summarizeBindingDisplay('ls\nrm -rf ~')).toBe('ls ⏎ rm -rf ~')
+  expect(summarizeBindingDisplay('\n  \na\n\n  \nb\nc\n')).toBe('a ⏎ b ⏎ c')
+})
+
+test('多行且被截斷：截到 200 字加「…（共 N 行）」，N 只算非空白行', () => {
+  const lines = ['x'.repeat(150), 'y'.repeat(100), '', 'z']
+  const joined = Array.from(lines.filter(line => line !== '').join(' ⏎ '))
+  expect(summarizeBindingDisplay(lines.join('\n'))).toBe(`${joined.slice(0, SUMMARY_MAX_LENGTH).join('')}…（共 3 行）`)
+})
+
+test('只多結尾換行 / 空白行不算多行，不加標記', () => {
+  expect(summarizeBindingDisplay('git status\n')).toBe('git status')
+  expect(summarizeBindingDisplay('git status\n\n   \n')).toBe('git status')
+})
+
+test('截斷依 code point，不切斷代理對', () => {
   const emoji = '😀'.repeat(SUMMARY_MAX_LENGTH + 1)
   expect(summarizeBindingDisplay(emoji)).toBe(`${'😀'.repeat(SUMMARY_MAX_LENGTH)}…`)
 })

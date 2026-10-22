@@ -40,7 +40,12 @@ import { ApprovalStore } from './approval-store'
 import { createApprovalService, type ApprovalService } from './approval-service'
 import { createApprovalHandler, mountApprovalRoutes } from './approval-http'
 import { pickAccessFields, type Access } from './access-schema'
-import { createSystemTextFormatter, resolveFirstLineFormat } from './first-line'
+import {
+  createSystemTextFormatter,
+  describeFirstLineSwitch,
+  FIRST_LINE_SWITCH_ENV,
+  resolveFirstLineFormat,
+} from './first-line'
 import type { Update } from 'grammy/types'
 import { setDefaultResultOrder } from 'node:dns'
 import { setDefaultAutoSelectFamily } from 'node:net'
@@ -118,7 +123,8 @@ const SCOPE_SPAWN_BIN = process.env.SCOPE_SPAWN_BIN
 // JP-379: the poller's own notices (capacity, spawn failure, reauth replies)
 // open with `[系統] tg-hub: ` when the switch is on. Off by default, so the
 // other bots sharing this plugin keep their messages exactly as they were.
-const systemText = createSystemTextFormatter(resolveFirstLineFormat(process.env))
+const formatSystemText = createSystemTextFormatter(resolveFirstLineFormat(process.env))
+process.stderr.write(`telegram poller: first-line format ${describeFirstLineSwitch(process.env)} (${FIRST_LINE_SWITCH_ENV})\n`)
 
 // The im-core reauth executor. Unset = /reauth and /authcode are NOT intercepted
 // and route like any other message (hosts that have not opted in keep today's behaviour).
@@ -301,7 +307,7 @@ async function main(): Promise<void> {
     deliver: hub.deliver,
     spawn: spawnScope,
     notify: async (chatId, text) => {
-      await bot.api.sendMessage(chatId, systemText(text)).catch(err => {
+      await bot.api.sendMessage(chatId, formatSystemText(text)).catch(err => {
         process.stderr.write(`telegram poller: notify ${chatId} failed: ${err}\n`)
       })
     },
@@ -334,7 +340,7 @@ async function main(): Promise<void> {
         bin: REAUTH_BIN,
         run: runReauthBin,
         reply: async text => {
-          await bot.api.sendMessage(message.chat.id, systemText(text)).catch(err => {
+          await bot.api.sendMessage(message.chat.id, formatSystemText(text)).catch(err => {
             process.stderr.write(`telegram poller: reauth reply failed update_id=${update.update_id}: ${err}\n`)
           })
         },

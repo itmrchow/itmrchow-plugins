@@ -130,7 +130,7 @@ plugin 自己寫的部分：
 
 | 變數 | 預設 | 意思 |
 | --- | --- | --- |
-| `TELEGRAM_FIRST_LINE_FORMAT` | 未設（關閉） | `poller.ts` 與 `server.ts` 都讀。`1` 或 `true`（去空白、不分大小寫）時，上表標此開關的訊息加第一行；其他值一律維持原文，共用本 plugin 的其他 bot 不受影響。兩個程序都要設。 |
+| `TELEGRAM_FIRST_LINE_FORMAT` | 未設（關閉） | `poller.ts` 與 `server.ts` 都讀。`1` 或 `true`（去空白、不分大小寫）時，上表標此開關的訊息加第一行；其他值一律維持原文，共用本 plugin 的其他 bot 不受影響。兩個程序都要設。兩者啟動時都會在 stderr 印出讀到的狀態：`telegram poller: first-line format on|off (unset)|off (value is not 1 / true) (TELEGRAM_FIRST_LINE_FORMAT)`（server.ts 開頭為 `telegram channel:`）。 |
 
 ## 核准請求（inline 按鈕，loopback 介面）
 
@@ -173,7 +173,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `comment_timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
 | `binding_session` | 與 `binding_subject` 同時帶 | 呼叫方的 session id，`[A-Za-z0-9_-]{1,128}`（不可能含換行）。 |
 | `binding_subject` | 與 `binding_session` 同時帶 | 這筆核准要放行的內容 —— Bash 呼叫就是指令全文。不可空白。兩個綁定欄位要嘛都帶、要嘛都不帶；都不帶 = 未綁定，永遠不能消耗。body 裡的 `binding_key` 一律忽略：key 不能由呼叫方指定。 |
-| `session_name` | 否 | （JP-379）請求所屬 session 的名字，與 `claude agents --json` / ListAgents 看到的相同。字串、最多 3500 字元、不得含換行或控制字元（C0 含 tab / CR / LF、DEL、C1、U+2028 / U+2029、零寬字元、雙向文字控制字元）：不合規一律回 `400`（不分有無綁定、不分 `kind`），不截斷也不清洗。未帶、`null`、空字串或只有空白 = `tg-hub`。顯示時 `:` `[` `]` 換全形。用於已被擋下的第一行與這筆請求後續訊息的第一行；隨請求落檔，poller 重啟後仍保留。查詢回應不帶此欄位。 |
+| `session_name` | 否 | （JP-379）請求所屬 session 的名字，與 `claude agents --json` / ListAgents 看到的相同。字串、最多 3500 字元、不得含換行或控制字元（C0 含 tab / CR / LF、DEL、C1、U+2028 / U+2029、零寬字元、雙向文字控制字元，以及隱形的 U+00AD / U+061C / U+180E / U+E0000-E007F；與綁定區塊的跳脫共用同一份清單，見 `invisible-chars.ts`）：不合規一律回 `400`（不分有無綁定、不分 `kind`），不截斷也不清洗。未帶、`null`、空字串或只有空白 = `tg-hub`。顯示時 `:` `[` `]` 換全形。用於已被擋下的第一行與這筆請求後續訊息的第一行；隨請求落檔，poller 重啟後仍保留。查詢回應不帶此欄位。 |
 
 **綁定（JP-374）。** 有綁定的請求由 poller 自己算 key：`sha256(binding_session + "\n" + binding_subject)`（十六進位），
 並把 subject 顯示在訊息**最上方**、由 poller 寫的區塊裡，呼叫方的 `text` 排在後面。有綁定的請求就是被擋下的動作（JP-379），
@@ -198,8 +198,11 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 分類器擋下了這個指令
 ```
 
-- `<摘要>` = 遮罩後 subject 的第一個非空白行，最多 80 字元；有省略（截斷或還有其他行）就在後面加 `…`。
-  完整內容一律看下方區塊。
+- `<摘要>` = 遮罩後 subject 的所有非空白行，依原順序以 ` ⏎ `（空白 + U+23CE + 空白）接成一行，最多 200 字（以 code point 計），
+  超過截到 200 字加 `…`。subject 有多個非空白行且被截斷時，`…` 後再加 `（共 N 行）`（N = 非空白行數）；沒被截斷時全部行都已顯示，
+  不加行數。空白行（含結尾換行）不算行數。例：subject 為 `ls` 換行 `rm -rf ~` 時顯示 `[已被擋下] OP-8820: ls ⏎ rm -rf ~`；
+  第一行 250 字再接 `rm -rf ~` 時顯示前 200 字加 `…（共 2 行）`。subject 本身含字面 `⏎` 時畫面上分不出是原字元還是分隔，
+  但它仍是被綁定的內容本身，不是呼叫端文字。完整內容一律看下方區塊逐行顯示。
 
 - subject 每一行都以 `┃ ` 開頭，所以 `text` 裡的任何東西（長得一樣的假區塊、假分隔線）都冒充不了 subject；
   subject 裡長得像分隔線的行也一樣帶著標記。

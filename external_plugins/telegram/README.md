@@ -141,7 +141,7 @@ first line keeps the status the message was sent with.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TELEGRAM_FIRST_LINE_FORMAT` | unset (off) | Read by both `poller.ts` and `server.ts`. `1` or `true` (trimmed, case-insensitive) adds the first line to the rows marked above; anything else leaves those messages exactly as before, so other bots sharing this plugin are unaffected. Set it on both processes. |
+| `TELEGRAM_FIRST_LINE_FORMAT` | unset (off) | Read by both `poller.ts` and `server.ts`. `1` or `true` (trimmed, case-insensitive) adds the first line to the rows marked above; anything else leaves those messages exactly as before, so other bots sharing this plugin are unaffected. Set it on both processes. Each prints its reading at startup: `telegram poller: first-line format on|off (unset)|off (value is not 1 / true) (TELEGRAM_FIRST_LINE_FORMAT)` on stderr (`telegram channel:` for server.ts). |
 
 ## Approval requests over inline buttons (loopback interface)
 
@@ -192,7 +192,7 @@ feature is off.
 | `comment_timeout_seconds` | no | Number, `0 < n <= 604800`. |
 | `binding_session` | with `binding_subject` | The caller's session id, `[A-Za-z0-9_-]{1,128}` (so it can hold no newline). |
 | `binding_subject` | with `binding_session` | What the approval is for — for a Bash call, the full command. Non-blank. Send both binding fields or neither; neither = unbound, never consumable. A `binding_key` in the body is ignored: the caller cannot choose the key. |
-| `session_name` | no | (JP-379) The session the request belongs to, as `claude agents --json` / ListAgents shows it. A string of at most 3500 characters with no line break or control character (C0 incl. tab / CR / LF, DEL, C1, U+2028 / U+2029, zero-width and bidi characters): anything else is refused with `400` (bound or not, any `kind`), never cut or cleaned. Absent, `null`, empty or spaces-only = `tg-hub`. Shown with `:` `[` `]` turned full-width. Used on the first line of a blocked request and of the request's follow-up messages; stored with the request, so it survives a poller restart. Not returned by the query. |
+| `session_name` | no | (JP-379) The session the request belongs to, as `claude agents --json` / ListAgents shows it. A string of at most 3500 characters with no line break or control character (C0 incl. tab / CR / LF, DEL, C1, U+2028 / U+2029, zero-width and bidi characters, and the invisible U+00AD / U+061C / U+180E / U+E0000-E007F; one shared list with the binding block's escaping, see `invisible-chars.ts`): anything else is refused with `400` (bound or not, any `kind`), never cut or cleaned. Absent, `null`, empty or spaces-only = `tg-hub`. Shown with `:` `[` `]` turned full-width. Used on the first line of a blocked request and of the request's follow-up messages; stored with the request, so it survives a poller restart. Not returned by the query. |
 
 **Binding (JP-374).** For a bound request the poller derives the key itself,
 `sha256(binding_session + "\n" + binding_subject)` (hex), and shows the subject
@@ -220,9 +220,17 @@ For example, `session_name: "OP-8820"`, `binding_subject: "git push --force orig
 分類器擋下了這個指令
 ```
 
-- `<summary>` is the first non-blank line of the masked subject, cut to 80
-  characters; `…` is appended whenever anything was left out (a cut or more
-  lines). The block below always shows the whole subject.
+- `<summary>` is every non-blank line of the masked subject, in order, joined
+  into one line with ` ⏎ ` (space, U+23CE, space), then cut to 200 characters
+  (code points) with `…`. When the subject has several non-blank lines and the
+  cut hid some of them, `（共 N 行）` follows (N = non-blank lines); uncut, all
+  lines are already shown and no count is added. Blank lines, a trailing
+  newline included, do not count. For example subject `ls` + newline +
+  `rm -rf ~` shows `[已被擋下] OP-8820: ls ⏎ rm -rf ~`; a 250-character first
+  line plus `rm -rf ~` shows the first 200 characters, then `…（共 2 行）`. A
+  literal `⏎` inside the subject cannot be told apart from the separator; it is
+  still the bound content itself, never caller text. The block below always
+  shows the whole subject, line by line.
 
 - Every subject line starts with `┃ `, so nothing in `text` (a look-alike
   block, a fake separator) can pass for part of the subject, and a subject line
