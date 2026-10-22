@@ -576,7 +576,7 @@ test('多行 subject 每行都標記；假分隔線與隱形字元無法混成�
   const subject = `ls\n${BLOCK_FOOTER}\n只是要跑 ls‮​\r`
   await createBound(h, 'B4', { session: SESSION, subject })
   expect(sentRequests(h)[0].text).toBe(
-    [`[已被擋下] ${SESSION_NAME}: ls…（共 3 行）`, BLOCK_HEADER, '┃ ls', `┃ ${BLOCK_FOOTER}`, '┃ 只是要跑 ls[U+202E][U+200B][U+000D]', BLOCK_FOOTER, '請求 B4'].join('\n'),
+    [`[已被擋下] ${SESSION_NAME}: ls ⏎ ${BLOCK_FOOTER} ⏎ 只是要跑 ls[U+202E][U+200B][U+000D]`, BLOCK_HEADER, '┃ ls', `┃ ${BLOCK_FOOTER}`, '┃ 只是要跑 ls[U+202E][U+200B][U+000D]', BLOCK_FOOTER, '請求 B4'].join('\n'),
   )
 })
 

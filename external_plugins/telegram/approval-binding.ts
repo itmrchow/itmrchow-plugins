@@ -34,8 +34,10 @@ const BLOCK_HEADER = '【綁定內容】由 poller 顯示，每行以「┃ 」�
 const BLOCK_LINE_PREFIX = '┃ '
 const BLOCK_FOOTER = '────────────'
 const LINE_BREAK = '\n'
-/** First-line summary cap: a glance, the block below holds the whole content. */
-export const SUMMARY_MAX_LENGTH = 80
+/** First-line summary cap in code points: a glance, the block below holds the whole content. */
+export const SUMMARY_MAX_LENGTH = 200
+/** Between the bound content's lines once they are joined into the one-line summary. */
+export const SUMMARY_LINE_JOINER = ' ⏎ '
 /**
  * Characters that can hide or reorder what is shown: C0 / C1 controls other
  * than tab and newline, zero-width characters and bidi controls. One list,
@@ -87,12 +89,13 @@ export function composeMessageText(bindingDisplay: string | null, text: string, 
 }
 
 /**
- * One-line summary of the bound content for the first line (Spec v1.2 Q2):
- * its first non-blank line, cut to SUMMARY_MAX_LENGTH with `…`; when the
- * content has more than one non-blank line, `…（共 N 行）` follows, N being the
- * number of non-blank lines, so a glance at the first line shows there is
- * more. Blank lines, a trailing newline included, never count. Taken from the
- * display, so it is already masked; the block below shows it whole.
+ * One-line summary of the bound content for the first line (Spec v1.3): every
+ * non-blank line, in order, joined with SUMMARY_LINE_JOINER, then cut to
+ * SUMMARY_MAX_LENGTH code points with `…`. When the content has several
+ * non-blank lines and the cut hid some of them, `（共 N 行）` follows, N being
+ * the number of non-blank lines; uncut, every line is already shown and no
+ * count is added. Blank lines, a trailing newline included, never count. Taken
+ * from the display, so it is already masked; the block below shows it whole.
  *
  * @param bindingDisplay - From renderBindingDisplay.
  * @returns The summary.
@@ -100,10 +103,10 @@ export function composeMessageText(bindingDisplay: string | null, text: string, 
 export function summarizeBindingDisplay(bindingDisplay: string): string {
   const nonBlankLines = bindingDisplay.split(LINE_BREAK).filter(line => line.trim() !== '')
   // By code point, so a cut never splits a surrogate pair.
-  const head = Array.from(nonBlankLines[0] ?? '')
-  const summary = head.slice(0, SUMMARY_MAX_LENGTH).join('')
-  if (nonBlankLines.length > 1) return `${summary}${TRUNCATION_MARK}${formatLineCount(nonBlankLines.length)}`
-  return head.length > SUMMARY_MAX_LENGTH ? `${summary}${TRUNCATION_MARK}` : summary
+  const joined = Array.from(nonBlankLines.join(SUMMARY_LINE_JOINER))
+  if (joined.length <= SUMMARY_MAX_LENGTH) return joined.join('')
+  const cut = `${joined.slice(0, SUMMARY_MAX_LENGTH).join('')}${TRUNCATION_MARK}`
+  return nonBlankLines.length > 1 ? `${cut}${formatLineCount(nonBlankLines.length)}` : cut
 }
 
 function formatLineCount(count: number): string {

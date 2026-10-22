@@ -7,6 +7,7 @@ import type { Update } from 'grammy/types'
 import { ApprovalStore } from './approval-store'
 import { createApprovalService, type ApprovalService } from './approval-service'
 import { createApprovalHandler, mountApprovalRoutes, parseCreateBody } from './approval-http'
+import { composeMessageText, renderBindingDisplay } from './approval-binding'
 import { ScopeRegistry } from './poller-registry'
 import { createSubscribeServer, type SubscribeHub } from './subscribe-server'
 
@@ -477,4 +478,13 @@ test('帶 session_name 建立：201，回應欄位與既有格式相同（不回
   expect(Object.keys(res.body as Record<string, unknown>).sort()).toEqual(
     ['comment', 'created_at_ms', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'].sort(),
   )
+})
+
+test('4096 上限把第一行摘要算進去：區塊加 text 放得下、加上第一行就超過時回 400', () => {
+  const body = {
+    id: 'a', text: '長'.repeat(3500), kind: 'allow_deny', binding_session: SESSION, binding_subject: 'x'.repeat(450), session_name: 'OP-8820',
+  }
+  const withoutFirstLine = composeMessageText(renderBindingDisplay(body.binding_subject), body.text, 'OP-8820').split('\n').slice(1).join('\n')
+  expect(withoutFirstLine.length).toBeLessThanOrEqual(4096)
+  expect(parseCreateBody(JSON.stringify(body), DEFAULTS).ok).toBe(false)
 })

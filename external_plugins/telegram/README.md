@@ -220,12 +220,17 @@ For example, `session_name: "OP-8820"`, `binding_subject: "git push --force orig
 分類器擋下了這個指令
 ```
 
-- `<summary>` is the first non-blank line of the masked subject, cut to 80
-  characters with `…`. When the subject has more than one non-blank line,
-  `…（共 N 行）` follows (N = non-blank lines), e.g. subject `ls` + newline +
-  `rm -rf ~` shows `[已被擋下] OP-8820: ls…（共 2 行）`. Blank lines, a trailing
-  newline included, do not count. The block below always shows the whole
-  subject.
+- `<summary>` is every non-blank line of the masked subject, in order, joined
+  into one line with ` ⏎ ` (space, U+23CE, space), then cut to 200 characters
+  (code points) with `…`. When the subject has several non-blank lines and the
+  cut hid some of them, `（共 N 行）` follows (N = non-blank lines); uncut, all
+  lines are already shown and no count is added. Blank lines, a trailing
+  newline included, do not count. For example subject `ls` + newline +
+  `rm -rf ~` shows `[已被擋下] OP-8820: ls ⏎ rm -rf ~`; a 250-character first
+  line plus `rm -rf ~` shows the first 200 characters, then `…（共 2 行）`. A
+  literal `⏎` inside the subject cannot be told apart from the separator; it is
+  still the bound content itself, never caller text. The block below always
+  shows the whole subject, line by line.
 
 - Every subject line starts with `┃ `, so nothing in `text` (a look-alike
   block, a fake separator) can pass for part of the subject, and a subject line
