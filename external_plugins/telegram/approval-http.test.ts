@@ -144,6 +144,23 @@ test.each([
   ['逾時為 0', { id: 'bad', text: 't', kind: 'allow_deny', timeout_seconds: 0 }],
   ['逾時非數字', { id: 'bad', text: 't', kind: 'allow_deny', timeout_seconds: '60' }],
   ['等意見時間為負', { id: 'bad', text: 't', kind: 'allow_deny', comment_timeout_seconds: -1 }],
+  ['session_name 含換行', { id: 'bad', text: 't', kind: 'allow_deny', session_name: 'a\nb' }],
+  ['session_name 含 CR', { id: 'bad', text: 't', kind: 'allow_deny', session_name: 'a\rb' }],
+  ['session_name 含控制字元', { id: 'bad', text: 't', kind: 'allow_deny', session_name: `a${String.fromCharCode(7)}b` }],
+  ['session_name 含 line separator', { id: 'bad', text: 't', kind: 'allow_deny', session_name: `a${String.fromCharCode(0x2028)}b` }],
+  ['session_name 非字串', { id: 'bad', text: 't', kind: 'allow_deny', session_name: 42 }],
+  ['session_name 超過 3500 字', { id: 'bad', text: 't', kind: 'allow_deny', session_name: 'n'.repeat(3501) }],
+  [
+    '已被擋下時 session_name 與綁定內容合計超過 Telegram 上限',
+    {
+      id: 'bad',
+      text: 't',
+      kind: 'allow_deny',
+      binding_session: 'session-1111',
+      binding_subject: 's'.repeat(600),
+      session_name: 'n'.repeat(3500),
+    },
+  ],
   ['格式錯誤', '{not json'],
   ['不是物件', '[1,2]'],
 ])('建立時%s回 400，不發訊息、不留下請求', async (_name, body) => {
@@ -264,7 +281,15 @@ test('parseCreateBody 只讀取文件化的欄位，未帶逾時用預設值', (
   const parsed = parseCreateBody(JSON.stringify({ id: 'a', text: 't', kind: 'approve_reject', status: 'approved' }), DEFAULTS)
   expect(parsed).toEqual({
     ok: true,
-    input: { id: 'a', text: 't', kind: 'approve_reject', timeoutSeconds: 60, commentTimeoutSeconds: 5, binding: null },
+    input: {
+      id: 'a',
+      text: 't',
+      kind: 'approve_reject',
+      timeoutSeconds: 60,
+      commentTimeoutSeconds: 5,
+      binding: null,
+      sessionName: 'tg-hub',
+    },
   })
   const custom = parseCreateBody(
     JSON.stringify({ id: 'a', text: 't', kind: 'allow_deny', timeout_seconds: 0.5, comment_timeout_seconds: 0.1 }),
@@ -429,4 +454,27 @@ test('消耗時狀態檔寫不進去 -> 503 persist_failed，之後同一筆也�
   expect((await call(ctx.port, 'POST', '/approvals/K9/consume', consumeBody())).body).toMatchObject({
     error: 'already_consumed',
   })
+})
+
+test('parseCreateBody 讀可選的 session_name；未帶 / null / 空白填 tg-hub', () => {
+  const base = { id: 'a', text: 't', kind: 'allow_deny' }
+  expect(parseCreateBody(JSON.stringify({ ...base, session_name: 'OP-8820' }), DEFAULTS)).toMatchObject({
+    ok: true,
+    input: { sessionName: 'OP-8820' },
+  })
+  for (const sessionName of [undefined, null, '', '  ']) {
+    expect(parseCreateBody(JSON.stringify({ ...base, session_name: sessionName }), DEFAULTS)).toMatchObject({
+      ok: true,
+      input: { sessionName: 'tg-hub' },
+    })
+  }
+})
+
+test('帶 session_name 建立：201，回應欄位與既有格式相同（不回傳 session_name）', async () => {
+  const { port } = await startServer({ enabled: true })
+  const res = await call(port, 'POST', '/approvals', { id: 'N1', text: 't', kind: 'allow_deny', session_name: 'OP-8820' })
+  expect(res.status).toBe(201)
+  expect(Object.keys(res.body as Record<string, unknown>).sort()).toEqual(
+    ['comment', 'created_at_ms', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'].sort(),
+  )
 })

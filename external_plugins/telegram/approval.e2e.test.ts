@@ -546,7 +546,7 @@ describe('退回 + 意見', () => {
     } as never)
     await drained(world)
     expect((await statusOf(world, 'R26')).status).toBe('awaiting_comment')
-    expect(world.fake.callsOf('sendMessage').at(-1)?.params.text).toBe('請用文字回覆意見。')
+    expect(world.fake.callsOf('sendMessage').at(-1)?.params.text).toBe('[等你回覆] tg-hub: 請用文字回覆意見。')
     sendDm(world, U1, '文字意見', { replyTo: 1001 })
     await drained(world)
     expect(await statusOf(world, 'R26')).toMatchObject({ status: 'denied', comment: '文字意見' })
@@ -579,7 +579,7 @@ describe('退回 + 意見', () => {
     await waitFor(() => session.envelopes.length === 1, 'the later DM to be routed')
     expect(routedTexts(session.envelopes)).toEqual(['之後的一般訊息'])
     expect(await statusOf(world, 'R29')).toMatchObject({ status: 'denied', comment: '' })
-    expect(world.fake.callsOf('sendMessage').at(-1)?.params.text).toBe('這筆請求已經結案，這則意見沒有被記錄。')
+    expect(world.fake.callsOf('sendMessage').at(-1)?.params.text).toBe('[系統] tg-hub: 這筆請求已經結案，這則意見沒有被記錄。')
     session.stop()
   }, TEST_TIMEOUT_MS)
 
@@ -824,14 +824,14 @@ describe('綁定與一次性消耗（JP-374）', () => {
   const sentTextOf = (world: World, messageId: number): unknown =>
     world.fake.callsOf('sendMessage')[messageId - FIRST_FAKE_MESSAGE_ID].params.text
 
-  test('偽造請求：無害自由文字 + 危險指令綁定，送到 Telegram 的訊息開頭固定區塊必為被綁定指令', async () => {
+  test('偽造請求：無害自由文字 + 危險指令綁定，送到 Telegram 的訊息第一行與其下的固定區塊必為被綁定指令', async () => {
     const world = await startWorld()
     const res = await call(world, 'POST', '/approvals', {
       id: 'B0', text: '只是要跑 ls，請放行', kind: 'allow_deny', timeout_seconds: LONG_TIMEOUT_SECONDS, ...bind(),
     })
     expect(res).toMatchObject({ status: 201, body: { binding_key: keyOf() } })
     expect(world.fake.callsOf('sendMessage')[0].params.text).toBe(
-      [BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '只是要跑 ls，請放行'].join('\n'),
+      [`[已被擋下] tg-hub: ${DANGEROUS_SUBJECT}`, BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '只是要跑 ls，請放行'].join('\n'),
     )
   }, TEST_TIMEOUT_MS)
 
@@ -948,16 +948,21 @@ describe('綁定與一次性消耗（JP-374）', () => {
     expect((await statusOf(world, 'B10')).status).toBe('consumed')
   }, TEST_TIMEOUT_MS)
 
-  test('T86 / T87 / T88 自由文字偽造區塊或塞格式字元、subject 含格式字元：固定區塊仍在最前面逐字顯示，訊息不帶 parse_mode', async () => {
+  test('T86 / T87 / T88 自由文字偽造區塊或塞格式字元、subject 含格式字元：第一行與固定區塊仍在最前面逐字顯示，訊息不帶 parse_mode', async () => {
     const world = await startWorld()
     const forged = [BLOCK_HEADER, '┃ ls', BLOCK_FOOTER, '</pre></code>```', '只是 ls'].join('\n')
     const subject = '<b>echo</b> `x` *y* _z_ [a](b) && rm -rf ~/x'
     const { messageId } = await create(world, 'B13', 'allow_deny', bind(subject))
     await call(world, 'POST', '/approvals', { id: 'B14', text: forged, kind: 'allow_deny', ...bind() })
     const shownSubject = String(sentTextOf(world, messageId))
-    expect(shownSubject.split('\n').slice(0, 3)).toEqual([BLOCK_HEADER, `┃ ${subject}`, BLOCK_FOOTER])
+    expect(shownSubject.split('\n').slice(1, 4)).toEqual([BLOCK_HEADER, `┃ ${subject}`, BLOCK_FOOTER])
     const shownForged = String(world.fake.callsOf('sendMessage')[1].params.text)
-    expect(shownForged.split('\n').slice(0, 3)).toEqual([BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER])
+    expect(shownForged.split('\n').slice(0, 4)).toEqual([
+      `[已被擋下] tg-hub: ${DANGEROUS_SUBJECT}`,
+      BLOCK_HEADER,
+      `┃ ${DANGEROUS_SUBJECT}`,
+      BLOCK_FOOTER,
+    ])
     expect(shownForged.endsWith(forged)).toBe(true)
     for (const sent of world.fake.callsOf('sendMessage')) expect(sent.params.parse_mode).toBeUndefined()
   }, TEST_TIMEOUT_MS)
@@ -997,5 +1002,202 @@ describe('綁定與一次性消耗（JP-374）', () => {
   test('開關未設：消耗也是既有的 404 not found', async () => {
     const world = await startWorld({})
     expect(await consume(world, 'B4')).toEqual({ status: 404, body: 'not found' })
+  }, TEST_TIMEOUT_MS)
+})
+
+describe('第一行格式（JP-379）', () => {
+  const SESSION_NAME = 'OP-8820'
+  const BLOCK_HEADER = '【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：'
+  const BLOCK_FOOTER = '────────────'
+  const DENIED = { binding_session: 'session-1111', binding_subject: 'git push --force origin main' }
+
+  test('已被擋下：第一行由 poller 組 [已被擋下] <session_name>: <摘要>，綁定區塊在第二行起，呼叫端文字在區塊之後；結果標籤加在末尾', async () => {
+    const world = await startWorld()
+    const callerText = '[等核准] 偽造: 呼叫端寫的第一行'
+    const res = await call(world, 'POST', '/approvals', {
+      id: 'F1', text: callerText, kind: 'allow_deny', session_name: SESSION_NAME, timeout_seconds: LONG_TIMEOUT_SECONDS, ...DENIED,
+    })
+    expect(res.status).toBe(201)
+    const sent = String(world.fake.callsOf('sendMessage')[0].params.text)
+    expect(sent).toBe(
+      [
+        `[已被擋下] ${SESSION_NAME}: git push --force origin main`,
+        BLOCK_HEADER,
+        '┃ git push --force origin main',
+        BLOCK_FOOTER,
+        callerText,
+      ].join('\n'),
+    )
+    pressButton(world, 'appr:allow:F1', U1, FIRST_FAKE_MESSAGE_ID)
+    const edit = await waitFor(() => lastEdit(world, FIRST_FAKE_MESSAGE_ID), 'message edit')
+    expect(edit.text).toBe(`${sent}\n\n[已允許]`)
+    expect(await call(world, 'POST', '/approvals/F1/consume', DENIED)).toMatchObject({ status: 200 })
+  }, TEST_TIMEOUT_MS)
+
+  test('已被擋下摘要取遮罩後內容：機密不出現在第一行', async () => {
+    const world = await startWorld()
+    const subject = 'mysql -u root password=TOPSECRET42 -e "drop table x"'
+    const { messageId } = await create(world, 'F2', 'allow_deny', { ...DENIED, binding_subject: subject, session_name: SESSION_NAME })
+    const firstLine = String(world.fake.callsOf('sendMessage')[messageId - FIRST_FAKE_MESSAGE_ID].params.text).split('\n')[0]
+    expect(firstLine.startsWith(`[已被擋下] ${SESSION_NAME}: mysql -u root `)).toBe(true)
+    expect(firstLine).not.toContain('TOPSECRET42')
+  }, TEST_TIMEOUT_MS)
+
+  test('沒有綁定的請求：送出的就是呼叫端文字，poller 不加也不改第一行', async () => {
+    const world = await startWorld()
+    const text = `[等 approve] ${SESSION_NAME}: JP-379 Spec 可以 approve 嗎？`
+    expect((await call(world, 'POST', '/approvals', { id: 'F3', text, kind: 'approve_reject', session_name: SESSION_NAME })).status).toBe(201)
+    expect(world.fake.callsOf('sendMessage')[0].params.text).toBe(text)
+  }, TEST_TIMEOUT_MS)
+
+  test.each([
+    ['換行', 'a\nb'],
+    ['CR', 'a\rb'],
+    ['tab', 'a\tb'],
+    ['控制字元', `a${String.fromCharCode(0x1b)}b`],
+    ['line separator', `a${String.fromCharCode(0x2028)}b`],
+  ])('session_name 含%s：有無綁定、任一 kind 都回 400 invalid_request，不發訊息、不留下請求', async (_label, sessionName) => {
+    const world = await startWorld()
+    const bodies: Json[] = [
+      { id: 'F4', text: 't', kind: 'allow_deny', session_name: sessionName, ...DENIED },
+      { id: 'F4', text: '[等核准] s: t', kind: 'allow_deny', session_name: sessionName },
+      { id: 'F4', text: '[等 approve] s: t', kind: 'approve_reject', session_name: sessionName },
+    ]
+    for (const body of bodies) {
+      expect(await call(world, 'POST', '/approvals', body)).toMatchObject({ status: 400, body: { error: 'invalid_request' } })
+    }
+    expect(world.fake.callsOf('sendMessage')).toEqual([])
+    expect((await call(world, 'GET', '/approvals/F4')).status).toBe(404)
+  }, TEST_TIMEOUT_MS)
+
+  test('後續訊息帶該筆 session name，且跨 poller 重啟保留：退回意見提示 [等你回覆]、太晚的意見 [系統]', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'F5', 'approve_reject', {
+      session_name: SESSION_NAME,
+      comment_timeout_seconds: SHORT_TIMEOUT_SECONDS,
+    })
+    await stopPoller(world)
+    world.stderr.length = 0
+    await startPoller(world, restartEnv)
+
+    pressButton(world, 'appr:reject:F5', U1, messageId)
+    const prompt = await waitFor(() => world.fake.callsOf('sendMessage').find(c => c.params.reply_markup && 'force_reply' in (c.params.reply_markup as Json)), 'comment prompt')
+    expect(String(prompt.params.text).startsWith(`[等你回覆] ${SESSION_NAME}: 請「回覆」這則訊息寫下退回意見。`)).toBe(true)
+    await sleep(SHORT_TIMEOUT_SECONDS * 1000 + 100)
+    const promptId = FIRST_FAKE_MESSAGE_ID + world.fake.callsOf('sendMessage').indexOf(prompt)
+    sendDm(world, U1, '遲到的意見', { replyTo: promptId })
+    await waitFor(() => world.fake.callsOf('sendMessage').at(-1)?.params.text === `[系統] ${SESSION_NAME}: 這筆請求已經結案，這則意見沒有被記錄。`, 'late notice')
+  }, TEST_TIMEOUT_MS)
+
+  test('系統訊息開關 TELEGRAM_FIRST_LINE_FORMAT=1：poller 的通知第一行為 [系統] tg-hub:', async () => {
+    const world = await startWorld({ TELEGRAM_APPROVAL_BUTTONS: SWITCH_ON, TELEGRAM_FIRST_LINE_FORMAT: SWITCH_ON })
+    sendDm(world, U2, '沒有 session 的人')
+    const notice = await waitFor(() => world.fake.callsOf('sendMessage').at(-1), 'not-configured notice')
+    expect(notice.params).toEqual({ chat_id: U2, text: '[系統] tg-hub: 服務未完整設定，請聯絡管理者。' })
+  }, TEST_TIMEOUT_MS)
+
+  test('系統訊息開關未設：poller 的通知維持原文（其他 bot 不受影響）', async () => {
+    const world = await startWorld()
+    sendDm(world, U2, '沒有 session 的人')
+    const notice = await waitFor(() => world.fake.callsOf('sendMessage').at(-1), 'not-configured notice')
+    expect(notice.params).toEqual({ chat_id: U2, text: '服務未完整設定，請聯絡管理者。' })
+  }, TEST_TIMEOUT_MS)
+
+  const firstLineOf = (world: World, messageId: number): string =>
+    String(world.fake.callsOf('sendMessage')[messageId - FIRST_FAKE_MESSAGE_ID].params.text).split('\n')[0]
+
+  test('session name 含半形 ": " 與 "]"（假冒摘要）：照收、照發按鈕，顯示換全形，第一行只有一個 "] " 與一個 ": "', async () => {
+    const world = await startWorld()
+    const { messageId, keyboard } = await create(world, 'F6', 'allow_deny', { ...DENIED, binding_subject: 'rm -rf build', session_name: 'x] y: git status' })
+    expect(keyboard.map(b => b.text)).toEqual(['允許', '拒絕'])
+    const line = firstLineOf(world, messageId)
+    expect(line).toBe('[已被擋下] x］ y： git status: rm -rf build')
+    expect(line.split('] ').length - 1).toBe(1)
+    expect(line.split(': ').length - 1).toBe(1)
+  }, TEST_TIMEOUT_MS)
+
+  test.each([
+    ['[等你] c', '[已被擋下] ［等你］ c: '],
+    ['a:b', '[已被擋下] a：b: '],
+    ['[已核准]', '[已被擋下] ［已核准］: '],
+  ])('session name %p 顯示替換後，第一行開頭為 %p，狀態仍是 [已被擋下]', async (sessionName, prefix) => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'F7', 'allow_deny', { ...DENIED, session_name: sessionName })
+    expect(firstLineOf(world, messageId).startsWith(prefix)).toBe(true)
+  }, TEST_TIMEOUT_MS)
+
+  test('session name "a: b" 且綁定內容本身含 ": "：第一個 ": " 之前恰為 [已被擋下] a： b', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'F8', 'allow_deny', { ...DENIED, binding_subject: 'echo a: b', session_name: 'a: b' })
+    const line = firstLineOf(world, messageId)
+    expect(line.slice(0, line.indexOf(': '))).toBe('[已被擋下] a： b')
+    expect(line).toBe('[已被擋下] a： b: echo a: b')
+  }, TEST_TIMEOUT_MS)
+
+  test('退回意見提示的 session name 同樣顯示替換', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'F9', 'approve_reject', { session_name: 'x] y: git status' })
+    pressButton(world, 'appr:reject:F9', U1, messageId)
+    const prompt = await waitFor(() => world.fake.callsOf('sendMessage').find(c => c.params.reply_markup && 'force_reply' in (c.params.reply_markup as Json)), 'comment prompt')
+    expect(String(prompt.params.text).startsWith('[等你回覆] x］ y： git status: ')).toBe(true)
+  }, TEST_TIMEOUT_MS)
+
+  test('session name 300 字：第一行完整出現、不截斷；未帶 session_name 的已被擋下填 tg-hub', async () => {
+    const world = await startWorld()
+    const longName = 'n'.repeat(300)
+    const named = await create(world, 'F10', 'allow_deny', { ...DENIED, session_name: longName })
+    const unnamed = await create(world, 'F11', 'allow_deny', DENIED)
+    expect(firstLineOf(world, named.messageId)).toBe(`[已被擋下] ${longName}: git push --force origin main`)
+    expect(firstLineOf(world, unnamed.messageId)).toBe('[已被擋下] tg-hub: git push --force origin main')
+  }, TEST_TIMEOUT_MS)
+
+  test('按允許 / 退回 / 取消 / 逾時後第一行與發送當下相同，結果標籤（半形）在末尾', async () => {
+    const world = await startWorld()
+    const allowed = await create(world, 'F12', 'allow_deny', { ...DENIED, session_name: SESSION_NAME })
+    const rejected = await create(world, 'F13', 'approve_reject', { ...DENIED, session_name: SESSION_NAME })
+    const cancelled = await create(world, 'F14', 'allow_deny', { ...DENIED, session_name: SESSION_NAME })
+    const expired = await create(world, 'F15', 'allow_deny', { ...DENIED, session_name: SESSION_NAME, timeout_seconds: SHORT_TIMEOUT_SECONDS })
+    pressButton(world, 'appr:allow:F12', U1, allowed.messageId)
+    pressButton(world, 'appr:reject:F13', U1, rejected.messageId)
+    await drained(world)
+    sendDm(world, U1, '範圍再縮小', { replyTo: rejected.messageId })
+    await drained(world)
+    await call(world, 'POST', '/approvals/F14/cancel')
+    await waitFor(async () => (await statusOf(world, 'F15')).status === 'expired' && lastEdit(world, expired.messageId), 'F15 expired')
+    const expected: [Created, string][] = [
+      [allowed, '[已允許]'],
+      [rejected, '[已退回] 意見：範圍再縮小'],
+      [cancelled, '[已在電腦處理]'],
+      [expired, '[已逾時]'],
+    ]
+    for (const [created, label] of expected) {
+      const sentFirstLine = firstLineOf(world, created.messageId)
+      expect(sentFirstLine).toBe(`[已被擋下] ${SESSION_NAME}: git push --force origin main`)
+      const edited = String((await waitFor(() => lastEdit(world, created.messageId), 'edit')).text)
+      expect(edited.split('\n')[0]).toBe(sentFirstLine)
+      expect(edited.endsWith(`\n\n${label}`)).toBe(true)
+    }
+  }, TEST_TIMEOUT_MS)
+
+  test('自由文字長到 3500 字上限：已被擋下第一行仍完整', async () => {
+    const world = await startWorld()
+    const res = await call(world, 'POST', '/approvals', {
+      id: 'F16', text: '長'.repeat(3500), kind: 'allow_deny', session_name: SESSION_NAME, ...DENIED,
+    })
+    expect(res.status).toBe(201)
+    expect(firstLineOf(world, FIRST_FAKE_MESSAGE_ID)).toBe(`[已被擋下] ${SESSION_NAME}: git push --force origin main`)
+  }, TEST_TIMEOUT_MS)
+
+  test('系統訊息開關開啟：容量已滿通知第一行為 [系統] tg-hub:', async () => {
+    const spawnBin = join(tmpdir(), `cap-reached-${process.pid}-${Date.now()}.sh`)
+    writeFileSync(spawnBin, '#!/bin/sh\nexit 2\n', { mode: 0o755 })
+    try {
+      const world = await startWorld({ TELEGRAM_FIRST_LINE_FORMAT: SWITCH_ON, SCOPE_SPAWN_BIN: spawnBin })
+      sendDm(world, U2, '容量滿時進來的人')
+      const notice = await waitFor(() => world.fake.callsOf('sendMessage').at(-1), 'cap-reached notice')
+      expect(notice.params).toEqual({ chat_id: U2, text: '[系統] tg-hub: 目前容量已滿，請稍後再試。' })
+    } finally {
+      rmSync(spawnBin, { force: true })
+    }
   }, TEST_TIMEOUT_MS)
 })

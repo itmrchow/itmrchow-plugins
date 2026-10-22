@@ -13,6 +13,7 @@
  */
 import type { Update } from 'grammy/types'
 import { composeMessageText, computeBindingKey, renderBindingDisplay, type ApprovalBinding } from './approval-binding'
+import { FIRST_LINE_STATUS, formatFirstLine, HUB_SESSION_NAME } from './first-line'
 import {
   ACTIONS_BY_KIND,
   ALL_ACTIONS,
@@ -94,6 +95,8 @@ export type CreateApprovalInput = {
   commentTimeoutSeconds: number
   /** What the approval is bound to (JP-374); null = unbound, never consumable. */
   binding: ApprovalBinding | null
+  /** Session the request belongs to (JP-379), already validated; first line of its follow-up messages. */
+  sessionName: string
 }
 
 export type CreateApprovalError = 'duplicate_id' | 'no_recipient' | 'telegram_send_failed' | 'too_many_requests'
@@ -160,15 +163,15 @@ function outcomeLabel(request: ApprovalRequest): string {
 
 /**
  * The text a request message shows once it is no longer plain pending: the
- * message as first sent (binding block, then free text) followed by its
- * outcome, cut to Telegram's message limit. The binding block comes first, so
- * a cut never reaches it.
+ * message as first sent (first line and binding block, then free text)
+ * followed by its outcome, cut to Telegram's message limit. The first line and
+ * binding block come first, so a cut never reaches them.
  *
  * @param request - The request in its current state.
  * @returns Message text.
  */
 export function renderApprovalText(request: ApprovalRequest): string {
-  const rendered = `${composeMessageText(request.bindingDisplay, request.text)}\n\n${outcomeLabel(request)}`
+  const rendered = `${composeMessageText(request.bindingDisplay, request.text, request.sessionName)}\n\n${outcomeLabel(request)}`
   if (rendered.length <= TELEGRAM_MESSAGE_LIMIT) return rendered
   return `${rendered.slice(0, TELEGRAM_MESSAGE_LIMIT - TRUNCATION_MARK.length)}${TRUNCATION_MARK}`
 }
@@ -231,7 +234,7 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
       // key, masked into the display, never stored.
       const bindingKey = input.binding === null ? null : computeBindingKey(input.binding)
       const bindingDisplay = input.binding === null ? null : renderBindingDisplay(input.binding.subject)
-      const messageText = composeMessageText(bindingDisplay, input.text)
+      const messageText = composeMessageText(bindingDisplay, input.text, input.sessionName)
       const messages: SentMessage[] = []
       for (const chatId of recipients) {
         try {
@@ -250,6 +253,7 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
         text: input.text,
         bindingKey,
         bindingDisplay,
+        sessionName: input.sessionName,
         createdAtMs,
         expiresAtMs: createdAtMs + input.timeoutSeconds * MS_PER_SECOND,
         commentTimeoutMs: input.commentTimeoutSeconds * MS_PER_SECOND,
@@ -276,9 +280,12 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
 
   const askForComment = async (request: ApprovalRequest, chatId: number, messageId: number): Promise<void> => {
     await rewriteMessages(request)
-    const prompt =
+    const prompt = formatFirstLine(
+      FIRST_LINE_STATUS.awaitingReply,
+      request.sessionName,
       `請「回覆」這則訊息寫下退回意見。` +
-      `${describeCommentWindow(request.commentTimeoutMs)}內沒有回覆，會記為無意見退回。`
+        `${describeCommentWindow(request.commentTimeoutMs)}內沒有回覆，會記為無意見退回。`,
+    )
     try {
       store.addPrompt(request.id, { chatId, messageId: await api.sendPrompt(chatId, prompt, messageId) })
     } catch (err) {
@@ -329,14 +336,16 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     // Too late: routing it would hand a session the prompt text plus an
     // orphaned comment, which reads like an instruction. Say so instead.
     if (!request) {
-      await api.sendText(message.chat.id, COMMENT_TOO_LATE_TEXT).catch(err => {
+      const notice = formatFirstLine(FIRST_LINE_STATUS.system, closed?.sessionName ?? HUB_SESSION_NAME, COMMENT_TOO_LATE_TEXT)
+      await api.sendText(message.chat.id, notice).catch(err => {
         log(`telegram poller: approval ${closed?.id} late-comment notice failed: ${err}`)
       })
       return true
     }
 
     if (message.text === undefined) {
-      await api.sendText(message.chat.id, TEXT_ONLY_COMMENT_TEXT).catch(err => {
+      const notice = formatFirstLine(FIRST_LINE_STATUS.awaitingReply, request.sessionName, TEXT_ONLY_COMMENT_TEXT)
+      await api.sendText(message.chat.id, notice).catch(err => {
         log(`telegram poller: approval ${request.id} text-only notice failed: ${err}`)
       })
       return true

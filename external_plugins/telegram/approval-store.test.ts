@@ -30,6 +30,7 @@ const newApproval = (id: string, kind: ApprovalKind = 'allow_deny', messageId = 
   text: `請求 ${id}`,
   bindingKey: null,
   bindingDisplay: null,
+  sessionName: 'OP-8820',
   createdAtMs: clock,
   expiresAtMs: clock + TIMEOUT_MS,
   commentTimeoutMs: COMMENT_TIMEOUT_MS,
@@ -361,7 +362,7 @@ test('consumed 與綁定 key 重開後保留；consumed 過了保留期一樣清
   expect(reopened.get('used')).toBeUndefined()
 })
 
-test('舊版狀態檔（沒有綁定欄位）照常載入，綁定 key 與顯示文字視為 null', () => {
+test('舊版狀態檔（沒有綁定欄位、沒有 session name）照常載入，綁定 key 與顯示文字視為 null、session name 填 tg-hub', () => {
   const legacy = {
     id: 'old', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
     createdAtMs: clock, expiresAtMs: clock + TIMEOUT_MS, commentTimeoutMs: COMMENT_TIMEOUT_MS,
@@ -369,12 +370,12 @@ test('舊版狀態檔（沒有綁定欄位）照常載入，綁定 key 與顯示
   }
   writeFileSync(filePath, JSON.stringify({ version: 1, requests: [legacy] }))
   const store = openStore()
-  expect(store.get('old')).toMatchObject({ status: 'approved', bindingKey: null, bindingDisplay: null })
+  expect(store.get('old')).toMatchObject({ status: 'approved', bindingKey: null, bindingDisplay: null, sessionName: 'tg-hub' })
   expect(store.consume('old', KEY).outcome).toBe('binding_mismatch')
   expect(readdirSync(dir).some(name => name.startsWith('approvals.json.corrupt-'))).toBe(false)
 })
 
-test.each([['bindingKey'], ['bindingDisplay']])('狀態檔裡 %s 型別不對視為損毀', (field: string) => {
+test.each([['bindingKey'], ['bindingDisplay'], ['sessionName']])('狀態檔裡 %s 型別不對視為損毀', (field: string) => {
   const bad = {
     id: 'a', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
     createdAtMs: 1, expiresAtMs: 2, commentTimeoutMs: 3, commentDeadlineMs: null, resolvedAtMs: 1,
@@ -410,4 +411,9 @@ test('其他轉換寫檔失敗時照舊：決定留在記憶體，重啟後回�
   expect(store.get('a')?.status).toBe('approved')
   rmSync(`${filePath}.tmp`, { recursive: true })
   expect(openStore().get('a')?.status).toBe('pending')
+})
+
+test('session name 隨請求落檔，重開後照舊', () => {
+  openStore().add(newApproval('named'))
+  expect(openStore().get('named')?.sessionName).toBe('OP-8820')
 })
