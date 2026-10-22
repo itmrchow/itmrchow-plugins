@@ -20,6 +20,7 @@
  */
 import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { HUB_SESSION_NAME } from './first-line'
 
 export type ApprovalKind = 'allow_deny' | 'approve_reject'
 export type ApprovalAction = 'allow' | 'deny' | 'approve' | 'reject'
@@ -44,6 +45,8 @@ export type ApprovalRequest = {
   bindingKey: string | null
   /** The bound content as shown to the user, secrets masked; null exactly when bindingKey is. */
   bindingDisplay: string | null
+  /** Session the request belongs to, for the first line of its messages (JP-379); tg-hub when the caller named none. */
+  sessionName: string
   status: ApprovalStatus
   /** The button that settled it; null until one does, and for cancelled / expired. */
   decision: ApprovalAction | null
@@ -63,7 +66,16 @@ export type ApprovalRequest = {
 
 export type NewApproval = Pick<
   ApprovalRequest,
-  'id' | 'kind' | 'text' | 'bindingKey' | 'bindingDisplay' | 'createdAtMs' | 'expiresAtMs' | 'commentTimeoutMs' | 'messages'
+  | 'id'
+  | 'kind'
+  | 'text'
+  | 'bindingKey'
+  | 'bindingDisplay'
+  | 'sessionName'
+  | 'createdAtMs'
+  | 'expiresAtMs'
+  | 'commentTimeoutMs'
+  | 'messages'
 >
 
 export type PressOutcome =
@@ -135,6 +147,10 @@ function isOptionalStringOrNull(value: unknown): boolean {
   return value === undefined || value === null || typeof value === 'string'
 }
 
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === 'string'
+}
+
 function isApprovalRequest(value: unknown): value is ApprovalRequest {
   if (typeof value !== 'object' || value === null) return false
   const request = value as Record<string, unknown>
@@ -144,6 +160,7 @@ function isApprovalRequest(value: unknown): value is ApprovalRequest {
     typeof request.text === 'string' &&
     isOptionalStringOrNull(request.bindingKey) &&
     isOptionalStringOrNull(request.bindingDisplay) &&
+    isOptionalString(request.sessionName) &&
     typeof request.status === 'string' && ALL_STATUSES.has(request.status) &&
     (request.decision === null || (typeof request.decision === 'string' && KNOWN_ACTIONS.has(request.decision))) &&
     (request.comment === null || typeof request.comment === 'string') &&
@@ -404,12 +421,14 @@ export class ApprovalStore {
         throw new Error('unexpected shape')
       }
       if (!parsed.requests.every(isApprovalRequest)) throw new Error('invalid request entry')
-      // Files written before JP-374 carry no binding fields: those requests are unbound.
+      // Files written before JP-374 carry no binding fields: those requests are
+      // unbound. Files written before JP-379 carry no session name: tg-hub.
       for (const request of parsed.requests) {
         this.#requests.set(request.id, {
           ...request,
           bindingKey: request.bindingKey ?? null,
           bindingDisplay: request.bindingDisplay ?? null,
+          sessionName: request.sessionName ?? HUB_SESSION_NAME,
         })
       }
     } catch (err) {

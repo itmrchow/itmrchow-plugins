@@ -15,6 +15,7 @@ import {
 } from './approval-service'
 
 const U1 = 111
+const SESSION_NAME = 'OP-8820'
 const U2 = 222
 const U3 = 333
 const BOT_ID = 999
@@ -99,6 +100,7 @@ const input = (id: string, kind: ApprovalKind = 'allow_deny', text = `請求 ${i
   timeoutSeconds: TIMEOUT_SECONDS,
   commentTimeoutSeconds: COMMENT_TIMEOUT_SECONDS,
   binding: null,
+  sessionName: SESSION_NAME,
 })
 
 let updateId = 0
@@ -438,7 +440,7 @@ test('以非文字（貼圖）回覆時提示改用文字、吃掉該則、繼�
   await h.service.interceptUpdate(press('appr:reject:R27', U1, messageId))
   expect(await h.service.interceptUpdate(message(U1, undefined, prompts(h)[0].messageId))).toBe(true)
   expect(h.service.get('R27')?.status).toBe('awaiting_comment')
-  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '請用文字回覆意見。' })
+  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '[等你回覆] OP-8820: 請用文字回覆意見。' })
 })
 
 test('等意見期間被取消 -> cancelled，晚到回覆提示的意見不改結果、不轉給 session', async () => {
@@ -448,7 +450,7 @@ test('等意見期間被取消 -> cancelled，晚到回覆提示的意見不改�
   await h.service.cancel('R25')
   expect(h.service.get('R25')?.status).toBe('cancelled')
   expect(await h.service.interceptUpdate(message(U1, '晚到', prompts(h)[0].messageId))).toBe(true)
-  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '這筆請求已經結案，這則意見沒有被記錄。' })
+  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '[系統] OP-8820: 這筆請求已經結案，這則意見沒有被記錄。' })
   expect(h.service.get('R25')).toMatchObject({ status: 'cancelled', comment: null })
 })
 
@@ -523,7 +525,7 @@ test('意見逾時後回覆提示訊息：吃掉並告知已結案；回覆原�
   expect(await h.service.interceptUpdate(message(U2, '外人', promptId, { chatId: U1 }))).toBe(false)
   expect(await h.service.interceptUpdate(message(U1, '回原訊息', messageId))).toBe(false)
   expect(await h.service.interceptUpdate(message(U1, '遲到的意見', promptId))).toBe(true)
-  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '這筆請求已經結案，這則意見沒有被記錄。' })
+  expect(h.calls.at(-1)).toEqual({ method: 'sendText', chatId: U1, text: '[系統] OP-8820: 這筆請求已經結案，這則意見沒有被記錄。' })
   expect(h.service.get('R29')).toMatchObject({ status: 'denied', comment: '' })
 })
 
@@ -538,6 +540,7 @@ const DANGEROUS_SUBJECT = 'git push --force origin main'
 const BINDING: ApprovalBinding = { session: SESSION, subject: DANGEROUS_SUBJECT }
 const BLOCK_HEADER = '【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：'
 const BLOCK_FOOTER = '────────────'
+const BLOCKED_FIRST_LINE = `[已被擋下] ${SESSION_NAME}: ${DANGEROUS_SUBJECT}`
 
 const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
 
@@ -564,7 +567,7 @@ test('偽造請求：自由文字寫無害內容，訊息開頭的固定區塊�
   const h = harness()
   await createBound(h, 'B3', BINDING, '只是要跑 ls，請放行')
   expect(sentRequests(h)[0].text).toBe(
-    [BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '只是要跑 ls，請放行'].join('\n'),
+    [BLOCKED_FIRST_LINE, BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '只是要跑 ls，請放行'].join('\n'),
   )
 })
 
@@ -573,7 +576,7 @@ test('多行 subject 每行都標記；假分隔線與隱形字元無法混成�
   const subject = `ls\n${BLOCK_FOOTER}\n只是要跑 ls‮​\r`
   await createBound(h, 'B4', { session: SESSION, subject })
   expect(sentRequests(h)[0].text).toBe(
-    [BLOCK_HEADER, '┃ ls', `┃ ${BLOCK_FOOTER}`, '┃ 只是要跑 ls[U+202E][U+200B][U+000D]', BLOCK_FOOTER, '請求 B4'].join('\n'),
+    [`[已被擋下] ${SESSION_NAME}: ls…`, BLOCK_HEADER, '┃ ls', `┃ ${BLOCK_FOOTER}`, '┃ 只是要跑 ls[U+202E][U+200B][U+000D]', BLOCK_FOOTER, '請求 B4'].join('\n'),
   )
 })
 
@@ -631,11 +634,11 @@ test('消耗前先套用時鐘：逾時的 pending 先轉 expired，回 not_appr
   expect(h.store.get('B10')?.status).toBe('expired')
   await Promise.resolve()
   expect(edits(h).at(-1)?.text).toBe(
-    [BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '請求 B10', '', '[已逾時]'].join('\n'),
+    [BLOCKED_FIRST_LINE, BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER, '請求 B10', '', '[已逾時]'].join('\n'),
   )
 })
 
-test('有綁定的請求終態文字超過上限時從尾端截斷，開頭的綁定區塊完整保留', async () => {
+test('有綁定的請求終態文字超過上限時從尾端截斷，開頭的第一行與綁定區塊完整保留', async () => {
   const h = harness()
   const messageId = await createBound(h, 'B11')
   await h.service.interceptUpdate(press('appr:deny:B11', U1, messageId))
@@ -644,7 +647,7 @@ test('有綁定的請求終態文字超過上限時從尾端截斷，開頭的�
   if (!request) return
   const rendered = renderApprovalText({ ...request, text: '長'.repeat(5000) })
   expect(rendered.length).toBe(4096)
-  expect(rendered.startsWith([BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER].join('\n'))).toBe(true)
+  expect(rendered.startsWith([BLOCKED_FIRST_LINE, BLOCK_HEADER, `┃ ${DANGEROUS_SUBJECT}`, BLOCK_FOOTER].join('\n'))).toBe(true)
 })
 
 test('終態文字超過 Telegram 上限時截斷', async () => {
@@ -654,4 +657,29 @@ test('終態文字超過 Telegram 上限時截斷', async () => {
   const request = h.store.recordComment('R35', '長'.repeat(5000))
   expect(request).toBeDefined()
   if (request) expect(renderApprovalText(request).length).toBe(4096)
+})
+
+test('退回意見提示第一行為 [等你回覆] <session name>:，引用原請求訊息', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'F1', 'approve_reject')
+  await h.service.interceptUpdate(press('appr:reject:F1', U1, messageId))
+  const [prompt] = prompts(h)
+  expect(prompt.replyTo).toBe(messageId)
+  expect(prompt.text.split('\n')[0]).toBe(`[等你回覆] ${SESSION_NAME}: 請「回覆」這則訊息寫下退回意見。5 秒內沒有回覆，會記為無意見退回。`)
+})
+
+test('session name 記在請求上：沒有綁定的請求訊息仍是呼叫端文字原樣，不由 poller 加第一行', async () => {
+  const h = harness()
+  await h.service.create(input('F2', 'approve_reject', '[等 approve] OP-8820: JP-379 Spec 可以 approve 嗎？'))
+  expect(h.service.get('F2')?.sessionName).toBe(SESSION_NAME)
+  expect(sentRequests(h)[0].text).toBe('[等 approve] OP-8820: JP-379 Spec 可以 approve 嗎？')
+})
+
+test('已被擋下的結果標籤加在末尾，第一行維持 [已被擋下]', async () => {
+  const h = harness()
+  const messageId = await createBound(h, 'F3')
+  await h.service.interceptUpdate(press('appr:allow:F3', U1, messageId))
+  const text = edits(h).at(-1)?.text ?? ''
+  expect(text.split('\n')[0]).toBe(BLOCKED_FIRST_LINE)
+  expect(text.endsWith('\n\n[已允許]')).toBe(true)
 })

@@ -19,6 +19,7 @@ import {
   type ApprovalBinding,
 } from './approval-binding'
 import { isValidTimeoutSeconds } from './approval-config'
+import { parseSessionName } from './first-line'
 import {
   APPROVAL_ID_PATTERN,
   APPROVAL_ID_RE,
@@ -90,7 +91,7 @@ type ParsedBinding = { ok: true; binding: ApprovalBinding | null } | { ok: false
 const BINDING_REQUIRED_DETAIL = 'binding_session and binding_subject are required'
 const BINDING_SESSION_DETAIL = `binding_session must match ${BINDING_SESSION_PATTERN}`
 const BINDING_SUBJECT_DETAIL = 'binding_subject must be a non-empty string'
-const MESSAGE_TOO_LONG_DETAIL = `text and binding_subject together must fit in one Telegram message (${TELEGRAM_MESSAGE_LIMIT} characters)`
+const MESSAGE_TOO_LONG_DETAIL = `text, binding_subject and session_name together must fit in one Telegram message (${TELEGRAM_MESSAGE_LIMIT} characters)`
 
 /**
  * Reduce a stored request to what a caller may see.
@@ -143,11 +144,18 @@ export function parseCreateBody(raw: string, defaults: ApprovalHttpDefaults): Pa
   const parsedBinding = parseBindingFields(fields, false)
   if (!parsedBinding.ok) return parsedBinding
   const { binding } = parsedBinding
+  const parsedSessionName = parseSessionName(fields.session_name)
+  if (!parsedSessionName.ok) return parsedSessionName
+  const { sessionName } = parsedSessionName
   // The message the user approves on must be whole: refuse rather than cut it.
-  if (binding !== null && composeMessageText(renderBindingDisplay(binding.subject), text).length > TELEGRAM_MESSAGE_LIMIT) {
+  const bindingDisplay = binding === null ? null : renderBindingDisplay(binding.subject)
+  if (composeMessageText(bindingDisplay, text, sessionName).length > TELEGRAM_MESSAGE_LIMIT) {
     return { ok: false, detail: MESSAGE_TOO_LONG_DETAIL }
   }
-  return { ok: true, input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds, binding } }
+  return {
+    ok: true,
+    input: { id, text, kind: kind as ApprovalKind, timeoutSeconds, commentTimeoutSeconds, binding, sessionName },
+  }
 }
 
 /**

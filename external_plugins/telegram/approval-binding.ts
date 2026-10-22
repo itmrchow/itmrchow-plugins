@@ -14,6 +14,7 @@
  * keys but look the same on screen (accepted in Spec v1.2).
  */
 import { createHash } from 'node:crypto'
+import { FIRST_LINE_STATUS, formatFirstLine } from './first-line'
 import { maskSecrets } from './secret-mask'
 
 /** The content a request is bound to, as sent by the caller. */
@@ -31,6 +32,9 @@ const BLOCK_HEADER = '【綁定內容】由 poller 顯示，每行以「┃ 」�
 const BLOCK_LINE_PREFIX = '┃ '
 const BLOCK_FOOTER = '────────────'
 const LINE_BREAK = '\n'
+/** First-line summary cap: a glance, the block below holds the whole content. */
+export const SUMMARY_MAX_LENGTH = 80
+const TRUNCATION_MARK = '…'
 /**
  * Characters that can hide or reorder what is shown: C0 / C1 controls other
  * than tab and newline, zero-width characters and bidi controls.
@@ -61,18 +65,41 @@ export function renderBindingDisplay(subject: string): string {
 }
 
 /**
- * The message as sent to Telegram: the poller's block first, every subject line
- * marked, then the caller's free text. Without a binding it is the free text
- * alone, exactly as before JP-374.
+ * The message as sent to Telegram. A bound request (JP-379) opens with a first
+ * line the poller writes entirely itself — `[已被擋下] <session name>: <summary
+ * of the bound content>` — then the poller's block, every subject line marked,
+ * then the caller's free text; so nothing the caller wrote can reach the first
+ * line. Without a binding it is the free text alone, exactly as before JP-374:
+ * the caller writes its own first line.
  *
  * @param bindingDisplay - From renderBindingDisplay, or null for an unbound request.
  * @param text - The caller's free text.
+ * @param sessionName - Session the request belongs to; only shown for a bound request.
  * @returns Message text.
  */
-export function composeMessageText(bindingDisplay: string | null, text: string): string {
+export function composeMessageText(bindingDisplay: string | null, text: string, sessionName: string): string {
   if (bindingDisplay === null) return text
+  const firstLine = formatFirstLine(FIRST_LINE_STATUS.blocked, sessionName, summarizeBindingDisplay(bindingDisplay))
   const lines = bindingDisplay.split(LINE_BREAK).map(line => `${BLOCK_LINE_PREFIX}${line}`)
-  return [BLOCK_HEADER, ...lines, BLOCK_FOOTER, text].join(LINE_BREAK)
+  return [firstLine, BLOCK_HEADER, ...lines, BLOCK_FOOTER, text].join(LINE_BREAK)
+}
+
+/**
+ * One-line summary of the bound content for the first line: its first
+ * non-blank line, cut to SUMMARY_MAX_LENGTH, with a mark whenever anything was
+ * left out. Taken from the display, so it is already masked; the block below
+ * shows it whole.
+ *
+ * @param bindingDisplay - From renderBindingDisplay.
+ * @returns The summary.
+ */
+export function summarizeBindingDisplay(bindingDisplay: string): string {
+  const lines = bindingDisplay.split(LINE_BREAK)
+  // By code point, so a cut never splits a surrogate pair.
+  const head = Array.from(lines.find(line => line.trim() !== '') ?? '')
+  const cut = head.length > SUMMARY_MAX_LENGTH
+  const summary = head.slice(0, SUMMARY_MAX_LENGTH).join('')
+  return cut || lines.length > 1 ? `${summary}${TRUNCATION_MARK}` : summary
 }
 
 function formatCodePoint(char: string): string {
