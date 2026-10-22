@@ -105,6 +105,44 @@ Non-admins get no reply. Admins in a group are told to use a private chat. The
 admin list, timers and every write to the host live in the im-core executor;
 see im-core's README. Without `REAUTH_BIN` both commands route like any text.
 
+## First line of every message (JP-379)
+
+Messages the bot sends the user open with a fixed first line,
+`[<status>] <session name>: <content>` (half-width brackets, half-width colon
+and one space), so the user can tell at a glance which session a message
+belongs to. Statuses come from a fixed list: `[等核准]` `[等 approve]` `[等你]`
+`[已停下]` `[異常結束]` `[已被擋下]` `[等你回覆]` `[回報]` `[系統]`.
+
+On every first line the plugin writes, the session name is shown with
+half-width `:` `[` `]` replaced by full-width `：` `［` `］` (display only — such a
+name is accepted, never refused). So the first `] ` and the first `: ` are
+always the format's separators and a name like `x] y: git status` cannot pose
+as the content: it shows as `[已被擋下] x］ y： git status: <summary>`. Callers
+that write their own first line (unbound requests, see below) must apply the
+same replacement. A session name is still not unique: never trust a message on
+its first line alone.
+
+What the plugin writes itself:
+
+| Message | First line | Switch |
+| --- | --- | --- |
+| Blocked request (an approval request with a binding) | `[已被擋下] <session_name>: <summary>`, see "Binding" below | always on (part of the approval feature) |
+| Reject-comment prompt, "reply with text" notice | `[等你回覆] <session_name>: ...` | always on |
+| "Already closed, comment not recorded" notice | `[系統] <session_name>: ...` | always on |
+| Poller notices (capacity full, cannot respond, not configured, reauth replies) | `[系統] tg-hub: ...` | `TELEGRAM_FIRST_LINE_FORMAT` |
+| server.ts system replies (pairing, /start /help /status, /ctx /clear /restart, the startup notice) | `[系統] tg-hub: ...` | `TELEGRAM_FIRST_LINE_FORMAT` |
+| server.ts permission relay | `[等核准] tg-hub: 權限確認 <tool_name>` (replaces `🔐 Permission: <tool_name>`; buttons and the outcome label unchanged) | `TELEGRAM_FIRST_LINE_FORMAT` |
+
+Everything else is the caller's: an unbound approval request is sent exactly
+as its `text` (the caller writes its own first line), and the session's own
+`reply` / `edit_message` text is never touched. Outcome labels
+(`[已允許]`, `[已在電腦處理]`, `[已逾時]`, ...) are still appended at the end; the
+first line keeps the status the message was sent with.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TELEGRAM_FIRST_LINE_FORMAT` | unset (off) | Read by both `poller.ts` and `server.ts`. `1` or `true` (trimmed, case-insensitive) adds the first line to the rows marked above; anything else leaves those messages exactly as before, so other bots sharing this plugin are unaffected. Set it on both processes. |
+
 ## Approval requests over inline buttons (loopback interface)
 
 Off by default. When the poller has `TELEGRAM_APPROVAL_BUTTONS` set to `1` or
@@ -154,18 +192,37 @@ feature is off.
 | `comment_timeout_seconds` | no | Number, `0 < n <= 604800`. |
 | `binding_session` | with `binding_subject` | The caller's session id, `[A-Za-z0-9_-]{1,128}` (so it can hold no newline). |
 | `binding_subject` | with `binding_session` | What the approval is for — for a Bash call, the full command. Non-blank. Send both binding fields or neither; neither = unbound, never consumable. A `binding_key` in the body is ignored: the caller cannot choose the key. |
+| `session_name` | no | (JP-379) The session the request belongs to, as `claude agents --json` / ListAgents shows it. A string of at most 3500 characters with no line break or control character (C0 incl. tab / CR / LF, DEL, C1, U+2028 / U+2029, zero-width and bidi characters): anything else is refused with `400` (bound or not, any `kind`), never cut or cleaned. Absent, `null`, empty or spaces-only = `tg-hub`. Shown with `:` `[` `]` turned full-width. Used on the first line of a blocked request and of the request's follow-up messages; stored with the request, so it survives a poller restart. Not returned by the query. |
 
 **Binding (JP-374).** For a bound request the poller derives the key itself,
 `sha256(binding_session + "\n" + binding_subject)` (hex), and shows the subject
-in a block it writes at the **top** of the message, before the caller's `text`:
+in a block it writes at the **top** of the message, before the caller's `text`.
+A bound request is a blocked action (JP-379), so the poller also writes the
+first line, entirely by itself — nothing the caller sends can reach it:
 
 ```
+[已被擋下] <session_name>: <summary>
 【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：
 ┃ <subject, line 1>
 ┃ <subject, line 2>
 ────────────
 <text>
 ```
+
+For example, `session_name: "OP-8820"`, `binding_subject: "git push --force origin main"`,
+`text: "分類器擋下了這個指令"`:
+
+```
+[已被擋下] OP-8820: git push --force origin main
+【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：
+┃ git push --force origin main
+────────────
+分類器擋下了這個指令
+```
+
+- `<summary>` is the first non-blank line of the masked subject, cut to 80
+  characters; `…` is appended whenever anything was left out (a cut or more
+  lines). The block below always shows the whole subject.
 
 - Every subject line starts with `┃ `, so nothing in `text` (a look-alike
   block, a fake separator) can pass for part of the subject, and a subject line
@@ -180,13 +237,14 @@ in a block it writes at the **top** of the message, before the caller's `text`:
   to deny.
 - The raw subject is not stored: the poller keeps the key and the masked
   display only.
-- The message is never cut: if the block plus `text` does not fit in one
-  Telegram message (4096 characters), the create is refused with `400`.
+- The message is never cut: if the first line, the block and `text` together
+  do not fit in one Telegram message (4096 characters), the create is refused
+  with `400`.
 
 | Reply | Body | When |
 | --- | --- | --- |
 | `201` | the request (see below), `status: "pending"` | Sent to at least one recipient. |
-| `400` | `{"error":"invalid_request","detail":"..."}` | Missing / invalid field, a bound message that would not fit in one Telegram message, malformed JSON, or a body over 32 KB. Nothing was sent. |
+| `400` | `{"error":"invalid_request","detail":"..."}` | Missing / invalid field (including a `session_name` with a line break or control character), a bound message that would not fit in one Telegram message, malformed JSON, or a body over 32 KB. Nothing was sent. |
 | `409` | `{"error":"duplicate_id","request":{...}}` | The id exists. The existing request is returned untouched (never reset, never re-sent). `request` is absent only if the same id is still being created. **This is not your request** — see "Rules for callers". |
 | `502` | `{"error":"telegram_send_failed"}` | Telegram refused every send. Nothing is stored; the id stays free. |
 | `503` | `{"error":"no_recipient"}` | `access.json` has no `allowFrom` entry (or is unreadable). |
@@ -313,13 +371,13 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
   for a reply. The comment is the text of a **quote-reply** to that prompt (or to
   the request message) from someone in `allowFrom`. That reply is consumed by
   the poller and is **not** delivered to any session. A non-text reply gets
-  "請用文字回覆意見。" and the wait continues. No reply within the comment
+  "[等你回覆] <session_name>: 請用文字回覆意見。" and the wait continues. No reply within the comment
   timeout settles it as `denied` with `comment: ""`.
 - A reply that starts with `/` is never a comment: it is routed as usual, so
   bot commands such as `/restart` keep working while a comment is awaited.
 - A quote-reply to the prompt that arrives after the request has settled
   (comment timeout, cancel) is not recorded and not delivered to a session; the
-  bot answers "這筆請求已經結案，這則意見沒有被記錄。".
+  bot answers "[系統] <session_name>: 這筆請求已經結案，這則意見沒有被記錄。".
 - Ordinary messages, replies to anything else, and other callback data
   (`perm:` permission buttons included) are routed to sessions as before.
 - An expired request's message becomes `[已逾時]`.

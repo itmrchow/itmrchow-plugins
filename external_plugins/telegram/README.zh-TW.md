@@ -102,6 +102,36 @@ poller 設了 `REAUTH_BIN`（指向 im-core 的 `scripts/reauth.sh`）時，會�
 非管理員不會收到任何回覆；管理員在群組送出會被告知改用私訊。管理員名單、計時與所有對主機的
 寫入都在 im-core 執行器內，見 im-core 的 README。未設 `REAUTH_BIN` 時，兩個指令照一般文字分派。
 
+## 每則訊息的第一行（JP-379）
+
+bot 發給 user 的訊息第一行固定為 `[<狀態>] <session name>: <內容>`（半形方括號、半形冒號加一個空白），
+讓 user 一眼看出訊息屬於哪個 session。狀態值固定清單：`[等核准]` `[等 approve]` `[等你]` `[已停下]`
+`[異常結束]` `[已被擋下]` `[等你回覆]` `[回報]` `[系統]`。
+
+plugin 自己寫的第一行，session name 顯示時半形 `:` `[` `]` 一律換成全形 `：` `［` `］`（只改顯示，不因此拒收）。
+所以第一行的第一個 `] ` 與第一個 `: ` 一定是格式本身的分隔，`x] y: git status` 這種名字冒充不了內容：
+顯示為 `[已被擋下] x］ y： git status: <摘要>`。自己組第一行的呼叫方（沒有綁定的請求，見下方）必須套同一條替換。
+session name 仍不唯一：不得只靠第一行判斷訊息可不可信。
+
+plugin 自己寫的部分：
+
+| 訊息 | 第一行 | 開關 |
+| --- | --- | --- |
+| 已被擋下（帶綁定的核准請求） | `[已被擋下] <session_name>: <摘要>`，見下方「綁定」 | 一律開啟（屬核准功能） |
+| 退回意見提示、「請用文字回覆意見」 | `[等你回覆] <session_name>: ...` | 一律開啟 |
+| 「已結案、意見沒有被記錄」 | `[系統] <session_name>: ...` | 一律開啟 |
+| poller 通知（容量已滿、暫時無法回應、服務未完整設定、reauth 回覆） | `[系統] tg-hub: ...` | `TELEGRAM_FIRST_LINE_FORMAT` |
+| server.ts 系統回覆（配對、/start /help /status、/ctx /clear /restart、重啟完成通知） | `[系統] tg-hub: ...` | `TELEGRAM_FIRST_LINE_FORMAT` |
+| server.ts 權限 relay | `[等核准] tg-hub: 權限確認 <tool_name>`（取代 `🔐 Permission: <tool_name>`；按鈕與結果標籤不變） | `TELEGRAM_FIRST_LINE_FORMAT` |
+
+其他都由呼叫方負責：沒有綁定的核准請求照 `text` 原樣送出（第一行由呼叫方自己寫），session 經
+`reply` / `edit_message` 送的文字一律不動。結果標籤（`[已允許]`、`[已在電腦處理]`、`[已逾時]` 等）
+仍加在訊息末尾；第一行維持發送當下的狀態。
+
+| 變數 | 預設 | 意思 |
+| --- | --- | --- |
+| `TELEGRAM_FIRST_LINE_FORMAT` | 未設（關閉） | `poller.ts` 與 `server.ts` 都讀。`1` 或 `true`（去空白、不分大小寫）時，上表標此開關的訊息加第一行；其他值一律維持原文，共用本 plugin 的其他 bot 不受影響。兩個程序都要設。 |
+
 ## 核准請求（inline 按鈕，loopback 介面）
 
 預設關閉。poller 的 `TELEGRAM_APPROVAL_BUTTONS` 設為 `1` 或 `true` 時，本機程序可以請
@@ -143,11 +173,14 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `comment_timeout_seconds` | 否 | 數字，`0 < n <= 604800`。 |
 | `binding_session` | 與 `binding_subject` 同時帶 | 呼叫方的 session id，`[A-Za-z0-9_-]{1,128}`（不可能含換行）。 |
 | `binding_subject` | 與 `binding_session` 同時帶 | 這筆核准要放行的內容 —— Bash 呼叫就是指令全文。不可空白。兩個綁定欄位要嘛都帶、要嘛都不帶；都不帶 = 未綁定，永遠不能消耗。body 裡的 `binding_key` 一律忽略：key 不能由呼叫方指定。 |
+| `session_name` | 否 | （JP-379）請求所屬 session 的名字，與 `claude agents --json` / ListAgents 看到的相同。字串、最多 3500 字元、不得含換行或控制字元（C0 含 tab / CR / LF、DEL、C1、U+2028 / U+2029、零寬字元、雙向文字控制字元）：不合規一律回 `400`（不分有無綁定、不分 `kind`），不截斷也不清洗。未帶、`null`、空字串或只有空白 = `tg-hub`。顯示時 `:` `[` `]` 換全形。用於已被擋下的第一行與這筆請求後續訊息的第一行；隨請求落檔，poller 重啟後仍保留。查詢回應不帶此欄位。 |
 
 **綁定（JP-374）。** 有綁定的請求由 poller 自己算 key：`sha256(binding_session + "\n" + binding_subject)`（十六進位），
-並把 subject 顯示在訊息**最上方**、由 poller 寫的區塊裡，呼叫方的 `text` 排在後面：
+並把 subject 顯示在訊息**最上方**、由 poller 寫的區塊裡，呼叫方的 `text` 排在後面。有綁定的請求就是被擋下的動作（JP-379），
+所以第一行也全由 poller 組，呼叫方送的任何內容都到不了第一行：
 
 ```
+[已被擋下] <session_name>: <摘要>
 【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：
 ┃ <subject 第 1 行>
 ┃ <subject 第 2 行>
@@ -155,18 +188,31 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 <text>
 ```
 
+範例：`session_name: "OP-8820"`、`binding_subject: "git push --force origin main"`、`text: "分類器擋下了這個指令"`：
+
+```
+[已被擋下] OP-8820: git push --force origin main
+【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：
+┃ git push --force origin main
+────────────
+分類器擋下了這個指令
+```
+
+- `<摘要>` = 遮罩後 subject 的第一個非空白行，最多 80 字元；有省略（截斷或還有其他行）就在後面加 `…`。
+  完整內容一律看下方區塊。
+
 - subject 每一行都以 `┃ ` 開頭，所以 `text` 裡的任何東西（長得一樣的假區塊、假分隔線）都冒充不了 subject；
   subject 裡長得像分隔線的行也一樣帶著標記。
 - 先套機密遮罩（規則與 tg-notify 權限通知相同，見 `secret-mask.ts`），再把控制字元、零寬字元、雙向文字控制字元
   寫成 `[U+XXXX]`，讓它們無法隱藏或重排顯示內容。key 用原文算，所以只差在被遮機密段的兩個 subject key 不同、畫面相同。
 - 遮罩也可能蓋掉不是機密的部分：`TOKEN=$(某指令)` 會顯示成 `TOKEN=*** ...)`。不該有機密的地方出現 `***`，就應該拒絕。
 - subject 原文不落盤：poller 只保存 key 與遮罩後的顯示文字。
-- 訊息絕不截斷：區塊加上 `text` 放不進一則 Telegram 訊息（4096 字元）時，建立直接回 `400`。
+- 訊息絕不截斷：第一行、區塊加上 `text` 放不進一則 Telegram 訊息（4096 字元）時，建立直接回 `400`。
 
 | 回應 | body | 何時 |
 | --- | --- | --- |
 | `201` | 該請求（格式見下），`status: "pending"` | 至少發給一位收件人。 |
-| `400` | `{"error":"invalid_request","detail":"..."}` | 欄位缺漏 / 不合法、有綁定的訊息放不進一則 Telegram 訊息、JSON 格式錯誤、body 超過 32 KB。沒有發出任何訊息。 |
+| `400` | `{"error":"invalid_request","detail":"..."}` | 欄位缺漏 / 不合法（含 `session_name` 帶換行或控制字元）、有綁定的訊息放不進一則 Telegram 訊息、JSON 格式錯誤、body 超過 32 KB。沒有發出任何訊息。 |
 | `409` | `{"error":"duplicate_id","request":{...}}` | id 已存在。回傳既有請求的現況，不重置、不重發。只有同一 id 仍在建立中時才沒有 `request`。**這不是你的請求**，見「呼叫方必須遵守的規則」。 |
 | `502` | `{"error":"telegram_send_failed"}` | Telegram 全部發送失敗。不留下請求，該 id 可再用。 |
 | `503` | `{"error":"no_recipient"}` | `access.json` 的 `allowFrom` 為空（或讀不到）。 |
@@ -270,10 +316,10 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
 - 「允許」/「拒絕」/ approve 立即定案；訊息變成原文加上 `[已允許]`、`[已拒絕]` 或 `[已 approve]`，按鈕移除。
 - 「退回」讓請求進入 `awaiting_comment`，bot 另發一則提示請 user 回覆。意見 = `allowFrom` 內的人
   **引用回覆**該提示（或原請求訊息）的文字。這則回覆由 poller 吃掉，**不會**轉給任何 session。
-  非文字的回覆會收到「請用文字回覆意見。」並繼續等。等意見逾時則記為 `denied`、`comment: ""`。
+  非文字的回覆會收到「[等你回覆] <session_name>: 請用文字回覆意見。」並繼續等。等意見逾時則記為 `denied`、`comment: ""`。
 - 以 `/` 開頭的回覆一律不算意見、照常轉送，所以等意見期間 `/restart` 這類 bot 指令照樣有效。
 - 請求已結案（等意見逾時、被取消）後才引用回覆提示訊息：不記錄、也不轉給 session，bot 回一句
-  「這筆請求已經結案，這則意見沒有被記錄。」。
+  「[系統] <session_name>: 這筆請求已經結案，這則意見沒有被記錄。」。
 - 一般訊息、回覆其他訊息、其他 callback data（含 `perm:` 權限按鈕）照舊轉給 session。
 - 逾時的請求訊息改為 `[已逾時]`。
 - 改訊息失敗不會讓決定消失；以查詢結果為準。
