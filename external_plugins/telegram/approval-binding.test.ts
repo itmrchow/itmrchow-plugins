@@ -38,7 +38,7 @@ test('沒有綁定時訊息就是自由文字本身（第一行由呼叫端寫�
 test('有綁定時第一行由 poller 組 [已被擋下]，區塊在第二行起、每行加標記，自由文字在分隔線之後', () => {
   expect(composeMessageText('line1\nline2', '說明', 'OP-8820')).toBe(
     [
-      '[已被擋下] OP-8820: line1…',
+      '[已被擋下] OP-8820: line1…（共 2 行）',
       '【綁定內容】由 poller 顯示，每行以「┃ 」開頭，機密已遮罩：',
       '┃ line1',
       '┃ line2',
@@ -56,7 +56,21 @@ test('呼叫端自由文字不會出現在第一行', () => {
 
 test('摘要取第一個非空白行；單行且未超長時不加省略號', () => {
   expect(summarizeBindingDisplay('git status')).toBe('git status')
-  expect(summarizeBindingDisplay('\n  \ngit status\nmore')).toBe('git status…')
+  expect(summarizeBindingDisplay('\n  \ngit status\nmore')).toBe('git status…（共 2 行）')
+})
+
+test('多個非空白行時加「…（共 N 行）」，N 只算非空白行', () => {
+  expect(summarizeBindingDisplay('ls\nrm -rf ~')).toBe('ls…（共 2 行）')
+  expect(summarizeBindingDisplay('a\n\n  \nb\nc\n')).toBe('a…（共 3 行）')
+})
+
+test('只多結尾換行 / 空白行不算多行，不加標記', () => {
+  expect(summarizeBindingDisplay('git status\n')).toBe('git status')
+  expect(summarizeBindingDisplay('git status\n\n   \n')).toBe('git status')
+})
+
+test('第一行超長又有多行時：截斷後只加一次「…」再接行數', () => {
+  expect(summarizeBindingDisplay(`${'a'.repeat(SUMMARY_MAX_LENGTH + 5)}\nb`)).toBe(`${'a'.repeat(SUMMARY_MAX_LENGTH)}…（共 2 行）`)
 })
 
 test('摘要超過上限時依字元截斷並加省略號，不切斷代理對', () => {

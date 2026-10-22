@@ -1201,6 +1201,14 @@ describe('第一行格式（JP-379）', () => {
     }
   }, TEST_TIMEOUT_MS)
 
+  test('多行綁定內容：第一行摘要加「…（共 N 行）」；只多結尾換行不加', async () => {
+    const world = await startWorld()
+    const multi = await create(world, 'F17', 'allow_deny', { ...DENIED, binding_subject: 'ls\nrm -rf ~', session_name: SESSION_NAME })
+    const trailing = await create(world, 'F18', 'allow_deny', { ...DENIED, binding_subject: 'git status\n', session_name: SESSION_NAME })
+    expect(firstLineOf(world, multi.messageId)).toBe(`[已被擋下] ${SESSION_NAME}: ls…（共 2 行）`)
+    expect(firstLineOf(world, trailing.messageId)).toBe(`[已被擋下] ${SESSION_NAME}: git status`)
+  }, TEST_TIMEOUT_MS)
+
   test.each([
     [{}, 'off (unset)'],
     [{ TELEGRAM_FIRST_LINE_FORMAT: 'on' }, 'off (value is not 1 / true)'],

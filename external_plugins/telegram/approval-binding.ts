@@ -87,21 +87,27 @@ export function composeMessageText(bindingDisplay: string | null, text: string, 
 }
 
 /**
- * One-line summary of the bound content for the first line: its first
- * non-blank line, cut to SUMMARY_MAX_LENGTH, with a mark whenever anything was
- * left out. Taken from the display, so it is already masked; the block below
- * shows it whole.
+ * One-line summary of the bound content for the first line (Spec v1.2 Q2):
+ * its first non-blank line, cut to SUMMARY_MAX_LENGTH with `…`; when the
+ * content has more than one non-blank line, `…（共 N 行）` follows, N being the
+ * number of non-blank lines, so a glance at the first line shows there is
+ * more. Blank lines, a trailing newline included, never count. Taken from the
+ * display, so it is already masked; the block below shows it whole.
  *
  * @param bindingDisplay - From renderBindingDisplay.
  * @returns The summary.
  */
 export function summarizeBindingDisplay(bindingDisplay: string): string {
-  const lines = bindingDisplay.split(LINE_BREAK)
+  const nonBlankLines = bindingDisplay.split(LINE_BREAK).filter(line => line.trim() !== '')
   // By code point, so a cut never splits a surrogate pair.
-  const head = Array.from(lines.find(line => line.trim() !== '') ?? '')
-  const cut = head.length > SUMMARY_MAX_LENGTH
+  const head = Array.from(nonBlankLines[0] ?? '')
   const summary = head.slice(0, SUMMARY_MAX_LENGTH).join('')
-  return cut || lines.length > 1 ? `${summary}${TRUNCATION_MARK}` : summary
+  if (nonBlankLines.length > 1) return `${summary}${TRUNCATION_MARK}${formatLineCount(nonBlankLines.length)}`
+  return head.length > SUMMARY_MAX_LENGTH ? `${summary}${TRUNCATION_MARK}` : summary
+}
+
+function formatLineCount(count: number): string {
+  return `（共 ${count} 行）`
 }
 
 function formatCodePoint(char: string): string {
