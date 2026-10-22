@@ -152,3 +152,60 @@ test('spawn 失敗後容量釋出，讓下一個身分還能進來', () => {
   reg.onSpawnFailed('telegram-dm-c')
   expect(reg.admit('telegram-dm-d', env('telegram-dm-d'))).toEqual({ action: 'spawn' })
 })
+
+test('容量上限只計活著的 scope：全部斷線後新身分仍可 spawn（JP-384）', () => {
+  for (const id of ['telegram-dm-a', 'telegram-dm-b', 'telegram-dm-c']) {
+    reg.admit(id, env(id))
+    reg.onSubscribed(id)
+    reg.onDisconnected(id)
+  }
+  expect(reg.admit('telegram-dm-d', env('telegram-dm-d'))).toEqual({ action: 'spawn' })
+})
+
+test('容量上限：maxScopes 個 scope 都已連線時新身分仍擋下（JP-384）', () => {
+  for (const id of ['telegram-dm-a', 'telegram-dm-b', 'telegram-dm-c']) {
+    reg.admit(id, env(id))
+    reg.onSubscribed(id)
+  }
+  expect(reg.admit('telegram-dm-d', env('telegram-dm-d'))).toEqual({
+    action: 'rejected',
+    reason: 'cap_reached',
+  })
+})
+
+test('容量上限：啟動中（connecting）的 scope 計入，斷線的不計（JP-384）', () => {
+  reg.admit('telegram-dm-a', env('telegram-dm-a'))
+  reg.onSubscribed('telegram-dm-a')
+  reg.onDisconnected('telegram-dm-a')
+  reg.admit('telegram-dm-b', env('telegram-dm-b'))
+  reg.admit('telegram-dm-c', env('telegram-dm-c'))
+  expect(reg.admit('telegram-dm-d', env('telegram-dm-d'))).toEqual({ action: 'spawn' })
+  expect(reg.admit('telegram-dm-e', env('telegram-dm-e'))).toEqual({
+    action: 'rejected',
+    reason: 'cap_reached',
+  })
+})
+
+test('未經 admit 直接訂閱上來的 scope 斷線後也不佔容量（JP-384）', () => {
+  for (const id of ['telegram-dm-a', 'telegram-dm-b', 'telegram-dm-c']) {
+    reg.onSubscribed(id)
+    reg.onDisconnected(id)
+  }
+  expect(reg.admit('telegram-dm-d', env('telegram-dm-d'))).toEqual({ action: 'spawn' })
+})
+
+test('斷線 scope 不計入上限後，重連仍照常補送佇列（JP-384 不退化）', () => {
+  const first = env('telegram-dm-a')
+  reg.admit('telegram-dm-a', first)
+  reg.onSubscribed('telegram-dm-a')
+  // 寫進訂閱但沒 ack 就斷線：first 回到佇列
+  reg.onDisconnected('telegram-dm-a')
+  reg.requeue('telegram-dm-a', [first])
+  reg.admit('telegram-dm-b', env('telegram-dm-b'))
+  reg.admit('telegram-dm-c', env('telegram-dm-c'))
+  reg.admit('telegram-dm-d', env('telegram-dm-d'))
+  const late = env('telegram-dm-a')
+  expect(reg.admit('telegram-dm-a', late)).toEqual({ action: 'spawn' })
+  expect(reg.onSubscribed('telegram-dm-a')).toEqual([first, late])
+  expect(reg.size()).toBe(4)
+})
