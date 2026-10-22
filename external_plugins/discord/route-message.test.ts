@@ -250,3 +250,128 @@ test('佇列滿了只記錄不回覆 —— 對方正在洗版，再回更多訊
   expect(h.notified).toEqual([])
   expect(h.logs.some(line => line.includes('queue full'))).toBe(true)
 })
+
+// JP-384：poller 層的容量上限只算活著（啟動中 / 已連線）的 scope。
+// 情境以 maxScopes=2 串 routeMessage，對外只看 spawn 有沒有被呼叫、頻道收到什麼回覆。
+const CAP_TEXT = 'At capacity right now — please try again shortly.'
+
+function createCapHarness(spawn?: SpawnOutcome): Harness {
+  return harness({ registry: new ScopeRegistry({ maxScopes: 2, maxQueue: 10 }), spawn })
+}
+
+async function sendFrom(h: Harness, authorId: string): Promise<void> {
+  await routeMessage(dmMessage({ authorId, channelId: `ch-${authorId}` }), h.ctx)
+}
+
+async function bringUp(h: Harness, authorId: string): Promise<void> {
+  await sendFrom(h, authorId)
+  h.ctx.registry.onSubscribed(`discord-dm-${authorId}`)
+}
+
+test('上限只算活著的 scope：2 個 scope 上線後全部斷線，新頻道照樣 spawn（JP-384）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '111')
+  await bringUp(h, '222')
+  h.ctx.registry.onDisconnected('discord-dm-111')
+  h.ctx.registry.onDisconnected('discord-dm-222')
+  await sendFrom(h, '333')
+  expect(h.spawned).toContain('discord-dm-333')
+  expect(h.notified).toEqual([])
+})
+
+test('上限只算活著的 scope：2 個 scope 都在線時新頻道收到容量已滿（JP-384）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '111')
+  await bringUp(h, '222')
+  await sendFrom(h, '333')
+  expect(h.spawned).not.toContain('discord-dm-333')
+  expect(h.notified).toEqual([{ channelId: 'ch-333', text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：啟動中尚未訂閱的 scope 佔名額（JP-384）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '111')
+  await sendFrom(h, '222')
+  await sendFrom(h, '333')
+  expect(h.ctx.registry.state('discord-dm-222')).toBe('connecting')
+  expect(h.notified).toEqual([{ channelId: 'ch-333', text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：1 個在線 + 1 個斷線，新頻道照樣 spawn（JP-384）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '111')
+  await bringUp(h, '222')
+  h.ctx.registry.onDisconnected('discord-dm-222')
+  await sendFrom(h, '333')
+  expect(h.spawned).toContain('discord-dm-333')
+  expect(h.notified).toEqual([])
+})
+
+test('上限只算活著的 scope：斷線後又重新訂閱的 scope 重新佔名額（JP-384）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '111')
+  await bringUp(h, '222')
+  h.ctx.registry.onDisconnected('discord-dm-111')
+  h.ctx.registry.onDisconnected('discord-dm-222')
+  h.ctx.registry.onSubscribed('discord-dm-111')
+  h.ctx.registry.onSubscribed('discord-dm-222')
+  await sendFrom(h, '333')
+  expect(h.notified).toEqual([{ channelId: 'ch-333', text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：沒經訊息直接訂閱上來的 scope 在線時佔名額（JP-384）', async () => {
+  const h = createCapHarness()
+  h.ctx.registry.onSubscribed('discord-dm-111')
+  h.ctx.registry.onSubscribed('discord-dm-222')
+  await sendFrom(h, '333')
+  expect(h.spawned).toEqual([])
+  expect(h.notified).toEqual([{ channelId: 'ch-333', text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：沒經訊息直接訂閱上來的 scope 斷線後不佔名額（JP-384）', async () => {
+  const h = createCapHarness()
+  h.ctx.registry.onSubscribed('discord-dm-111')
+  h.ctx.registry.onSubscribed('discord-dm-222')
+  h.ctx.registry.onDisconnected('discord-dm-111')
+  h.ctx.registry.onDisconnected('discord-dm-222')
+  await sendFrom(h, '333')
+  expect(h.spawned).toEqual(['discord-dm-333'])
+  expect(h.notified).toEqual([])
+})
+
+test('上限已滿時，斷線 scope 自己的頻道來訊仍要求 spawn，不回容量已滿（JP-384）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '333')
+  h.ctx.registry.onDisconnected('discord-dm-333')
+  await bringUp(h, '111')
+  await bringUp(h, '222')
+  await sendFrom(h, '333')
+  expect(h.spawned.filter(id => id === 'discord-dm-333').length).toBe(2)
+  expect(h.notified).toEqual([])
+})
+
+test('斷線 scope 不佔名額後，重連仍補送斷線期間的訊息（JP-384 不退化）', async () => {
+  const h = createCapHarness()
+  await bringUp(h, '111')
+  h.ctx.registry.onDisconnected('discord-dm-111')
+  await bringUp(h, '222')
+  await bringUp(h, '333')
+  await routeMessage(dmMessage({ authorId: '111', channelId: 'ch-111', data: { content: 'late-1' } }), h.ctx)
+  await routeMessage(dmMessage({ authorId: '111', channelId: 'ch-111', data: { content: 'late-2' } }), h.ctx)
+  const pending = h.ctx.registry.onSubscribed('discord-dm-111')
+  expect(pending.map(e => (e.payload as DiscordPayload).data)).toEqual([
+    { content: 'late-1' },
+    { content: 'late-2' },
+  ])
+})
+
+test('poller 放行新頻道但 spawn 回報容量已滿（exit 2）：沿用容量已滿回覆（JP-384）', async () => {
+  const h = createCapHarness('cap_reached')
+  h.ctx.registry.onSubscribed('discord-dm-111')
+  h.ctx.registry.onSubscribed('discord-dm-222')
+  h.ctx.registry.onDisconnected('discord-dm-111')
+  h.ctx.registry.onDisconnected('discord-dm-222')
+  await sendFrom(h, '333')
+  expect(h.spawned).toEqual(['discord-dm-333'])
+  expect(h.notified).toEqual([{ channelId: 'ch-333', text: CAP_TEXT }])
+})

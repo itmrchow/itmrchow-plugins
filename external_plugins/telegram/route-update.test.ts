@@ -11,6 +11,8 @@ import {
 } from './route-update'
 import type { InboundEnvelope } from './subscribe-protocol'
 
+const CAP_TEXT = '目前容量已滿，請稍後再試。'
+
 const privateUpdate = (updateId = 1, userId = 555, chatId = 555): Update =>
   ({
     update_id: updateId,
@@ -132,7 +134,7 @@ test('spawn 回報容量已滿：清掉 entry 並回覆使用者', async () => {
   const h = harness({ spawn: 'cap_reached' })
   await routeUpdate(privateUpdate(1), h.ctx)
   expect(h.ctx.registry.state('telegram-dm-555')).toBeUndefined()
-  expect(h.notified).toEqual([{ chatId: 555, text: '目前容量已滿，請稍後再試。' }])
+  expect(h.notified).toEqual([{ chatId: 555, text: CAP_TEXT }])
 })
 
 test('SCOPE_SPAWN_BIN 未設：回「服務未完整設定」而不是靜默丟棄', async () => {
@@ -146,7 +148,7 @@ test('registry 容量上限擋下新身分時直接回覆，不呼叫 spawn', as
   await routeUpdate(privateUpdate(1, 111, 111), h.ctx)
   await routeUpdate(privateUpdate(2, 222, 222), h.ctx)
   expect(h.spawned).toEqual(['telegram-dm-111'])
-  expect(h.notified).toEqual([{ chatId: 222, text: '目前容量已滿，請稍後再試。' }])
+  expect(h.notified).toEqual([{ chatId: 222, text: CAP_TEXT }])
 })
 
 test('spawn 成功但逾時沒訂閱：出聲並清掉 entry', async () => {
@@ -380,4 +382,122 @@ test('計數器由 consumer 自己持有：跨批次累加不靠呼叫端傳同�
   const consume = createUpdateConsumer(ctx)
   for (let i = 0; i < 3; i++) offset = await consume([privateUpdate(10)], offset)
   expect(offset).toBe(11)
+})
+
+// JP-384：poller 層的容量上限只算活著（啟動中 / 已連線）的 scope。
+// 情境以 maxScopes=2 串 routeUpdate，對外只看 spawn 有沒有被呼叫、聊天室收到什麼回覆。
+let capUpdateId = 1000
+
+async function sendFrom(h: Harness, userId: number): Promise<void> {
+  await routeUpdate(privateUpdate(++capUpdateId, userId, userId), h.ctx)
+}
+
+async function bringUp(h: Harness, userId: number): Promise<void> {
+  await sendFrom(h, userId)
+  h.ctx.registry.onSubscribed(`telegram-dm-${userId}`)
+}
+
+test('上限只算活著的 scope：2 個 scope 上線後全部斷線，新聊天室照樣 spawn（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 111)
+  await bringUp(h, 222)
+  h.ctx.registry.onDisconnected('telegram-dm-111')
+  h.ctx.registry.onDisconnected('telegram-dm-222')
+  await sendFrom(h, 333)
+  expect(h.spawned).toContain('telegram-dm-333')
+  expect(h.notified).toEqual([])
+})
+
+test('上限只算活著的 scope：2 個 scope 都在線時新聊天室收到容量已滿（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 111)
+  await bringUp(h, 222)
+  await sendFrom(h, 333)
+  expect(h.spawned).not.toContain('telegram-dm-333')
+  expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：啟動中尚未訂閱的 scope 佔名額（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 111)
+  await sendFrom(h, 222)
+  await sendFrom(h, 333)
+  expect(h.ctx.registry.state('telegram-dm-222')).toBe('connecting')
+  expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：1 個在線 + 1 個斷線，新聊天室照樣 spawn（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 111)
+  await bringUp(h, 222)
+  h.ctx.registry.onDisconnected('telegram-dm-222')
+  await sendFrom(h, 333)
+  expect(h.spawned).toContain('telegram-dm-333')
+  expect(h.notified).toEqual([])
+})
+
+test('上限只算活著的 scope：斷線後又重新訂閱的 scope 重新佔名額（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 111)
+  await bringUp(h, 222)
+  h.ctx.registry.onDisconnected('telegram-dm-111')
+  h.ctx.registry.onDisconnected('telegram-dm-222')
+  h.ctx.registry.onSubscribed('telegram-dm-111')
+  h.ctx.registry.onSubscribed('telegram-dm-222')
+  await sendFrom(h, 333)
+  expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：沒經訊息直接訂閱上來的 scope 在線時佔名額（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  h.ctx.registry.onSubscribed('telegram-dm-111')
+  h.ctx.registry.onSubscribed('telegram-dm-222')
+  await sendFrom(h, 333)
+  expect(h.spawned).toEqual([])
+  expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
+})
+
+test('上限只算活著的 scope：沒經訊息直接訂閱上來的 scope 斷線後不佔名額（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  h.ctx.registry.onSubscribed('telegram-dm-111')
+  h.ctx.registry.onSubscribed('telegram-dm-222')
+  h.ctx.registry.onDisconnected('telegram-dm-111')
+  h.ctx.registry.onDisconnected('telegram-dm-222')
+  await sendFrom(h, 333)
+  expect(h.spawned).toEqual(['telegram-dm-333'])
+  expect(h.notified).toEqual([])
+})
+
+test('上限已滿時，斷線 scope 自己的聊天室來訊仍要求 spawn，不回容量已滿（JP-384）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 333)
+  h.ctx.registry.onDisconnected('telegram-dm-333')
+  await bringUp(h, 111)
+  await bringUp(h, 222)
+  await sendFrom(h, 333)
+  expect(h.spawned.filter(id => id === 'telegram-dm-333').length).toBe(2)
+  expect(h.notified).toEqual([])
+})
+
+test('斷線 scope 不佔名額後，重連仍補送斷線期間的訊息（JP-384 不退化）', async () => {
+  const h = harness({ maxScopes: 2 })
+  await bringUp(h, 111)
+  h.ctx.registry.onDisconnected('telegram-dm-111')
+  await bringUp(h, 222)
+  await bringUp(h, 333)
+  await routeUpdate(privateUpdate(2001, 111, 111), h.ctx)
+  await routeUpdate(privateUpdate(2002, 111, 111), h.ctx)
+  const pending = h.ctx.registry.onSubscribed('telegram-dm-111')
+  expect(pending.map(e => (e.payload as Update).update_id)).toEqual([2001, 2002])
+})
+
+test('poller 放行新聊天室但 spawn 回報容量已滿（exit 2）：沿用容量已滿回覆（JP-384）', async () => {
+  const h = harness({ maxScopes: 2, spawn: 'cap_reached' })
+  h.ctx.registry.onSubscribed('telegram-dm-111')
+  h.ctx.registry.onSubscribed('telegram-dm-222')
+  h.ctx.registry.onDisconnected('telegram-dm-111')
+  h.ctx.registry.onDisconnected('telegram-dm-222')
+  await sendFrom(h, 333)
+  expect(h.spawned).toEqual(['telegram-dm-333'])
+  expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
 })
