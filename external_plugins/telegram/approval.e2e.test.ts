@@ -1200,4 +1200,13 @@ describe('第一行格式（JP-379）', () => {
       rmSync(spawnBin, { force: true })
     }
   }, TEST_TIMEOUT_MS)
+
+  test.each([
+    [{}, 'off (unset)'],
+    [{ TELEGRAM_FIRST_LINE_FORMAT: 'on' }, 'off (value is not 1 / true)'],
+    [{ TELEGRAM_FIRST_LINE_FORMAT: SWITCH_ON }, 'on'],
+  ])('poller 啟動時印出第一行開關狀態：%p -> %p', async (env, state) => {
+    const world = await startWorld({ TELEGRAM_APPROVAL_BUTTONS: SWITCH_ON, ...env })
+    expect(world.stderr.join('')).toContain(`telegram poller: first-line format ${state} (TELEGRAM_FIRST_LINE_FORMAT)`)
+  }, TEST_TIMEOUT_MS)
 })

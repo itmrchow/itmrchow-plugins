@@ -13,7 +13,8 @@
  */
 import type { Update } from 'grammy/types'
 import { composeMessageText, computeBindingKey, renderBindingDisplay, type ApprovalBinding } from './approval-binding'
-import { FIRST_LINE_STATUS, formatFirstLine, HUB_SESSION_NAME } from './first-line'
+import { MAX_APPROVAL_TEXT_LENGTH, TRUNCATION_MARK } from './approval-config'
+import { FIRST_LINE_STATUS, formatFirstLine } from './first-line'
 import {
   ACTIONS_BY_KIND,
   ALL_ACTIONS,
@@ -34,15 +35,14 @@ const CALLBACK_RE = new RegExp(`^${APPROVAL_CALLBACK_PREFIX}(${ALL_ACTIONS.join(
 
 /** Telegram caps a message at 4096 UTF-16 code units. */
 export const TELEGRAM_MESSAGE_LIMIT = 4096
-/** Display text cap; the remainder is kept free for the outcome line and comment. */
-export const MAX_APPROVAL_TEXT_LENGTH = 3500
+/** Re-exported from its new home so existing importers keep working. */
+export { MAX_APPROVAL_TEXT_LENGTH }
 /** Requests held at once (settled ones included) before create is refused. */
 export const MAX_APPROVAL_REQUESTS = 200
 /** How often the clock is applied when nobody is querying. */
 export const SWEEP_INTERVAL_MS = 1000
 const MS_PER_SECOND = 1000
 const SECONDS_PER_MINUTE = 60
-const TRUNCATION_MARK = '…'
 
 const BUTTON_LABELS: Readonly<Record<ApprovalAction, string>> = {
   allow: '允許',
@@ -327,8 +327,10 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     await sweep()
     const target: SentMessage = { chatId: message.chat.id, messageId: repliedTo.message_id }
     const request = store.findAwaitingComment(target)
-    const closed = request ? undefined : store.findClosedByPrompt(target)
-    if (!request && !closed) return false
+    // The request still waiting for this comment, else the one whose prompt this
+    // reply arrived too late for.
+    const owner = request ?? store.findClosedByPrompt(target)
+    if (!owner) return false
     // Not ours to swallow: an outsider's reply takes today's route, where
     // server.ts's gate applies the access policy as it always has.
     if (!deps.loadAllowFrom().includes(String(message.from.id))) return false
@@ -336,9 +338,9 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     // Too late: routing it would hand a session the prompt text plus an
     // orphaned comment, which reads like an instruction. Say so instead.
     if (!request) {
-      const notice = formatFirstLine(FIRST_LINE_STATUS.system, closed?.sessionName ?? HUB_SESSION_NAME, COMMENT_TOO_LATE_TEXT)
+      const notice = formatFirstLine(FIRST_LINE_STATUS.system, owner.sessionName, COMMENT_TOO_LATE_TEXT)
       await api.sendText(message.chat.id, notice).catch(err => {
-        log(`telegram poller: approval ${closed?.id} late-comment notice failed: ${err}`)
+        log(`telegram poller: approval ${owner.id} late-comment notice failed: ${err}`)
       })
       return true
     }

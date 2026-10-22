@@ -14,7 +14,9 @@
  * keys but look the same on screen (accepted in Spec v1.2).
  */
 import { createHash } from 'node:crypto'
+import { TRUNCATION_MARK } from './approval-config'
 import { FIRST_LINE_STATUS, formatFirstLine } from './first-line'
+import { INVISIBLE_CHAR_CLASS } from './invisible-chars'
 import { maskSecrets } from './secret-mask'
 
 /** The content a request is bound to, as sent by the caller. */
@@ -34,12 +36,12 @@ const BLOCK_FOOTER = '────────────'
 const LINE_BREAK = '\n'
 /** First-line summary cap: a glance, the block below holds the whole content. */
 export const SUMMARY_MAX_LENGTH = 80
-const TRUNCATION_MARK = '…'
 /**
  * Characters that can hide or reorder what is shown: C0 / C1 controls other
- * than tab and newline, zero-width characters and bidi controls.
+ * than tab and newline, zero-width characters and bidi controls. One list,
+ * shared with the session-name check; see invisible-chars.ts.
  */
-const INVISIBLE_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F​-‏‪-‮⁠-⁤⁦-⁩﻿]/g
+const INVISIBLE_RE = new RegExp(`[${INVISIBLE_CHAR_CLASS}]`, 'g')
 const HEX_RADIX = 16
 const CODE_POINT_DIGITS = 4
 

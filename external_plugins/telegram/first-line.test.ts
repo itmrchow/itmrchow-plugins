@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test'
+import { renderBindingDisplay } from './approval-binding'
 import {
   createPermissionHeadline,
+  describeFirstLineSwitch,
   displaySessionName,
   createSystemTextFormatter,
   FIRST_LINE_STATUS,
@@ -49,6 +51,25 @@ test.each([
   expect(parsed.ok).toBe(false)
 })
 
+test.each([
+  ['soft hyphen', 0xad],
+  ['Arabic letter mark', 0x61c],
+  ['Mongolian vowel separator', 0x180e],
+  ['tag character', 0xe0001],
+  ['tag cancel', 0xe007f],
+])('session_name 含%s時拒收', (_label, codePoint) => {
+  expect(parseSessionName(`a${String.fromCodePoint(codePoint)}b`).ok).toBe(false)
+})
+
+test('綁定區塊會跳脫成 [U+XXXX] 的字元，session name 一律拒收（共用同一份集合）', () => {
+  for (let codePoint = 0; codePoint <= 0xffff; codePoint++) {
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue
+    const char = String.fromCodePoint(codePoint)
+    if (renderBindingDisplay(char) === char) continue
+    expect(parseSessionName(`a${char}b`).ok).toBe(false)
+  }
+})
+
 test('session_name 非字串時拒收', () => {
   expect(parseSessionName(42).ok).toBe(false)
   expect(parseSessionName(['a']).ok).toBe(false)
@@ -90,4 +111,15 @@ test('session name 顯示時半形 : [ ] 換成全形，第一行只剩格式本
 
 test('session name 不含 : [ ] 時原樣顯示', () => {
   expect(displaySessionName('OP-8820')).toBe('OP-8820')
+})
+
+test.each([
+  [{ TELEGRAM_FIRST_LINE_FORMAT: '1' }, 'on'],
+  [{ TELEGRAM_FIRST_LINE_FORMAT: ' TRUE ' }, 'on'],
+  [{}, 'off (unset)'],
+  [{ TELEGRAM_FIRST_LINE_FORMAT: '  ' }, 'off (unset)'],
+  [{ TELEGRAM_FIRST_LINE_FORMAT: 'on' }, 'off (value is not 1 / true)'],
+  [{ TELEGRAM_FIRST_LINE_FORMAT: 'yes' }, 'off (value is not 1 / true)'],
+])('開關狀態描述 %p -> %p，不回顯值本身', (env, expected) => {
+  expect(describeFirstLineSwitch(env)).toBe(expected)
 })

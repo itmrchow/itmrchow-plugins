@@ -34,7 +34,13 @@ import {
 import { restartAgent } from './restart-agent'
 import { consumeStartupNotice } from './startup-notice'
 import { sanitizeMetaText } from './meta-text'
-import { createPermissionHeadline, createSystemTextFormatter, resolveFirstLineFormat } from './first-line'
+import {
+  createPermissionHeadline,
+  createSystemTextFormatter,
+  describeFirstLineSwitch,
+  FIRST_LINE_SWITCH_ENV,
+  resolveFirstLineFormat,
+} from './first-line'
 import { buildReplyMeta } from './reply-meta'
 import { resolvePort } from './resolve-port'
 import { isValidScopeId } from './scope-id'
@@ -96,8 +102,9 @@ const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 // sharing this plugin keep their messages exactly as they were. Replies the
 // session writes through the reply tool are never touched.
 const FIRST_LINE_ENABLED = resolveFirstLineFormat(process.env)
-const systemText = createSystemTextFormatter(FIRST_LINE_ENABLED)
-const permissionHeadline = createPermissionHeadline(FIRST_LINE_ENABLED)
+const formatSystemText = createSystemTextFormatter(FIRST_LINE_ENABLED)
+const formatPermissionHeadline = createPermissionHeadline(FIRST_LINE_ENABLED)
+process.stderr.write(`telegram channel: first-line format ${describeFirstLineSwitch(process.env)} (${FIRST_LINE_SWITCH_ENV})\n`)
 
 if (!TOKEN) {
   process.stderr.write(
@@ -452,7 +459,7 @@ function checkApprovals(): void {
 
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId)
-    void bot.api.sendMessage(senderId, systemText("Paired! Say hi to Claude.")).then(
+    void bot.api.sendMessage(senderId, formatSystemText("Paired! Say hi to Claude.")).then(
       () => rmSync(file, { force: true }),
       err => {
         process.stderr.write(`telegram channel: failed to send approval confirm: ${err}\n`)
@@ -586,7 +593,7 @@ mcp.setNotificationHandler(
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
-    const text = permissionHeadline(tool_name)
+    const text = formatPermissionHeadline(tool_name)
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
@@ -941,12 +948,12 @@ bot.command('start', async ctx => {
     // dead defensive code.
     if (ctx.chat?.type !== 'private') return
     if (!redeemInvite(ctx, token)) return
-    await ctx.reply(systemText(`You're in. Just message me here and Claude will pick it up.`))
+    await ctx.reply(formatSystemText(`You're in. Just message me here and Claude will pick it up.`))
     return
   }
 
   if (!dmCommandGate(ctx)) return
-  await ctx.reply(systemText(
+  await ctx.reply(formatSystemText(
     `This bot bridges Telegram to a Claude Code session.\n\n` +
     `To pair:\n` +
     `1. DM me anything — you'll get a 6-char code\n` +
@@ -957,7 +964,7 @@ bot.command('start', async ctx => {
 
 bot.command('help', async ctx => {
   if (!dmCommandGate(ctx)) return
-  await ctx.reply(systemText(
+  await ctx.reply(formatSystemText(
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
@@ -972,20 +979,20 @@ bot.command('status', async ctx => {
 
   if (access.allowFrom.includes(senderId)) {
     const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(systemText(`Paired as ${name}.`))
+    await ctx.reply(formatSystemText(`Paired as ${name}.`))
     return
   }
 
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId === senderId) {
-      await ctx.reply(systemText(
+      await ctx.reply(formatSystemText(
         `Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`
       ))
       return
     }
   }
 
-  await ctx.reply(systemText(`Not paired. Send me a message to get a pairing code.`))
+  await ctx.reply(formatSystemText(`Not paired. Send me a message to get a pairing code.`))
 })
 
 // --- JP-38 bot-layer control plane (survives agent death) ---------------------
@@ -1019,14 +1026,14 @@ bot.command('ctx', async (ctx, next) => {
   if (!controlGate(ctx)) return
   const { pct, raw } = await getContextPercent()
   if (pct === null) {
-    await ctx.reply(systemText(
+    await ctx.reply(formatSystemText(
       raw
         ? `Context: 無法解析百分比，footer 片段：\n${raw}`
         : `Context: 讀取 pane 失敗（capture 無回應）。`,
     ))
     return
   }
-  await ctx.reply(systemText(`Context: ${pct}% used (≈ ${100 - pct}% left)`))
+  await ctx.reply(formatSystemText(`Context: ${pct}% used (≈ ${100 - pct}% left)`))
 })
 
 bot.command('clear', async (ctx, next) => {
@@ -1037,15 +1044,15 @@ bot.command('clear', async (ctx, next) => {
   const decision = decideClear(busy, clearWarnedAt.get(senderId) ?? null, Date.now())
   if (decision === 'warn') {
     clearWarnedAt.set(senderId, Date.now())
-    await ctx.reply(systemText('agent 忙碌中，/clear 會打斷當前任務並清空 context。確認請在 30 秒內再送一次 /clear。'))
+    await ctx.reply(formatSystemText('agent 忙碌中，/clear 會打斷當前任務並清空 context。確認請在 30 秒內再送一次 /clear。'))
     return
   }
   clearWarnedAt.delete(senderId)
   try {
     await sendClear()
-    await ctx.reply(systemText('已送出 /clear。'))
+    await ctx.reply(formatSystemText('已送出 /clear。'))
   } catch (err) {
-    await ctx.reply(systemText(`/clear 投遞失敗：${err}`))
+    await ctx.reply(formatSystemText(`/clear 投遞失敗：${err}`))
   }
 })
 
@@ -1055,12 +1062,12 @@ bot.command('restart', async (ctx, next) => {
   // Reply BEFORE restarting: this bot process is killed by the restart, so a
   // post-restart confirmation can never be sent. The freshly started agent
   // announces it is back up separately (startup notice).
-  await ctx.reply(systemText('重啟中…'))
+  await ctx.reply(formatSystemText('重啟中…'))
   const result = await restartAgent('manual /restart (telegram)', { bypassThrottle: true })
   if (result.status === 'in-progress') {
-    await ctx.reply(systemText('已有重啟進行中，請稍候。'))
+    await ctx.reply(formatSystemText('已有重啟進行中，請稍候。'))
   } else if (result.status === 'failed') {
-    await ctx.reply(systemText(`重啟失敗：${result.error}`))
+    await ctx.reply(formatSystemText(`重啟失敗：${result.error}`))
   }
   // status 'ok': this process is likely already gone; the back-up notice covers it.
 })
@@ -1082,7 +1089,7 @@ function announceStartup(): void {
   const notice = consumeStartupNotice()
   if (notice === null) return
   for (const chat_id of access.allowFrom) {
-    void bot.api.sendMessage(chat_id, systemText(notice)).catch(err => {
+    void bot.api.sendMessage(chat_id, formatSystemText(notice)).catch(err => {
       process.stderr.write(`telegram channel: startup notice to ${chat_id} failed: ${err}\n`)
     })
   }
@@ -1121,7 +1128,7 @@ bot.on('callback_query:data', async ctx => {
       prettyInput = input_preview
     }
     const expanded =
-      `${permissionHeadline(tool_name)}\n\n` +
+      `${formatPermissionHeadline(tool_name)}\n\n` +
       `tool_name: ${tool_name}\n` +
       `description: ${description}\n` +
       `input_preview:\n${prettyInput}`
@@ -1273,7 +1280,7 @@ async function handleInbound(
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
-    await ctx.reply(systemText(
+    await ctx.reply(formatSystemText(
       `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
     ))
     return

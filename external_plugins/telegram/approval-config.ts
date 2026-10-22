@@ -18,6 +18,14 @@ export const MAX_TIMEOUT_SECONDS = 604_800
 
 const ENABLING_VALUES: ReadonlySet<string> = new Set(['1', 'true'])
 
+// Text limits shared by the approval modules and first-line.ts. Kept here
+// because this module imports nothing, so every one of them can import it
+// without a cycle.
+/** Display text cap; the remainder of a Telegram message is kept free for the outcome line and comment. */
+export const MAX_APPROVAL_TEXT_LENGTH = 3500
+/** Appended wherever shown text was cut short. */
+export const TRUNCATION_MARK = '…'
+
 export type ApprovalConfig = {
   enabled: boolean
   defaultTimeoutSeconds: number
