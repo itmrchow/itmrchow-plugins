@@ -8,6 +8,14 @@ import { join } from 'node:path'
 // in a test (it needs an MCP client), so this pins the source instead: a new
 // ctx.reply that forgets the formatter turns red here. The session's own text
 // goes out through bot.api in the reply / edit_message tools, never ctx.reply.
+//
+// Scope (review r2 N-1): only the literal `ctx.reply(` is guarded. System
+// messages sent any other way — bot.api.sendMessage (the startup notice, the
+// "Paired!" confirmation after an approve), ctx.api.*, `ctx?.reply(` or a
+// context under another name — are NOT checked here and rely on review. A new
+// system message should go through ctx.reply where it can, or be wrapped by
+// hand and called out in its PR. The 80-character window below only needs to
+// reach past the call's opening and any line break before the formatter.
 const SOURCE = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
 const REPLY_CALL = 'ctx.reply('
 const FORMATTED_REPLY_RE = /^ctx\.reply\(\s*formatSystemText\(/
