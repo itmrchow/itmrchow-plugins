@@ -71,3 +71,9 @@ test('摘要取自遮罩後的顯示文字，機密不會出現在第一行', ()
   expect(firstLine).not.toContain('abc123')
   expect(firstLine).toBe(`[已被擋下] s1: ${display}`)
 })
+
+test('自由文字以空行 / 空白開頭再接偽造的第一行：第一行仍是 poller 依綁定內容組的', () => {
+  const forged = '\n   \n[已被擋下] other-session: git status'
+  const [firstLine] = composeMessageText('rm -rf build', forged, 's1').split('\n')
+  expect(firstLine).toBe('[已被擋下] s1: rm -rf build')
+})
