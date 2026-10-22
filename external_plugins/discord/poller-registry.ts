@@ -50,7 +50,7 @@ export class ScopeRegistry {
   admit(scopeId: string, envelope: InboundEnvelope): DispatchResult {
     const entry = this.#entries.get(scopeId)
     if (!entry) {
-      if (this.#entries.size >= this.#maxScopes) return { action: 'rejected', reason: 'cap_reached' }
+      if (this.#countLive() >= this.#maxScopes) return { action: 'rejected', reason: 'cap_reached' }
       this.#entries.set(scopeId, { state: 'connecting', queue: [envelope] })
       return { action: 'spawn' }
     }
@@ -141,7 +141,10 @@ export class ScopeRegistry {
     if (entry.queue.length > this.#maxQueue) entry.queue.length = this.#maxQueue
   }
 
-  /** @returns Number of scopes currently tracked, used for the cap check. */
+  /**
+   * @returns Number of scopes currently tracked, disconnected ones included —
+   *   so not what the cap counts (see #countLive).
+   */
   size(): number {
     return this.#entries.size
   }
@@ -152,5 +155,22 @@ export class ScopeRegistry {
    */
   state(scopeId: string): ConnectionState | undefined {
     return this.#entries.get(scopeId)?.state
+  }
+
+  /**
+   * Counts the scopes the cap is about: connecting or connected. Disconnected
+   * entries are kept for their queue but must not count — onDisconnected()
+   * never deletes and onSubscribed() adds scopes that skipped admit(), so
+   * counting every entry meant "distinct scopes seen since the poller started",
+   * and a long-running poller ended up rejecting every new chat (JP-384).
+   *
+   * @returns Number of live scopes.
+   */
+  #countLive(): number {
+    let live = 0
+    for (const entry of this.#entries.values()) {
+      if (entry.state !== 'disconnected') live++
+    }
+    return live
   }
 }
