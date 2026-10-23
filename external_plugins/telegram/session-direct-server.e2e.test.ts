@@ -205,15 +205,26 @@ async function rpc(world: World, method: string, params: Record<string, unknown>
   return reply.result ?? {}
 }
 
-/** Do the MCP handshake; returns the server's declared capabilities. */
-async function initialize(world: World): Promise<Record<string, unknown>> {
+/**
+ * Do the MCP handshake; returns the server's declared capabilities.
+ *
+ * @param opts.sendInitialized - Send `notifications/initialized` (default
+ *   true). Holding it back keeps the server's ready gate closed, and the
+ *   channel check only runs after that gate — so the check is reliably
+ *   unfinished until the test sends it (see sendInitialized below).
+ */
+async function initialize(world: World, opts: { sendInitialized?: boolean } = {}): Promise<Record<string, unknown>> {
   const result = await rpc(world, 'initialize', {
     protocolVersion: '2025-06-18',
     capabilities: {},
     clientInfo: { name: 'e2e', version: '0' },
   })
-  send(world, { method: 'notifications/initialized' })
+  if (opts.sendInitialized !== false) sendInitialized(world)
   return result.capabilities as Record<string, unknown>
+}
+
+function sendInitialized(world: World): void {
+  send(world, { method: 'notifications/initialized' })
 }
 
 const sessionScopeOf = (sessionId: string): string => `telegram-dm-s${sessionId.replace(/-/g, '')}`
@@ -444,10 +455,14 @@ test('直送模式但判斷不能顯示 channel：reply / react / edit_message /
 
 test('直送模式且判斷尚未完成：工具先回錯誤；判斷通過後才可用', async () => {
   const world = await startWorld()
-  await initialize(world)
+  // Gate held closed: the check cannot run before `initialized` (the gate's own
+  // fallback is 10s away, far beyond one tool call), so this state is not a race.
+  await initialize(world, { sendInitialized: false })
   const early = await reply(world, '太早')
   expect(early.isError).toBe(true)
   expect(JSON.stringify(early)).toContain('session-direct 未啟用（channel check has not finished）')
+  expect(world.subscribed).toEqual([])
+  sendInitialized(world)
   await waitFor(() => world.subscribed.length > 0, 'subscription')
   const later = await reply(world, '可以了')
   expect(JSON.stringify(later)).toContain('sent (id: ')
