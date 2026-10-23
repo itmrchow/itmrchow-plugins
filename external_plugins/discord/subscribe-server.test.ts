@@ -328,3 +328,42 @@ test('authorize 回 true 時照常訂閱', async () => {
   hub.close()
   await closeServer(hub.server)
 })
+
+test('斷線順序：onDisconnect 時佇列已含放回的未 ack 訊息；空的才被 forgetIfIdle 清掉（JP-380）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  const forgotten: string[] = []
+  // The same wiring as the telegram poller's onDisconnect for session scopes.
+  const hub = createSubscribeServer({
+    registry,
+    onDisconnect: scopeId => {
+      if (registry.forgetIfIdle(scopeId)) forgotten.push(scopeId)
+    },
+  })
+  const port = await listen(hub)
+
+  // Idle scope: nothing in flight -> forgotten on disconnect.
+  const idle = collect(port, 'telegram-dm-31', 1)
+  await new Promise(r => setTimeout(r, 100))
+  expect(registry.state('telegram-dm-31')).toBe('connected')
+  idle.stop()
+  await new Promise(r => setTimeout(r, 100))
+  expect(forgotten).toEqual(['telegram-dm-31'])
+  expect(registry.state('telegram-dm-31')).toBeUndefined()
+
+  // Busy scope: delivered but never acked -> requeued BEFORE onDisconnect, so it is kept.
+  const busy = collect(port, 'telegram-dm-32', 1)
+  await new Promise(r => setTimeout(r, 100))
+  hub.deliver('telegram-dm-32', [envelope('unacked', 'telegram-dm-32')])
+  await busy.done
+  busy.stop()
+  await new Promise(r => setTimeout(r, 100))
+  expect(forgotten).toEqual(['telegram-dm-31'])
+  expect(registry.state('telegram-dm-32')).toBe('disconnected')
+
+  // Reconnect gets it back.
+  const again = collect(port, 'telegram-dm-32', 1)
+  expect((await again.done).map(e => e.envelopeId)).toEqual(['unacked'])
+  again.stop()
+  hub.close()
+  await closeServer(hub.server)
+})
