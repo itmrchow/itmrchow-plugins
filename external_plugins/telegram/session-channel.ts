@@ -31,7 +31,7 @@ export const SESSION_DIRECT_POINTER_NAME = 'telegram-session-direct.json'
  * Measured chains: macOS / x86 run `launch.sh` -> `exec bun server.ts`, so the
  * claude process is the direct parent (1 step); arm64-linux runs
  * `exec tsx server.ts`, whose CLI starts node as a child (2 steps). 4 leaves
- * room for one more wrapper. A wider walk cannot misfire — the match is by
+ * room for two more wrapper layers. A wider walk cannot misfire — the match is by
  * session id, never "the nearest claude" — it only costs ps calls.
  */
 export const MAX_ANCESTOR_DEPTH = 4
