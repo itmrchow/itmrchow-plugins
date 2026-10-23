@@ -368,3 +368,19 @@ test('直送進來的訊息：channel 通知帶 session_name（顯示形式）�
   expect(params.meta.reply_to_message_id).toBe('3332')
   expect(world.subscribed).not.toContain(HUB_SCOPE)
 }, TEST_TIMEOUT_MS)
+
+test('直送模式 server 不論訂閱成功與否、poller 在不在，都不自己呼叫 getUpdates', async () => {
+  const subscribedWorld = await startWorld()
+  const unsubscribedWorld = await startWorld({ channels: false })
+  // No poller at all: point the subscription at a port nothing listens on.
+  const pollerlessWorld = await startWorld()
+  pollerlessWorld.hub.close()
+  await Promise.all([initialize(subscribedWorld), initialize(unsubscribedWorld), initialize(pollerlessWorld)])
+  await waitFor(() => subscribedWorld.subscribed.length > 0, 'subscription')
+  await sleep(NO_SUBSCRIBE_WAIT_MS)
+  await reply(subscribedWorld, 'x')
+  for (const world of [subscribedWorld, unsubscribedWorld, pollerlessWorld]) {
+    expect(world.fake.getUpdatesCount()).toBe(0)
+  }
+  expect(stderrOf(pollerlessWorld)).toContain('subscription lost')
+}, TEST_TIMEOUT_MS)
