@@ -4,10 +4,10 @@
  * task session — nothing in-process.
  */
 import { afterEach, expect, test } from 'bun:test'
-import { type ChildProcess, spawn } from 'node:child_process'
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, request } from 'node:http'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Update } from 'grammy/types'
 import { FAKE_BOT_ID, FAKE_BOT_TOKEN, startFakeTelegram, type FakeTelegram } from './fake-telegram'
@@ -429,4 +429,22 @@ test('攔截順序不變：approvals 的按鈕與退回意見引用回覆不會�
   expect((await api('GET', '/approvals/R1')).body).toMatchObject({ status: 'denied', comment: '範圍再縮小' })
   expect(session.got).toEqual([])
   expect(hub.got).toEqual([])
+}, TEST_TIMEOUT_MS)
+
+const FIND_SESSION_BIN = process.env.FIND_SESSION_BIN ?? join(homedir(), '.claude', 'scripts', 'tg-hub', 'find-session')
+
+test.skipIf(!existsSync(FIND_SESSION_BIN))('T95：同 message_id 多筆時，既有 find-session 與 poller 都取最後一筆', async () => {
+  const world = await startWorld({ direct: true })
+  appendFileSync(world.mapFile, mapLine(3800, SESSION_ID) + mapLine(3800, SESSION_2_ID))
+  const s1 = await subscribe(world, SESSION_SCOPE)
+  const s2 = await subscribe(world, SESSION_2_SCOPE)
+  await injectAndSettle(world, dm('取最後一筆', { messageId: 3800, fromId: FAKE_BOT_ID }))
+  expect(s2.got.map(textOf)).toEqual(['取最後一筆'])
+  expect(s1.got).toEqual([])
+  const out = spawnSync(FIND_SESSION_BIN, ['3800'], {
+    env: { PATH: process.env.PATH ?? '', HOME: world.rootDir, TG_NOTIFY_STATE_DIR: world.rootDir, TG_HUB_CLAUDE_BIN: 'false' },
+    encoding: 'utf8',
+  })
+  expect(out.status).toBe(0)
+  expect(JSON.parse(out.stdout)).toMatchObject({ found: true, session_id: SESSION_2_ID })
 }, TEST_TIMEOUT_MS)

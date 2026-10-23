@@ -10,12 +10,19 @@ import { join } from 'node:path'
 // by session-direct-server.e2e.test.ts (no getUpdates reaches the fake Bot API).
 const SOURCE = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
 // Comments mention getUpdates to explain the design; only code matters here.
-const CODE = SOURCE.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+// A line comment is `//` at the start of a line or after whitespace, so the
+// `//` inside a string such as 'https://...' is left alone — dropping the rest
+// of that line would hide whatever code follows the URL.
+const CODE = SOURCE.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/.*$/gm, '$1')
 
 test('server.ts 的程式碼不呼叫 getUpdates，也不啟動 grammy 的 polling（bot.start / run）', () => {
   expect(CODE).not.toMatch(/getUpdates/)
   expect(CODE).not.toMatch(/\bbot\s*\.\s*start\s*\(/)
   expect(CODE).not.toMatch(/@grammyjs\/runner|\brun\s*\(\s*bot\b/)
+})
+
+test('去註解不會吃掉網址字串之後的程式碼', () => {
+  expect(CODE).toContain('https://api.telegram.org/file/bot')
 })
 
 test('server.ts 收訊只走 poller 訂閱：update 由 bot.handleUpdate 餵入', () => {
