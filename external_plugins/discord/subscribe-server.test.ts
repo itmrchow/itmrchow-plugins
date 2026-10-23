@@ -262,3 +262,69 @@ test('deliver 對沒有連線的 scope 回 false，讓呼叫端改走佇列', ()
   expect(hub.deliver('telegram-dm-nobody', [envelope('x')])).toBe(false)
   hub.close()
 })
+
+function subscribeStatus(port: number, scope: string): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const req = request({ host: '127.0.0.1', port, path: `/subscribe?scope=${scope}` }, res => {
+      resolve(res.statusCode ?? 0)
+      req.destroy()
+    })
+    req.on('error', err => {
+      // destroy() after the status arrived surfaces as a socket hang-up; ignore it.
+      if ((err as NodeJS.ErrnoException).code !== 'ECONNRESET') reject(err)
+    })
+    req.end()
+  })
+}
+
+test('authorize 回 false：503、不建 registry 項目（JP-380）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  const asked: string[] = []
+  const hub = createSubscribeServer({
+    registry,
+    authorize: scopeId => {
+      asked.push(scopeId)
+      return false
+    },
+  })
+  const port = await listen(hub)
+
+  expect(await subscribeStatus(port, 'telegram-dm-9')).toBe(503)
+  expect(asked).toEqual(['telegram-dm-9'])
+  expect(registry.state('telegram-dm-9')).toBeUndefined()
+  expect(hub.deliver('telegram-dm-9', [envelope('x', 'telegram-dm-9')])).toBe(false)
+
+  hub.close()
+  await closeServer(hub.server)
+})
+
+test('authorize 拒絕不會踢掉同 scope 已在線的連線（JP-380）', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  let allow = true
+  const hub = createSubscribeServer({ registry, authorize: () => allow })
+  const port = await listen(hub)
+
+  const live = collect(port, 'telegram-dm-7', 1)
+  await new Promise(r => setTimeout(r, 100))
+  allow = false
+  expect(await subscribeStatus(port, 'telegram-dm-7')).toBe(503)
+  expect(registry.state('telegram-dm-7')).toBe('connected')
+  expect(hub.deliver('telegram-dm-7', [envelope('still', 'telegram-dm-7')])).toBe(true)
+  expect((await live.done).map(e => e.envelopeId)).toEqual(['still'])
+
+  live.stop()
+  hub.close()
+  await closeServer(hub.server)
+})
+
+test('authorize 回 true 時照常訂閱', async () => {
+  const registry = new ScopeRegistry({ maxScopes: 5, maxQueue: 10 })
+  registry.admit('telegram-dm-8', envelope('q', 'telegram-dm-8'))
+  const hub = createSubscribeServer({ registry, authorize: () => true })
+  const port = await listen(hub)
+  const sub = collect(port, 'telegram-dm-8', 1)
+  expect((await sub.done).map(e => e.envelopeId)).toEqual(['q'])
+  sub.stop()
+  hub.close()
+  await closeServer(hub.server)
+})

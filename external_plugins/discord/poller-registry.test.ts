@@ -209,3 +209,42 @@ test('斷線 scope 不計入上限後，重連仍照常補送佇列（JP-384 不
   expect(reg.onSubscribed('telegram-dm-a')).toEqual([first, late])
   expect(reg.size()).toBe(4)
 })
+
+test('capExempt：豁免的 scope 不佔 admit 的名額（JP-380）', () => {
+  const exempt = new ScopeRegistry({
+    maxScopes: 1,
+    maxQueue: 2,
+    isCapExempt: scopeId => scopeId.startsWith('telegram-dm-s'),
+  })
+  exempt.onSubscribed('telegram-dm-s1')
+  exempt.onSubscribed('telegram-dm-s2')
+  expect(exempt.admit('telegram-dm-1', env('telegram-dm-1'))).toEqual({ action: 'spawn' })
+  expect(exempt.admit('telegram-dm-2', env('telegram-dm-2'))).toEqual({
+    action: 'rejected',
+    reason: 'cap_reached',
+  })
+})
+
+test('liveCount：含豁免 scope、不含斷線的（JP-380）', () => {
+  const exempt = new ScopeRegistry({
+    maxScopes: 5,
+    maxQueue: 2,
+    isCapExempt: scopeId => scopeId.startsWith('telegram-dm-s'),
+  })
+  exempt.onSubscribed('telegram-dm-s1')
+  exempt.onSubscribed('telegram-dm-s2')
+  exempt.onDisconnected('telegram-dm-s2')
+  exempt.admit('telegram-dm-1', env('telegram-dm-1'))
+  expect(exempt.liveCount()).toBe(2)
+})
+
+test('未給 isCapExempt 時行為與原本相同：直接訂閱上來的也計入名額', () => {
+  reg.onSubscribed('telegram-dm-s1')
+  reg.onSubscribed('telegram-dm-s2')
+  reg.onSubscribed('telegram-dm-s3')
+  expect(reg.liveCount()).toBe(3)
+  expect(reg.admit('telegram-dm-d', env('telegram-dm-d'))).toEqual({
+    action: 'rejected',
+    reason: 'cap_reached',
+  })
+})
