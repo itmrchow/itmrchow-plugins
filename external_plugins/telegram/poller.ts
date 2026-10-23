@@ -36,6 +36,14 @@ import {
 import { interceptReauth, runReauthBin, shouldDropEditedReauth } from './reauth-command'
 import { API_ROOT_ENV, resolveApiRoot } from './api-root'
 import { resolveApprovalConfig } from './approval-config'
+import {
+  authorizeSessionSubscription,
+  isSessionScopeId,
+  resolvePollerSessionDirect,
+  resolveReplyDirectScope,
+  SESSION_DIRECT_SWITCH_ENV,
+} from './session-direct'
+import { createMessageMapLookup } from './message-map'
 import { ApprovalStore } from './approval-store'
 import { createApprovalService, type ApprovalService } from './approval-service'
 import { createApprovalHandler, mountApprovalRoutes } from './approval-http'
@@ -135,6 +143,15 @@ const REAUTH_BIN = process.env.REAUTH_BIN
 // is intercepted and no state file is written.
 const APPROVAL_CONFIG = resolveApprovalConfig(process.env)
 
+// Session-direct routing (JP-380): a DM reply to a message some session sent
+// goes straight to that session while it is online. Off unless explicitly
+// enabled with a map file; off also refuses every session-direct subscription,
+// so a session configured on its own cannot take scope slots.
+const SESSION_DIRECT = resolvePollerSessionDirect(process.env)
+process.stderr.write(
+  `telegram poller: session-direct ${SESSION_DIRECT.enabled ? `on (map ${SESSION_DIRECT.mapFile})` : `off (${SESSION_DIRECT.reason})`} (${SESSION_DIRECT_SWITCH_ENV})\n`,
+)
+
 // Test hook: point the Bot API client at a local fake. Loopback hosts only, so
 // the bot token cannot leave this machine through it; see resolveApiRoot.
 const API_ROOT_RESOLUTION = resolveApiRoot(process.env[API_ROOT_ENV])
@@ -145,8 +162,8 @@ if (API_ROOT_RESOLUTION.kind === 'ignored') {
 }
 const API_ROOT = API_ROOT_RESOLUTION.kind === 'override' ? API_ROOT_RESOLUTION.apiRoot : undefined
 if (API_ROOT) {
-  // Loud on purpose: only this process is redirected — server.ts keeps talking
-  // to Telegram.
+  // Loud on purpose: only this process is redirected — server.ts reads the
+  // same variable from its own environment / state .env.
   process.stderr.write(
     `telegram poller: WARNING TELEGRAM_API_ROOT is set, Bot API calls go to ${API_ROOT} instead of Telegram (test hook)\n`,
   )
@@ -179,9 +196,25 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
 const bot = API_ROOT ? new Bot(TOKEN, { client: { apiRoot: API_ROOT } }) : new Bot(TOKEN)
-const registry = new ScopeRegistry({ maxScopes: MAX_SCOPES, maxQueue: MAX_QUEUE_PER_SCOPE })
+// Session scopes are cap-exempt in admit(): the poller never spawns them, so
+// they must not be able to lock the hub (or any spawnable scope) out of a slot.
+// Their own cap is applied at subscribe time by authorize below.
+const registry = new ScopeRegistry({
+  maxScopes: MAX_SCOPES,
+  maxQueue: MAX_QUEUE_PER_SCOPE,
+  isCapExempt: isSessionScopeId,
+})
 const hub = createSubscribeServer({
   registry,
+  authorize: scopeId => {
+    const admitted = authorizeSessionSubscription(scopeId, {
+      enabled: SESSION_DIRECT.enabled,
+      registry,
+      maxScopes: MAX_SCOPES,
+    })
+    if (!admitted) process.stderr.write(`telegram poller: session-direct subscription refused for ${scopeId}\n`)
+    return admitted
+  },
   onSubscribe: scopeId => process.stderr.write(`telegram poller: ${scopeId} subscribed\n`),
   onDisconnect: scopeId => process.stderr.write(`telegram poller: ${scopeId} disconnected\n`),
 })
@@ -273,6 +306,19 @@ function createApprovals(): ApprovalService {
   })
 }
 
+/**
+ * Build the session-direct resolver. The map lookup keeps its parse cache in
+ * this closure, so it is built once per poller rather than per update.
+ *
+ * @param mapFile - Absolute path of the message map.
+ * @param botId - This bot's user id, to recognise replies to its own messages.
+ * @returns The resolver for RouteContext.resolveDirectScope.
+ */
+function createDirectScopeResolver(mapFile: string, botId: number): (update: Update) => string | undefined {
+  const lookup = createMessageMapLookup({ filePath: mapFile })
+  return update => resolveReplyDirectScope(update, { botId, allowFrom: loadAllowFrom, lookup })
+}
+
 const approvals: ApprovalService | undefined = APPROVAL_CONFIG.enabled ? createApprovals() : undefined
 if (approvals) {
   mountApprovalRoutes(
@@ -312,6 +358,7 @@ async function main(): Promise<void> {
       })
     },
     botInfo: me,
+    ...(SESSION_DIRECT.enabled ? { resolveDirectScope: createDirectScopeResolver(SESSION_DIRECT.mapFile, me.id) } : {}),
   }
 
   // Built once, outside the loop: it owns the per-update failure counter, which
