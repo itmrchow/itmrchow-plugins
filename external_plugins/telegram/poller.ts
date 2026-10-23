@@ -216,7 +216,12 @@ const hub = createSubscribeServer({
     return admitted
   },
   onSubscribe: scopeId => process.stderr.write(`telegram poller: ${scopeId} subscribed\n`),
-  onDisconnect: scopeId => process.stderr.write(`telegram poller: ${scopeId} disconnected\n`),
+  onDisconnect: scopeId => {
+    process.stderr.write(`telegram poller: ${scopeId} disconnected\n`)
+    // A session scope is never admitted or spawned, so an empty entry left
+    // behind would only grow the registry with every session ever seen.
+    if (isSessionScopeId(scopeId)) registry.forgetIfIdle(scopeId)
+  },
 })
 
 /**

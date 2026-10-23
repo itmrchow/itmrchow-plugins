@@ -56,6 +56,8 @@ export function buildSessionScopeId(sessionId: string): string | undefined {
 }
 
 /**
+ * Tell a session-direct scope apart from every other scope.
+ *
  * @param scopeId - Candidate scope-id.
  * @returns true when it is a session-direct scope.
  */
@@ -115,7 +117,7 @@ export function authorizeSessionSubscription(
   if (!isSessionScopeId(scopeId)) return true
   if (!opts.enabled) return false
   if (opts.registry.state(scopeId) === 'connected') return true
-  return opts.registry.liveCount() < opts.maxScopes
+  return opts.registry.countLiveScopes() < opts.maxScopes
 }
 
 /**

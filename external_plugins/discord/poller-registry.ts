@@ -163,11 +163,29 @@ export class ScopeRegistry {
   }
 
   /**
-   * @returns Number of live scopes (connecting or connected), cap-exempt ones
-   *   included — for callers enforcing a cap of their own on exempt scopes.
+   * Count every live scope (connecting or connected), cap-exempt ones
+   * included — for callers enforcing a cap of their own on exempt scopes.
+   *
+   * @returns Number of live scopes.
    */
-  liveCount(): number {
+  countLiveScopes(): number {
     return this.#countLive(false)
+  }
+
+  /**
+   * Drop a disconnected scope that holds nothing, so scopes that only ever
+   * subscribe on their own (and are never admitted or spawned) do not pile up
+   * for the life of the process. A scope still holding un-acked messages is
+   * kept, so a reconnect still gets them.
+   *
+   * @param scopeId - The scope that disconnected.
+   * @returns true when the entry was removed.
+   */
+  forgetIfIdle(scopeId: string): boolean {
+    const entry = this.#entries.get(scopeId)
+    if (!entry || entry.state !== 'disconnected' || entry.queue.length > 0) return false
+    this.#entries.delete(scopeId)
+    return true
   }
 
   /**
