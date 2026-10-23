@@ -132,6 +132,54 @@ plugin 自己寫的部分：
 | --- | --- | --- |
 | `TELEGRAM_FIRST_LINE_FORMAT` | 未設（關閉） | `poller.ts` 與 `server.ts` 都讀。`1` 或 `true`（去空白、不分大小寫）時，上表標此開關的訊息加第一行；其他值一律維持原文，共用本 plugin 的其他 bot 不受影響。兩個程序都要設。兩者啟動時都會在 stderr 印出讀到的狀態：`telegram poller: first-line format on|off (unset)|off (value is not 1 / true) (TELEGRAM_FIRST_LINE_FORMAT)`（server.ts 開頭為 `telegram channel:`）。 |
 
+## 回覆直送 session（session 直送模式）
+
+兩端預設都關。打開後，user 在私訊中**引用回覆**某個 Claude session 發出的訊息時，那則回覆直接送到該
+session，不經中控（對話 scope `telegram-dm-<user id>`）；session 收到的是一般的
+`<channel source="telegram">` 訊息。其他情況一律照原本的路由。
+
+**怎麼判斷要不要直送。** 在既有攔截（`/reauth` `/authcode`，接著核准按鈕與退回意見的引用回覆）之後，
+下面全部成立才直送，否則照原本路由：
+
+- 私訊中的新訊息（不是編輯、不是按按鈕），發話者在 `access.json` 的 `allowFrom`，且不是 `/` 開頭（指令仍給中控）；
+- 引用回覆的是本 bot 發的訊息，且該則的 `message_id` 在訊息對照表裡有 `session_id`。對照若另記了
+  `chat_id`，必須是同一個 chat（Telegram 的訊息編號是每個 chat 各自編）；
+- 該 session 的 scope 此刻在線，且寫入成功。
+
+poller 不會為此啟動任何 session：session 不在線就交給中控，喚醒 session 仍是中控的事。
+
+**哪些 session 會訂閱。** 啟動環境裡既沒有 `AGENT_SCOPE`、也沒有 `TELEGRAM_STATE_DIR` 的 server
+（`claude --bg` 與 `claude respawn` 啟動的一律如此）會讀下表的指標檔。指標開啟時，server 改用指標的
+state 目錄（bot token、`access.json`、其 `.env` 裡的 poller port），以
+`telegram-dm-s<session id 的 32 位 hex>` 訂閱；但只在確定本 session 能顯示 channel 訊息時才訂閱：
+它自己的 claude 程序帶 `--channels plugin:telegram@<marketplace>` 啟動（讀該程序的 argv；背景 session
+讀 Claude Code 的 job 記錄）。判斷不了就不訂閱（沒帶 `--channels` 的 session 會 ack 後靜默丟掉訊息）。
+中控與各 carrier scope 都帶 `AGENT_SCOPE`，完全不讀指標，行為不變。
+
+此模式下 server 不宣告權限 relay（`claude/channel/permission`），不發配對確認與重啟完成通知（由中控的
+server 負責），並附加 instructions 要求 session 回覆的第一行用 `[回報] <session_name>: `（需要 user
+回答時用 `[等你回覆] ...`）；每則收到的訊息都帶 `session_name`，每次現讀 session 記錄。
+
+session 經 `reply` 送出的每則訊息（分段的每一段、每個附件；`edit_message` 不算）都以 tg-send 相同的行格式
+`{message_id, session_id, session_name, sent_at}` 追加進訊息對照表，user 回覆它時就能送回同一個 session。
+寫入失敗只記 log，不讓 reply 失敗。中控自己的回覆不記錄，回覆它們仍進中控。同一個 `message_id` 有多筆時以
+最後一筆有效行為準。
+
+| 設定 | 誰讀 | 意思 |
+| --- | --- | --- |
+| `TELEGRAM_SESSION_DIRECT` | `poller.ts`（環境或 `$TELEGRAM_STATE_DIR/.env`） | `1` / `true` 開啟路由。關閉時也拒絕所有 `telegram-dm-s…` 訂閱（HTTP 503），單邊設定的 session 不佔名額。啟動時印 `telegram poller: session-direct on (map <path>)\|off (<reason>)`。 |
+| `TELEGRAM_MESSAGE_MAP_FILE` | `poller.ts`，以及直送模式的 `server.ts`（讀指標 `<stateDir>/.env`） | 訊息對照表的絕對路徑（JSON Lines `{message_id, session_id, ...}`，`chat_id` 選填）。開關開啟時必填，無預設。請放在 state 目錄的 `.env`，兩個程序才讀到同一個值：背景 session 看不到 poller 的啟動環境。poller 增量讀取（只讀上次之後新增的位元組）；壞行略過，含 JSON 合法但缺 `message_id` / `session_id` 的行。 |
+| `~/.claude/channels/telegram-session-direct.json` | `server.ts` | `{"enabled": true, "stateDir": "<絕對路徑>"}`。用檔案而不是環境變數，因為背景與 respawn 的 session 拿不到啟動環境。不存在、格式錯、或 `enabled` 不是 `true` = 關閉。 |
+
+**名額。** poller 決定要不要啟動 session 時，session scope 不計入 `MAX_SCOPES`，所以永遠擠不掉中控。
+新的 session scope 只在總在線數小於 `MAX_SCOPES` 時可訂閱；超過時 poller 回 503，session 依退避重試，
+期間對它的回覆送到中控。
+
+限制：指標與「能否顯示 channel」的判斷讀 Claude Code 自己的檔案（`~/.claude/sessions/<pid>.json`、
+`~/.claude/jobs/*/state.json`），不是公開介面；格式一變，session 就不再訂閱、回覆改送中控。訊息對照表
+信任任何本機程序寫入的內容，與本 plugin 其他部分的邊界相同。手動開、沒帶 `--channels` 的 session
+照舊走中控；要啟用就加上 `--channels plugin:telegram@<marketplace>`。
+
 ## 核准請求（inline 按鈕，loopback 介面）
 
 預設關閉。poller 的 `TELEGRAM_APPROVAL_BUTTONS` 設為 `1` 或 `true` 時，本機程序可以請
@@ -148,7 +196,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | 建立時沒帶 `timeout_seconds` 時，等按鈕的時間。 |
 | `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | 建立時沒帶 `comment_timeout_seconds` 時，按「退回」後等意見的時間。 |
 | `TELEGRAM_POLLER_PORT` | `7852` | 既有變數；介面掛在 poller 的埠上。 |
-| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址，用來把 poller 指向本機的假伺服器。**只接受本機位址**（`127.0.0.1`、`localhost`、`[::1]`；`http` 或 `https`；URL 內不得帶帳密；尾端的 `/` 會自動去掉），所以 bot token 不可能經這個變數被送到機器以外。被採用時啟動會在 stderr 印 `WARNING TELEGRAM_API_ROOT is set`。其他值（別的主機、無法解析的 URL）一律忽略：poller 印 `TELEGRAM_API_ROOT ignored (<原因>)`（不印出該值本身），照舊連 Telegram 官方伺服器。與 `TELEGRAM_APPROVAL_BUTTONS` 開關無關。 |
+| `TELEGRAM_API_ROOT` | 未設 | 測試用：Bot API 位址，用來把 poller 指向本機的假伺服器。**只接受本機位址**（`127.0.0.1`、`localhost`、`[::1]`；`http` 或 `https`；URL 內不得帶帳密；尾端的 `/` 會自動去掉），所以 bot token 不可能經這個變數被送到機器以外。被採用時啟動會在 stderr 印 `WARNING TELEGRAM_API_ROOT is set`。其他值（別的主機、無法解析的 URL）一律忽略：poller 印 `TELEGRAM_API_ROOT ignored (<原因>)`（不印出該值本身），照舊連 Telegram 官方伺服器。與 `TELEGRAM_APPROVAL_BUTTONS` 開關無關。`server.ts` 也認同一個變數、規則相同（讀環境或 state `.env`），讓它的測試不必連 Telegram。 |
 
 兩個逾時都接受小數，須大於 0 且不超過 604800（7 天）；不合法時在 stderr 警告並退回預設值。
 
