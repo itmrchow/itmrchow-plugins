@@ -153,3 +153,50 @@ test('寫入：空清單不動檔案；目錄不存在時丟例外交給呼叫�
   expect(() => readFileSync(join(dir, 'never.jsonl'))).toThrow()
   expect(() => appendMessageMapEntries(join(dir, 'no', 'such', 'map.jsonl'), [{ messageId: 1, sessionId: SID_A, sessionName: '' }])).toThrow()
 })
+
+test('寫入：給了 chatId 就寫 chat_id，查回時帶 chatId', () => {
+  appendMessageMapEntries(file, [{ messageId: 60, sessionId: SID_A, sessionName: 'n', chatId: '555' }], 1_000)
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+    message_id: 60,
+    session_id: SID_A,
+    session_name: 'n',
+    sent_at: 1,
+    chat_id: '555',
+  })
+  expect(createMessageMapLookup({ filePath: file })(60)).toEqual({ sessionId: SID_A, chatId: '555' })
+})
+
+test('T91 並行寫入：多個 server 寫入者 + tg-send 式 shell append 同時寫，每一筆都完整可查回', async () => {
+  const WRITERS = 3
+  const LINES_PER_WRITER = 200
+  const writerScript = join(dir, 'writer.ts')
+  writeFileSync(
+    writerScript,
+    `import { appendMessageMapEntries } from ${JSON.stringify(join(import.meta.dir, 'message-map.ts'))}\n` +
+      `const [file, base, count] = process.argv.slice(2)\n` +
+      `for (let i = 0; i < Number(count); i++) appendMessageMapEntries(file, [{ messageId: Number(base) + i, sessionId: ${JSON.stringify(SID_A)}, sessionName: '並行 寫入者', chatId: '555' }])\n`,
+  )
+  // tg-send appends one jq-built line per message with `>>`; this mimics it.
+  const shellBase = WRITERS * 10_000
+  const shellLoop =
+    `i=0; while [ $i -lt ${LINES_PER_WRITER} ]; do ` +
+    `printf '{"message_id":%d,"session_id":"${SID_B}","session_name":"tg-send 名稱","sent_at":1}\\n' $((${shellBase} + i)) >> "$1"; ` +
+    `i=$((i + 1)); done`
+  const children = [
+    ...Array.from({ length: WRITERS }, (_, w) =>
+      Bun.spawn([process.execPath, writerScript, file, String(w * 10_000), String(LINES_PER_WRITER)], { stderr: 'pipe' }),
+    ),
+    Bun.spawn(['sh', '-c', shellLoop, 'sh', file], { stderr: 'pipe' }),
+  ]
+  const codes = await Promise.all(children.map(child => child.exited))
+  expect(codes).toEqual(Array.from({ length: WRITERS + 1 }, () => 0))
+
+  const lines = readFileSync(file, 'utf8').trimEnd().split('\n')
+  expect(lines.length).toBe((WRITERS + 1) * LINES_PER_WRITER)
+  for (const raw of lines) expect(() => JSON.parse(raw)).not.toThrow()
+  const lookup = createMessageMapLookup({ filePath: file })
+  for (let w = 0; w < WRITERS; w++) {
+    for (let i = 0; i < LINES_PER_WRITER; i++) expect(lookup(w * 10_000 + i)).toEqual({ sessionId: SID_A, chatId: '555' })
+  }
+  for (let i = 0; i < LINES_PER_WRITER; i++) expect(lookup(shellBase + i)).toEqual({ sessionId: SID_B })
+}, 30_000)

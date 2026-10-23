@@ -9,7 +9,10 @@
  * The file is append-only and never rotated, so a full re-read per lookup
  * would grow without bound; instead the reader keeps what it parsed and on each
  * lookup reads only the bytes appended since — a full reload happens only when
- * the file shrank or was replaced. When a message_id appears more than once,
+ * the file shrank or was replaced. Truncating the file in place and letting it
+ * grow back past the read offset (copytruncate-style rotation) is NOT detected:
+ * clear or rotate it by replacing the file (a new inode) instead. When a
+ * message_id appears more than once,
  * the last valid line wins, the same as the carrier's find-session.
  *
  * Any read failure reads as "not found", which sends the reply to the hub as before.
@@ -30,55 +33,6 @@ export type MessageMapFs = {
 }
 
 const NEWLINE = 0x0a
-
-const nodeFs: MessageMapFs = {
-  stat: path => {
-    try {
-      const st = statSync(path)
-      return { size: st.size, ino: st.ino }
-    } catch {
-      return undefined
-    }
-  },
-  readRange: (path, start, end) => {
-    const fd = openSync(path, 'r')
-    try {
-      const buffer = Buffer.alloc(end - start)
-      let filled = 0
-      while (filled < buffer.length) {
-        const read = readSync(fd, buffer, filled, buffer.length - filled, start + filled)
-        if (read === 0) break
-        filled += read
-      }
-      return buffer.subarray(0, filled)
-    } finally {
-      closeSync(fd)
-    }
-  },
-}
-
-/**
- * Parse one map line. Malformed lines are skipped, not fatal: one bad write
- * must not hide every entry after it.
- *
- * @param line - One line, without its newline.
- * @returns The message id and entry, or undefined.
- */
-function parseLine(line: string): [number, MessageMapEntry] | undefined {
-  if (line.trim() === '') return undefined
-  let raw: { message_id?: unknown; session_id?: unknown; chat_id?: unknown }
-  try {
-    raw = JSON.parse(line) as typeof raw
-  } catch {
-    return undefined
-  }
-  if (typeof raw !== 'object' || raw === null) return undefined
-  if (typeof raw.message_id !== 'number' || !Number.isInteger(raw.message_id)) return undefined
-  if (typeof raw.session_id !== 'string' || raw.session_id === '') return undefined
-  const entry: MessageMapEntry = { sessionId: raw.session_id }
-  if (typeof raw.chat_id === 'number' || typeof raw.chat_id === 'string') entry.chatId = String(raw.chat_id)
-  return [raw.message_id, entry]
-}
 
 /**
  * Build a cached lookup over one map file.
@@ -129,8 +83,12 @@ export function createMessageMapLookup(opts: { filePath: string; fs?: MessageMap
   }
 }
 
-/** One message a session sent, as appendMessageMapEntries records it. */
-export type SentMessage = { messageId: number; sessionId: string; sessionName: string }
+/**
+ * One message a session sent, as appendMessageMapEntries records it. chatId is
+ * optional in the format (tg-send lines may lack it) and lets the poller
+ * reject a same-numbered message from another chat.
+ */
+export type SentMessage = { messageId: number; sessionId: string; sessionName: string; chatId?: string }
 
 /**
  * Record messages a session just sent, in the same line format as tg-send, so
@@ -158,7 +116,57 @@ export function appendMessageMapEntries(
       session_id: message.sessionId,
       session_name: message.sessionName,
       sent_at: sentAt,
+      ...(message.chatId === undefined ? {} : { chat_id: message.chatId }),
     }),
   )
   appendFileSync(filePath, `${lines.join('\n')}\n`)
+}
+
+const nodeFs: MessageMapFs = {
+  stat: path => {
+    try {
+      const st = statSync(path)
+      return { size: st.size, ino: st.ino }
+    } catch {
+      return undefined
+    }
+  },
+  readRange: (path, start, end) => {
+    const fd = openSync(path, 'r')
+    try {
+      const buffer = Buffer.alloc(end - start)
+      let filled = 0
+      while (filled < buffer.length) {
+        const read = readSync(fd, buffer, filled, buffer.length - filled, start + filled)
+        if (read === 0) break
+        filled += read
+      }
+      return buffer.subarray(0, filled)
+    } finally {
+      closeSync(fd)
+    }
+  },
+}
+
+/**
+ * Parse one map line. Malformed lines are skipped, not fatal: one bad write
+ * must not hide every entry after it.
+ *
+ * @param line - One line, without its newline.
+ * @returns The message id and entry, or undefined.
+ */
+function parseLine(line: string): [number, MessageMapEntry] | undefined {
+  if (line.trim() === '') return undefined
+  let raw: { message_id?: unknown; session_id?: unknown; chat_id?: unknown }
+  try {
+    raw = JSON.parse(line) as typeof raw
+  } catch {
+    return undefined
+  }
+  if (typeof raw !== 'object' || raw === null) return undefined
+  if (typeof raw.message_id !== 'number' || !Number.isInteger(raw.message_id)) return undefined
+  if (typeof raw.session_id !== 'string' || raw.session_id === '') return undefined
+  const entry: MessageMapEntry = { sessionId: raw.session_id }
+  if (typeof raw.chat_id === 'number' || typeof raw.chat_id === 'string') entry.chatId = String(raw.chat_id)
+  return [raw.message_id, entry]
 }

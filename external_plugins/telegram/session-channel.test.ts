@@ -3,12 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  channelSpecFromPluginRoot,
+  resolveChannelSpec,
   createSystemProbeIo,
   hasChannelFlag,
   probeSessionChannel,
   resolveSessionDirectPointer,
-  sessionDisplayName,
+  resolveSessionDisplayName,
   type JobRecord,
   type SessionProbeIo,
   type SessionRecord,
@@ -63,10 +63,10 @@ test('指標檔：合法 -> 開並給 stateDir', () => {
 })
 
 test('plugin 安裝路徑 -> --channels 項目', () => {
-  expect(channelSpecFromPluginRoot('/Users/u/.claude/plugins/cache/itmrchow-plugins/telegram/0.12.0')).toBe(SPEC)
-  expect(channelSpecFromPluginRoot('/Users/u/.claude/plugins/cache/itmrchow-plugins/telegram/0.12.0/')).toBe(SPEC)
-  expect(channelSpecFromPluginRoot(undefined)).toBeUndefined()
-  expect(channelSpecFromPluginRoot('/repo/external_plugins/telegram')).toBeUndefined()
+  expect(resolveChannelSpec('/Users/u/.claude/plugins/cache/itmrchow-plugins/telegram/0.12.0')).toBe(SPEC)
+  expect(resolveChannelSpec('/Users/u/.claude/plugins/cache/itmrchow-plugins/telegram/0.12.0/')).toBe(SPEC)
+  expect(resolveChannelSpec(undefined)).toBeUndefined()
+  expect(resolveChannelSpec('/repo/external_plugins/telegram')).toBeUndefined()
 })
 
 test('--channels 旗標的各種寫法', () => {
@@ -117,7 +117,7 @@ test('不會誤認外層 session：外層 claude 帶 --channels、自己這層�
   expect(probeSessionChannel({ sessionId: SID, startPid: 300, channelSpec: SPEC, io: ioOf(tree) }).ok).toBe(false)
 })
 
-test('背景 session：argv 看不到旗標時查 job 記錄的 respawnFlags', () => {
+test('背景 session（bg-spare 程序）：argv 看不到旗標時查 job 記錄的 respawnFlags', () => {
   const tree: Tree = { 400: { parent: 1, args: ['claude', 'bg-spare', '--bg-spare', '/tmp/s'], record: { sessionId: SID } } }
   const withChannel: JobRecord[] = [
     { sessionId: 'other', respawnFlags: ['--channels', SPEC] },
@@ -129,6 +129,24 @@ test('背景 session：argv 看不到旗標時查 job 記錄的 respawnFlags', (
   const without: JobRecord[] = [{ sessionId: SID, respawnFlags: ['--name', 'x'] }]
   expect(probeSessionChannel({ sessionId: SID, startPid: 400, channelSpec: SPEC, io: ioOf(tree, without) }).ok).toBe(false)
   expect(probeSessionChannel({ sessionId: SID, startPid: 400, channelSpec: SPEC, io: ioOf(tree) }).ok).toBe(false)
+})
+
+test('前景程序沒帶旗標：不看 job 記錄（舊 bg 記錄 + 同 session id 前景 resume 不可誤判）', () => {
+  const tree: Tree = { 500: { parent: 1, args: ['claude', '--resume', SID], record: { sessionId: SID } } }
+  const stale: JobRecord[] = [{ sessionId: SID, resumeSessionId: SID, respawnFlags: ['--channels', SPEC] }]
+  expect(probeSessionChannel({ sessionId: SID, startPid: 500, channelSpec: SPEC, io: ioOf(tree, stale) })).toEqual({
+    ok: false,
+    reason: `session not started with --channels ${SPEC}`,
+  })
+})
+
+test('argv 讀不到：不可顯示，也不看 job 記錄', () => {
+  const tree: Tree = { 600: { parent: 1, record: { sessionId: SID } } }
+  const jobs: JobRecord[] = [{ sessionId: SID, respawnFlags: ['--channels', SPEC] }]
+  expect(probeSessionChannel({ sessionId: SID, startPid: 600, channelSpec: SPEC, io: ioOf(tree, jobs) })).toEqual({
+    ok: false,
+    reason: 'claude process argv unreadable',
+  })
 })
 
 test('判斷不了一律不可顯示：無 session id / 無 spec / 找不到自己的 claude 程序 / 超過層數', () => {
@@ -147,9 +165,9 @@ test('判斷不了一律不可顯示：無 session id / 無 spec / 找不到自�
 })
 
 test('session 名：有名字用名字，沒有用 session-<id 前 8 碼>', () => {
-  expect(sessionDisplayName({ sessionId: SID, name: ' JP-380 直送 ' }, SID)).toBe('JP-380 直送')
-  expect(sessionDisplayName({ sessionId: SID, name: '  ' }, SID)).toBe('session-1cf90a25')
-  expect(sessionDisplayName(undefined, SID)).toBe('session-1cf90a25')
+  expect(resolveSessionDisplayName({ sessionId: SID, name: ' JP-380 直送 ' }, SID)).toBe('JP-380 直送')
+  expect(resolveSessionDisplayName({ sessionId: SID, name: '  ' }, SID)).toBe('session-1cf90a25')
+  expect(resolveSessionDisplayName(undefined, SID)).toBe('session-1cf90a25')
 })
 
 let configDir: string

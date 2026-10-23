@@ -3,16 +3,17 @@
  * server.ts process, driven over MCP stdio like Claude Code drives it, against
  * an in-test subscription hub and a fake Telegram Bot API.
  *
- * The server finds "its own claude process" by walking up from its parent —
- * here that parent is this test runner — and matching the session record.
- * So each world writes a session record for process.pid into a throwaway
- * CLAUDE_CONFIG_DIR, and a job record saying whether the session was started
- * with --channels (this runner's own argv never is).
+ * The server finds "its own claude process" by walking up from its parent and
+ * matching the session record. So each world starts server.ts under a `sh`
+ * stand-in whose argv carries the launch flags under test (`claude --channels
+ * …`, a `claude bg-spare --bg-spare …` spare, or no flags), writes a session
+ * record for that stand-in's pid into a throwaway CLAUDE_CONFIG_DIR, and a job
+ * record whose respawn flags may or may not list --channels.
  */
 import { afterEach, expect, test } from 'bun:test'
-import { type ChildProcess, spawn } from 'node:child_process'
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { FAKE_BOT_TOKEN, startFakeTelegram, type FakeTelegram } from './fake-telegram'
@@ -31,6 +32,12 @@ const POLL_INTERVAL_MS = 25
 const NO_SUBSCRIBE_WAIT_MS = 4500
 const TEST_TIMEOUT_MS = 30_000
 const FIRST_FAKE_MESSAGE_ID = 1000
+/** argv of the sh stand-in for the session's claude process ($0 first). */
+const LAUNCH_ARGV = {
+  channels: ['claude', '--name', 'x', '--channels', CHANNEL_SPEC],
+  'bg-spare': ['claude', 'bg-spare', '--bg-spare', '/tmp/spare.claim.sock'],
+  plain: ['claude', '--resume', 'x'],
+} as const
 
 type JsonRpc = { id?: number; method?: string; result?: Record<string, unknown>; params?: Record<string, unknown> }
 
@@ -56,6 +63,9 @@ const worlds: World[] = []
 afterEach(async () => {
   for (const world of worlds.splice(0)) {
     const server = world.server
+    // EOF on stdin is what shuts server.ts down; killing the sh stand-in alone
+    // would leave it to the orphan watchdog.
+    server?.stdin?.end()
     if (server && server.exitCode === null && server.signalCode === null) {
       const exited = new Promise<void>(r => server.once('exit', () => r()))
       server.kill('SIGKILL')
@@ -82,8 +92,12 @@ async function waitFor<T>(probe: () => T | undefined | false, what: string): Pro
 type WorldOpts = {
   /** Write the pointer file (switch on). Default true. */
   pointer?: boolean
+  /** Flags on the stand-in claude process's argv. Default 'channels'. */
+  launch?: 'channels' | 'bg-spare' | 'plain'
   /** Job record lists --channels for this session. Default true. */
-  channels?: boolean
+  jobChannels?: boolean
+  /** Extra lines for the state .env. */
+  stateEnv?: string[]
   /** Put TELEGRAM_MESSAGE_MAP_FILE in the state .env. Default true. */
   mapSetting?: boolean
   /** Extra launch env for server.ts (e.g. AGENT_SCOPE for the hub), given the state dir. */
@@ -119,6 +133,7 @@ async function startWorld(opts: WorldOpts = {}): Promise<World> {
       `TELEGRAM_POLLER_PORT=${hubPort}`,
       `TELEGRAM_API_ROOT=${fake.apiRoot}`,
       ...(opts.mapSetting === false ? [] : [`TELEGRAM_MESSAGE_MAP_FILE=${mapFile}`]),
+      ...(opts.stateEnv ?? []),
     ].join('\n') + '\n',
   )
   writeFileSync(
@@ -131,14 +146,13 @@ async function startWorld(opts: WorldOpts = {}): Promise<World> {
       JSON.stringify({ enabled: true, stateDir }),
     )
   }
-  writeFileSync(join(configDir, 'sessions', `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId, name: SESSION_NAME }))
   mkdirSync(join(configDir, 'jobs', 'job1'), { recursive: true })
   writeFileSync(
     join(configDir, 'jobs', 'job1', 'state.json'),
     JSON.stringify({
       sessionId,
       resumeSessionId: sessionId,
-      respawnFlags: opts.channels === false ? ['--name', 'x'] : ['--name', 'x', '--channels', CHANNEL_SPEC],
+      respawnFlags: opts.jobChannels === false ? ['--name', 'x'] : ['--name', 'x', '--channels', CHANNEL_SPEC],
     }),
   )
 
@@ -148,7 +162,7 @@ async function startWorld(opts: WorldOpts = {}): Promise<World> {
   }
   worlds.push(world)
 
-  const server = spawn(process.execPath, ['server.ts'], {
+  const server = spawn('sh', ['-c', `"${process.execPath}" server.ts; :`, ...LAUNCH_ARGV[opts.launch ?? 'channels']], {
     cwd: import.meta.dir,
     env: {
       PATH: process.env.PATH ?? '',
@@ -175,6 +189,8 @@ async function startWorld(opts: WorldOpts = {}): Promise<World> {
   })
   server.stderr?.on('data', (chunk: Buffer) => world.stderr.push(chunk.toString()))
   world.server = server
+  // The probe runs seconds after initialize, so writing the record now is in time.
+  writeFileSync(join(configDir, 'sessions', `${server.pid}.json`), JSON.stringify({ pid: server.pid, sessionId, name: SESSION_NAME }))
   return world
 }
 
@@ -235,7 +251,7 @@ test('不同 session id -> 不同專屬 scope', async () => {
 }, TEST_TIMEOUT_MS)
 
 test('沒帶 --channels：不訂閱，stderr 說明原因', async () => {
-  const world = await startWorld({ channels: false })
+  const world = await startWorld({ launch: 'plain', jobChannels: false })
   await initialize(world)
   await sleep(NO_SUBSCRIBE_WAIT_MS)
   expect(world.subscribed).toEqual([])
@@ -244,7 +260,7 @@ test('沒帶 --channels：不訂閱，stderr 說明原因', async () => {
 
 test('判斷不了（找不到自己的 session 記錄）：不訂閱', async () => {
   const world = await startWorld()
-  rmSync(join(world.configDir, 'sessions', `${process.pid}.json`))
+  rmSync(join(world.configDir, 'sessions', `${world.server?.pid}.json`))
   await initialize(world)
   await sleep(NO_SUBSCRIBE_WAIT_MS)
   expect(world.subscribed).toEqual([])
@@ -290,6 +306,7 @@ test('直送模式 reply：每則送出的訊息都寫進 map（四欄位、sess
       session_id: world.sessionId,
       session_name: SESSION_NAME,
       sent_at: expect.any(Number),
+      chat_id: String(USER_ID),
     })),
   )
 }, TEST_TIMEOUT_MS)
@@ -297,6 +314,7 @@ test('直送模式 reply：每則送出的訊息都寫進 map（四欄位、sess
 test('直送模式 edit_message：不寫 map', async () => {
   const world = await startWorld()
   await initialize(world)
+  await waitFor(() => world.subscribed.length > 0, 'subscription')
   await rpc(world, 'tools/call', { name: 'edit_message', arguments: { chat_id: String(USER_ID), message_id: '1000', text: 'x' } })
   expect(world.fake.callsOf('editMessageText').length).toBe(1)
   expect(mapLines(world)).toEqual([])
@@ -305,6 +323,7 @@ test('直送模式 edit_message：不寫 map', async () => {
 test('map 寫不進去：reply 照常成功、訊息照常送出、stderr 記一筆；恢復可寫後下一次照常寫', async () => {
   const world = await startWorld()
   await initialize(world)
+  await waitFor(() => world.subscribed.length > 0, 'subscription')
   const mapDir = join(world.rootDir, 'map')
   chmodSync(mapDir, 0o500)
   try {
@@ -323,6 +342,7 @@ test('map 寫不進去：reply 照常成功、訊息照常送出、stderr 記一
 test('直送模式但 state .env 沒設 map 路徑：reply 照常、不寫 map、啟動時說明', async () => {
   const world = await startWorld({ mapSetting: false })
   await initialize(world)
+  await waitFor(() => world.subscribed.length > 0, 'subscription')
   const result = await reply(world, 'x')
   expect(JSON.stringify(result)).toContain('sent (id: ')
   expect(mapLines(world)).toEqual([])
@@ -371,7 +391,7 @@ test('直送進來的訊息：channel 通知帶 session_name（顯示形式）�
 
 test('直送模式 server 不論訂閱成功與否、poller 在不在，都不自己呼叫 getUpdates', async () => {
   const subscribedWorld = await startWorld()
-  const unsubscribedWorld = await startWorld({ channels: false })
+  const unsubscribedWorld = await startWorld({ launch: 'plain', jobChannels: false })
   // No poller at all: point the subscription at a port nothing listens on.
   const pollerlessWorld = await startWorld()
   pollerlessWorld.hub.close()
@@ -383,4 +403,106 @@ test('直送模式 server 不論訂閱成功與否、poller 在不在，都不�
     expect(world.fake.getUpdatesCount()).toBe(0)
   }
   expect(stderrOf(pollerlessWorld)).toContain('subscription lost')
+}, TEST_TIMEOUT_MS)
+
+test('背景 session（bg-spare 程序）：argv 看不到旗標時，job 記錄有 --channels 才訂閱', async () => {
+  const withChannels = await startWorld({ launch: 'bg-spare' })
+  const without = await startWorld({ launch: 'bg-spare', jobChannels: false })
+  await Promise.all([initialize(withChannels), initialize(without)])
+  await waitFor(() => withChannels.subscribed.length > 0, 'bg-spare subscription')
+  await sleep(NO_SUBSCRIBE_WAIT_MS)
+  expect(withChannels.subscribed).toEqual([sessionScopeOf(withChannels.sessionId)])
+  expect(without.subscribed).toEqual([])
+}, TEST_TIMEOUT_MS)
+
+test('前景 resume 沒帶 --channels：就算同 session id 的舊 job 記錄有 --channels 也不訂閱', async () => {
+  const world = await startWorld({ launch: 'plain', jobChannels: true })
+  await initialize(world)
+  await sleep(NO_SUBSCRIBE_WAIT_MS)
+  expect(world.subscribed).toEqual([])
+  expect(stderrOf(world)).toContain('session not started with --channels')
+}, TEST_TIMEOUT_MS)
+
+test('直送模式但判斷不能顯示 channel：reply / react / edit_message / download_attachment 一律回錯誤、不碰 Telegram', async () => {
+  const world = await startWorld({ launch: 'plain', jobChannels: false })
+  await initialize(world)
+  await waitFor(() => stderrOf(world).includes('Telegram tools disabled'), 'probe result')
+  const calls: [string, Record<string, unknown>][] = [
+    ['reply', { chat_id: String(USER_ID), text: 'x' }],
+    ['react', { chat_id: String(USER_ID), message_id: '1', emoji: '👍' }],
+    ['edit_message', { chat_id: String(USER_ID), message_id: '1', text: 'x' }],
+    ['download_attachment', { file_id: 'f' }],
+  ]
+  for (const [name, args] of calls) {
+    const result = await rpc(world, 'tools/call', { name, arguments: args })
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result)).toContain('session-direct 未啟用')
+  }
+  expect(world.fake.calls).toEqual([])
+  expect(mapLines(world)).toEqual([])
+}, TEST_TIMEOUT_MS)
+
+test('直送模式且判斷尚未完成：工具先回錯誤；判斷通過後才可用', async () => {
+  const world = await startWorld()
+  await initialize(world)
+  const early = await reply(world, '太早')
+  expect(early.isError).toBe(true)
+  expect(JSON.stringify(early)).toContain('session-direct 未啟用（channel check has not finished）')
+  await waitFor(() => world.subscribed.length > 0, 'subscription')
+  const later = await reply(world, '可以了')
+  expect(JSON.stringify(later)).toContain('sent (id: ')
+  expect(world.fake.callsOf('sendMessage').map(call => call.params.text)).toEqual(['可以了'])
+}, TEST_TIMEOUT_MS)
+
+test('state .env 帶 AGENT_SCOPE（中控的）時，直送模式仍只訂閱專屬 scope、不頂掉中控', async () => {
+  const world = await startWorld({ stateEnv: [`AGENT_SCOPE=${HUB_SCOPE}`] })
+  await initialize(world)
+  await waitFor(() => world.subscribed.length > 0, 'subscription')
+  await sleep(500)
+  expect(world.subscribed).toEqual([sessionScopeOf(world.sessionId)])
+}, TEST_TIMEOUT_MS)
+
+test('直送模式不攔截「yes xxxxx」型文字：照常當一般訊息送進 session', async () => {
+  const world = await startWorld()
+  await initialize(world)
+  const scopeId = await waitFor(() => world.subscribed[0], 'subscription')
+  expect(world.hub.deliver(scopeId, [{
+    envelopeId: randomUUID(),
+    scopeId,
+    platform: 'telegram',
+    ts: Date.now(),
+    botInfo: { id: 123456, is_bot: true, first_name: 'fake', username: 'fake_test_bot' },
+    payload: {
+      update_id: 2,
+      message: {
+        message_id: 9002,
+        date: 0,
+        text: 'yes again',
+        from: { id: USER_ID, is_bot: false, first_name: 'u' },
+        chat: { id: USER_ID, type: 'private', first_name: 'u' },
+      },
+    },
+  }])).toBe(true)
+  const notification = await waitFor(
+    () => world.stdout.find(message => message.method === 'notifications/claude/channel'),
+    'channel notification',
+  )
+  expect((notification.params as { content: string }).content).toBe('yes again')
+  expect(world.stdout.some(message => message.method === 'notifications/claude/channel/permission')).toBe(false)
+}, TEST_TIMEOUT_MS)
+
+const FIND_SESSION_BIN = process.env.FIND_SESSION_BIN ?? join(homedir(), '.claude', 'scripts', 'tg-hub', 'find-session')
+
+test.skipIf(!existsSync(FIND_SESSION_BIN))('T92：既有 find-session 讀得懂 server 寫進 map 的那行（含 chat_id）', async () => {
+  const world = await startWorld()
+  await initialize(world)
+  await waitFor(() => world.subscribed.length > 0, 'subscription')
+  await reply(world, 'x')
+  const [line] = mapLines(world)
+  const out = spawnSync(FIND_SESSION_BIN, [String(line.message_id)], {
+    env: { PATH: process.env.PATH ?? '', HOME: world.homeDir, TG_NOTIFY_STATE_DIR: join(world.rootDir, 'map'), TG_HUB_CLAUDE_BIN: 'false' },
+    encoding: 'utf8',
+  })
+  expect(out.status).toBe(0)
+  expect(JSON.parse(out.stdout)).toMatchObject({ found: true, session_id: world.sessionId, session_name: SESSION_NAME })
 }, TEST_TIMEOUT_MS)

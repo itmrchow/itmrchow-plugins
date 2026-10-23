@@ -46,11 +46,11 @@ import { buildReplyMeta } from './reply-meta'
 import { buildSessionScopeId, MESSAGE_MAP_FILE_ENV, resolveMessageMapFile } from './session-direct'
 import { appendMessageMapEntries } from './message-map'
 import {
-  channelSpecFromPluginRoot,
+  resolveChannelSpec,
   createSystemProbeIo,
   probeSessionChannel,
   resolveSessionDirectPointer,
-  sessionDisplayName,
+  resolveSessionDisplayName,
   SESSION_DIRECT_POINTER_NAME,
 } from './session-channel'
 import { resolvePort } from './resolve-port'
@@ -169,6 +169,10 @@ const AGENT_SCOPE = SESSION_DIRECT_ON ? '' : process.env.AGENT_SCOPE ?? ''
 // at the bottom of this file has found it. Its session record supplies the
 // session name carried on every inbound message.
 let sessionClaudePid: number | undefined
+// Session-direct mode only: why the tools are refused, until the probe passes.
+// A session that cannot show channel messages gets no Telegram tools at all —
+// the same as before this mode existed, when such a session found no token.
+let sessionDirectRefusal: string | undefined = SESSION_DIRECT_ON ? 'channel check has not finished' : undefined
 // The scope this process actually subscribed under, for log lines.
 let subscribedScope = AGENT_SCOPE
 // Session-direct mode only: where the reply tool records what it sent, so the
@@ -568,10 +572,12 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
 // Session-direct mode only (JP-380). The user reads many sessions' messages in
 // one chat, so each one must say on its first line which session it is from.
+// Worded as a condition on the tag: instructions are fixed before the channel
+// check runs, and a session that fails it never receives such a tag.
 const SESSION_DIRECT_INSTRUCTIONS = [
   '',
-  'SESSION-DIRECT MODE — Telegram messages here come straight from the user, who quote-replied to a message this session sent. Each <channel source="telegram"> tag carries session_name: this session\'s name, already in display form.',
-  '- Whenever you call reply (or edit_message on one of your replies), the text starts with the line `[回報] <session_name>: <content>`. When you need the user to answer something, start with `[等你回覆] <session_name>: <question>` instead.',
+  'When a <channel source="telegram"> tag carries a session_name attribute, the user quote-replied to a message this session sent, and session_name is this session\'s name, already in display form.',
+  '- Whenever you then call reply (or edit_message on one of your replies), the text starts with the line `[回報] <session_name>: <content>`. When you need the user to answer something, start with `[等你回覆] <session_name>: <question>` instead.',
   '- Copy session_name exactly from the latest tag. Use only these two statuses — never invent others such as `[完成]` — and write the prefix once, at the very start.',
   '- Wrong: `部署完成，測試全過` / `[回報] tg-hub: 部署完成`. Right (session_name="OP-8820 部署"): `[回報] OP-8820 部署: 部署完成，測試全過`.',
 ]
@@ -761,6 +767,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (sessionDirectRefusal !== undefined) {
+    return {
+      content: [{ type: 'text', text: `${req.params.name} failed: session-direct 未啟用（${sessionDirectRefusal}）` }],
+      isError: true,
+    }
+  }
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
@@ -828,7 +840,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             }
           }
         } finally {
-          recordSentMessages(sentIds)
+          recordSentMessages(chat_id, sentIds)
         }
 
         const result =
@@ -1382,7 +1394,9 @@ async function handleInbound(
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
-  const permMatch = PERMISSION_REPLY_RE.exec(text)
+  // Not in session-direct mode: the permission relay is not declared there, so
+  // no request can be pending and swallowing a "yes again" would be pure loss.
+  const permMatch = SESSION_DIRECT_ON ? null : PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
@@ -1436,7 +1450,7 @@ async function handleInbound(
       user_id: String(from.id),
       ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
       ...replyMeta,
-      ...sessionNameMeta(),
+      ...buildSessionNameMeta(),
       ...(imagePath ? { image_path: imagePath } : {}),
       ...(attachment ? {
         attachment_kind: attachment.kind,
@@ -1454,9 +1468,11 @@ async function handleInbound(
  * mode only. Never throws: a failed record costs the direct route for those
  * messages (the user's reply to them reaches the hub), never the reply itself.
  *
+ * @param chatId - The chat they went to, recorded so the poller can reject a
+ *   same-numbered message from another chat.
  * @param messageIds - Telegram message ids, in send order.
  */
-function recordSentMessages(messageIds: readonly number[]): void {
+function recordSentMessages(chatId: string, messageIds: readonly number[]): void {
   const sessionId = process.env.CLAUDE_CODE_SESSION_ID
   if (!MESSAGE_MAP_FILE || !sessionId || messageIds.length === 0) return
   // Raw name, as tg-send records it; "" when unknown (the map is routed by
@@ -1466,7 +1482,7 @@ function recordSentMessages(messageIds: readonly number[]): void {
   try {
     appendMessageMapEntries(
       MESSAGE_MAP_FILE,
-      messageIds.map(messageId => ({ messageId, sessionId, sessionName })),
+      messageIds.map(messageId => ({ messageId, sessionId, sessionName, chatId })),
     )
   } catch (err) {
     process.stderr.write(`telegram channel: session-direct could not record ${messageIds.length} sent message(s) in the message map: ${err}\n`)
@@ -1483,10 +1499,10 @@ function recordSentMessages(messageIds: readonly number[]): void {
  *
  * @returns The meta fragment, or an empty object outside session-direct mode.
  */
-function sessionNameMeta(): Record<string, string> {
+function buildSessionNameMeta(): Record<string, string> {
   const sessionId = process.env.CLAUDE_CODE_SESSION_ID
   if (sessionClaudePid === undefined || !sessionId) return {}
-  const name = sessionDisplayName(sessionProbeIo.readSessionRecord(sessionClaudePid), sessionId)
+  const name = resolveSessionDisplayName(sessionProbeIo.readSessionRecord(sessionClaudePid), sessionId)
   return { session_name: sanitizeMetaText(displaySessionName(name)) }
 }
 
@@ -1533,6 +1549,9 @@ async function subscribeAs(scopeId: string): Promise<void> {
  * it is certain the session shows channel messages. A session started without
  * `--channels` acks every delivery and drops it silently, so "cannot tell"
  * means "do not subscribe" — the user's reply then reaches the hub as before.
+ * Until this passes, every Telegram tool answers with an error (see
+ * sessionDirectRefusal): a session that cannot be reached must not be able to
+ * send either.
  * Run after the ready gate: by then Claude Code has written the session record
  * the probe looks for.
  */
@@ -1540,21 +1559,24 @@ async function subscribeSessionDirect(): Promise<void> {
   const sessionId = process.env.CLAUDE_CODE_SESSION_ID
   const scopeId = buildSessionScopeId(sessionId ?? '')
   if (!scopeId) {
-    process.stderr.write('telegram channel: session-direct not subscribing (CLAUDE_CODE_SESSION_ID is not a session id)\n')
+    sessionDirectRefusal = 'CLAUDE_CODE_SESSION_ID is not a session id'
+    process.stderr.write(`telegram channel: session-direct not subscribing (${sessionDirectRefusal}); Telegram tools disabled\n`)
     return
   }
   await readyGate.ready
   const probe = probeSessionChannel({
     sessionId,
     startPid: process.ppid,
-    channelSpec: channelSpecFromPluginRoot(process.env.CLAUDE_PLUGIN_ROOT),
+    channelSpec: resolveChannelSpec(process.env.CLAUDE_PLUGIN_ROOT),
     io: sessionProbeIo,
   })
   if (!probe.ok) {
-    process.stderr.write(`telegram channel: session-direct not subscribing (${probe.reason})\n`)
+    sessionDirectRefusal = probe.reason
+    process.stderr.write(`telegram channel: session-direct not subscribing (${probe.reason}); Telegram tools disabled\n`)
     return
   }
   sessionClaudePid = probe.claudePid
+  sessionDirectRefusal = undefined
   await subscribeAs(scopeId)
 }
 

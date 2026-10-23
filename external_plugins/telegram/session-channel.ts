@@ -25,7 +25,15 @@ import { isAbsolute, join, sep } from 'node:path'
 /** File name of the pointer, under `<home>/.claude/channels/`. */
 export const SESSION_DIRECT_POINTER_NAME = 'telegram-session-direct.json'
 
-/** How far up the process tree to look for this session's claude process. */
+/**
+ * How far up the process tree to look for this session's claude process.
+ *
+ * Measured chains: macOS / x86 run `launch.sh` -> `exec bun server.ts`, so the
+ * claude process is the direct parent (1 step); arm64-linux runs
+ * `exec tsx server.ts`, whose CLI starts node as a child (2 steps). 4 leaves
+ * room for one more wrapper. A wider walk cannot misfire — the match is by
+ * session id, never "the nearest claude" — it only costs ps calls.
+ */
 export const MAX_ANCESTOR_DEPTH = 4
 
 const CHANNELS_FLAG = '--channels'
@@ -33,6 +41,10 @@ const CHANNELS_FLAG_EQ = `${CHANNELS_FLAG}=`
 const FLAG_PREFIX = '-'
 const SPEC_SEGMENT_RE = /^[A-Za-z0-9._-]+$/
 const PLUGIN_CACHE_DIR = 'cache'
+/** `cache/<marketplace>/<plugin>/<version>`: the tail of an installed plugin's path. */
+const PLUGIN_CACHE_PATH_SEGMENTS = 4
+/** argv marker of the pre-started process a `claude --bg` session runs in. */
+const BG_SPARE_FLAG = '--bg-spare'
 const SESSION_NAME_FALLBACK_PREFIX = 'session-'
 const SESSION_ID_SHORT_LENGTH = 8
 const PS_TIMEOUT_MS = 2000
@@ -101,18 +113,18 @@ export function resolveSessionDirectPointer(
 }
 
 /**
- * The `--channels` entry that names this plugin, derived from where Claude Code
+ * Resolve the `--channels` entry that names this plugin, derived from where Claude Code
  * installed it: `<...>/cache/<marketplace>/<plugin>/<version>`.
  *
  * @param pluginRoot - CLAUDE_PLUGIN_ROOT.
  * @returns `plugin:<plugin>@<marketplace>`, or undefined when the path does not
  *   have that shape (e.g. run from a checkout) — which means "cannot tell".
  */
-export function channelSpecFromPluginRoot(pluginRoot: string | undefined): string | undefined {
+export function resolveChannelSpec(pluginRoot: string | undefined): string | undefined {
   if (!pluginRoot) return undefined
   const parts = pluginRoot.split(sep).filter(part => part !== '')
-  if (parts.length < 4) return undefined
-  const [cacheDir, marketplace, plugin] = parts.slice(-4, -1)
+  if (parts.length < PLUGIN_CACHE_PATH_SEGMENTS) return undefined
+  const [cacheDir, marketplace, plugin] = parts.slice(-PLUGIN_CACHE_PATH_SEGMENTS, -1)
   if (cacheDir !== PLUGIN_CACHE_DIR) return undefined
   if (!SPEC_SEGMENT_RE.test(marketplace) || !SPEC_SEGMENT_RE.test(plugin)) return undefined
   return `plugin:${plugin}@${marketplace}`
@@ -149,14 +161,20 @@ export function hasChannelFlag(args: readonly string[], channelSpec: string): bo
  * The claude process is recognised by its session record carrying our
  * CLAUDE_CODE_SESSION_ID — not by "the nearest claude above us", which would
  * pick up an outer session when this one was started from another session's
- * shell. Then: its argv has `--channels <spec>` (foreground start), or, when
- * the argv does not show the flags (a `claude --bg` session runs inside a
- * pre-started spare process whose argv is just `claude bg-spare …`), the job
- * record for this session id lists it in its respawn flags.
+ * shell. Then: its argv has `--channels <spec>`, or — only when that argv is a
+ * `claude --bg` spare process (`claude bg-spare --bg-spare …`), whose argv
+ * never shows the session's flags — the job record for this session id lists
+ * it in its respawn flags.
+ *
+ * The job record is consulted for a spare process ONLY. Job records outlive
+ * their jobs, and a session that once ran as `claude --bg --channels` can be
+ * resumed in a terminal under the same session id without `--channels`; that
+ * foreground process must not inherit the old record's answer. An unreadable
+ * argv is "cannot tell", hence "cannot show".
  *
  * @param opts.sessionId - CLAUDE_CODE_SESSION_ID.
  * @param opts.startPid - Where the walk starts: this process's parent.
- * @param opts.channelSpec - From channelSpecFromPluginRoot.
+ * @param opts.channelSpec - From resolveChannelSpec.
  * @param opts.io - Process and file reads.
  * @returns ok with the claude pid, or the reason it cannot be told.
  */
@@ -182,7 +200,9 @@ export function probeSessionChannel(opts: {
   if (claudePid === undefined) return { ok: false, reason: 'own claude process not found' }
 
   const args = io.readArgs(claudePid)
-  if (args && hasChannelFlag(args, channelSpec)) return { ok: true, claudePid }
+  if (!args) return { ok: false, reason: 'claude process argv unreadable' }
+  if (hasChannelFlag(args, channelSpec)) return { ok: true, claudePid }
+  if (!args.includes(BG_SPARE_FLAG)) return { ok: false, reason: `session not started with ${CHANNELS_FLAG} ${channelSpec}` }
 
   const job = io.listJobRecords().find(record => record.sessionId === sessionId || record.resumeSessionId === sessionId)
   if (job && Array.isArray(job.respawnFlags) && hasChannelFlag(job.respawnFlags, channelSpec)) {
@@ -192,17 +212,64 @@ export function probeSessionChannel(opts: {
 }
 
 /**
- * The name this session goes by on a first line: its current name from the
- * session record, else `session-<first 8 of the id>` so there is always one.
+ * Resolve the name this session goes by on a first line: its current name
+ * from the session record, else `session-<first 8 of the id>` so there is
+ * always one.
  *
  * @param record - The session record, read fresh; undefined when unreadable.
  * @param sessionId - CLAUDE_CODE_SESSION_ID.
  * @returns The name.
  */
-export function sessionDisplayName(record: SessionRecord | undefined, sessionId: string): string {
+export function resolveSessionDisplayName(record: SessionRecord | undefined, sessionId: string): string {
   const name = record?.name?.trim()
   if (name) return name
   return `${SESSION_NAME_FALLBACK_PREFIX}${sessionId.slice(0, SESSION_ID_SHORT_LENGTH)}`
+}
+
+/**
+ * The real process and file reads, against Claude Code's config dir.
+ *
+ * @param configDir - CLAUDE_CONFIG_DIR, or `<home>/.claude`.
+ * @returns The io for probeSessionChannel.
+ */
+export function createSystemProbeIo(configDir: string): SessionProbeIo {
+  return {
+    readArgs: readProcessArgs,
+    readParentPid: pid => {
+      const raw = readPsField(pid, 'ppid')
+      const parent = raw === undefined ? NaN : Number(raw)
+      return Number.isInteger(parent) ? parent : undefined
+    },
+    readSessionRecord: pid => {
+      const raw = readJson(join(configDir, 'sessions', `${pid}.json`)) as { sessionId?: unknown; name?: unknown } | undefined
+      if (typeof raw?.sessionId !== 'string') return undefined
+      return { sessionId: raw.sessionId, ...(typeof raw.name === 'string' ? { name: raw.name } : {}) }
+    },
+    listJobRecords: () => {
+      const jobsDir = join(configDir, 'jobs')
+      let ids: string[]
+      try {
+        ids = readdirSync(jobsDir)
+      } catch {
+        return []
+      }
+      const records: JobRecord[] = []
+      for (const id of ids) {
+        const raw = readJson(join(jobsDir, id, 'state.json')) as
+          | { sessionId?: unknown; resumeSessionId?: unknown; respawnFlags?: unknown }
+          | undefined
+        if (typeof raw !== 'object' || raw === null) continue
+        records.push({
+          ...(typeof raw.sessionId === 'string' ? { sessionId: raw.sessionId } : {}),
+          ...(typeof raw.resumeSessionId === 'string' ? { resumeSessionId: raw.resumeSessionId } : {}),
+          ...(Array.isArray(raw.respawnFlags)
+            ? { respawnFlags: raw.respawnFlags.filter((flag): flag is string => typeof flag === 'string') }
+            : {}),
+        })
+      }
+      return records
+    },
+  }
 }
 
 /**
@@ -253,50 +320,4 @@ function readProcessArgs(pid: number): string[] | undefined {
     if (args.length > 0) return args
   } catch {}
   return readPsField(pid, 'args')?.split(/\s+/)
-}
-
-/**
- * The real process and file reads, against Claude Code's config dir.
- *
- * @param configDir - CLAUDE_CONFIG_DIR, or `<home>/.claude`.
- * @returns The io for probeSessionChannel.
- */
-export function createSystemProbeIo(configDir: string): SessionProbeIo {
-  return {
-    readArgs: readProcessArgs,
-    readParentPid: pid => {
-      const raw = readPsField(pid, 'ppid')
-      const parent = raw === undefined ? NaN : Number(raw)
-      return Number.isInteger(parent) ? parent : undefined
-    },
-    readSessionRecord: pid => {
-      const raw = readJson(join(configDir, 'sessions', `${pid}.json`)) as { sessionId?: unknown; name?: unknown } | undefined
-      if (typeof raw?.sessionId !== 'string') return undefined
-      return { sessionId: raw.sessionId, ...(typeof raw.name === 'string' ? { name: raw.name } : {}) }
-    },
-    listJobRecords: () => {
-      const jobsDir = join(configDir, 'jobs')
-      let ids: string[]
-      try {
-        ids = readdirSync(jobsDir)
-      } catch {
-        return []
-      }
-      const records: JobRecord[] = []
-      for (const id of ids) {
-        const raw = readJson(join(jobsDir, id, 'state.json')) as
-          | { sessionId?: unknown; resumeSessionId?: unknown; respawnFlags?: unknown }
-          | undefined
-        if (typeof raw !== 'object' || raw === null) continue
-        records.push({
-          ...(typeof raw.sessionId === 'string' ? { sessionId: raw.sessionId } : {}),
-          ...(typeof raw.resumeSessionId === 'string' ? { resumeSessionId: raw.resumeSessionId } : {}),
-          ...(Array.isArray(raw.respawnFlags)
-            ? { respawnFlags: raw.respawnFlags.filter((flag): flag is string => typeof flag === 'string') }
-            : {}),
-        })
-      }
-      return records
-    },
-  }
 }
