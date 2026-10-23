@@ -173,21 +173,32 @@ the server uses the pointer's state dir (bot token, `access.json`, poller port
 from its `.env`) and subscribes as `telegram-dm-s<session id, 32 hex>`, but only
 once it is certain the session shows channel messages: its own claude process
 was started with `--channels plugin:telegram@<marketplace>`, read from that
-process's argv, or for a background session from Claude Code's job record. If
-that cannot be told, it does not subscribe (a session without `--channels` would
+process's argv, or — only when that process is a `claude --bg` spare
+(`claude bg-spare --bg-spare …`), whose argv never shows the session's flags —
+from Claude Code's job record for this session. A foreground process without
+the flag is never rescued by an old job record. If that cannot be told, it does
+not subscribe (a session without `--channels` would
 ack every message and drop it silently). The hub and every carrier scope set
 `AGENT_SCOPE`, so they never read the pointer and behave exactly as before.
 
 In this mode the server does not declare the permission relay
 (`claude/channel/permission`), skips the pairing confirmation and the startup
-notice (the hub's server does those), and adds instructions asking the session
-to start each reply with `[回報] <session_name>: ` (or `[等你回覆] ...` when it
-needs an answer); every inbound tag carries `session_name`, read fresh from the
-session's record.
+notice (the hub's server does those), does not treat `yes xxxxx` / `no xxxxx`
+texts as permission answers, and adds instructions asking the session to start
+each reply to a message that carries `session_name` with `[回報] <session_name>: `
+(or `[等你回覆] ...` when it needs an answer); every inbound tag carries
+`session_name`, read fresh from the session's record.
+
+Until that check passes — and for good when it fails — `reply`, `react`,
+`edit_message` and `download_attachment` answer with an error
+(`session-direct 未啟用 (<reason>)`) and touch nothing in Telegram. A session that
+cannot be reached cannot send either, which is where such sessions stood before
+this mode existed (they found no bot token and the server exited).
 
 Each message the session sends through `reply` (every chunk and attachment;
 `edit_message` adds nothing) is appended to the message map in tg-send's line
-format, `{message_id, session_id, session_name, sent_at}`, so a reply to it
+format, `{message_id, session_id, session_name, sent_at}`, plus the `chat_id`
+it went to, so a reply to it
 comes back to the same session. A failed write is logged and never fails the
 reply. The hub's own replies are not recorded, so replies to them stay with the
 hub. When the same `message_id` appears more than once, the last valid line wins.
@@ -207,8 +218,14 @@ it reach the hub meanwhile.
 Limits: the pointer and the "can show channel" check read Claude Code's own
 files (`~/.claude/sessions/<pid>.json`, `~/.claude/jobs/*/state.json`), which are
 not a public interface; if they change, sessions stop subscribing and replies go
-to the hub. The message map is trusted as written by any local process, the same
-boundary as the rest of this plugin. A session started by hand without
+to the hub. With the pointer on, every session started without `AGENT_SCOPE` /
+`TELEGRAM_STATE_DIR` loads the hub's bot token (today such a session finds none
+and its server exits); its Telegram tools stay refused unless the check above
+passes. None of these servers ever calls `getUpdates` — inbound only arrives
+through the poller subscription. The message map is trusted as written by any
+local process, the same boundary as the rest of this plugin. Truncating the map
+in place (copytruncate-style) is not supported: the poller would miss lines;
+clear or rotate it by replacing the file. A session started by hand without
 `--channels` stays on the hub; add `--channels plugin:telegram@<marketplace>` to
 opt in.
 

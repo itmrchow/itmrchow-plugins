@@ -152,16 +152,22 @@ poller 不會為此啟動任何 session：session 不在線就交給中控，喚
 （`claude --bg` 與 `claude respawn` 啟動的一律如此）會讀下表的指標檔。指標開啟時，server 改用指標的
 state 目錄（bot token、`access.json`、其 `.env` 裡的 poller port），以
 `telegram-dm-s<session id 的 32 位 hex>` 訂閱；但只在確定本 session 能顯示 channel 訊息時才訂閱：
-它自己的 claude 程序帶 `--channels plugin:telegram@<marketplace>` 啟動（讀該程序的 argv；背景 session
-讀 Claude Code 的 job 記錄）。判斷不了就不訂閱（沒帶 `--channels` 的 session 會 ack 後靜默丟掉訊息）。
+它自己的 claude 程序帶 `--channels plugin:telegram@<marketplace>` 啟動（讀該程序的 argv；只有當該程序是
+`claude --bg` 的備用程序（`claude bg-spare --bg-spare …`，argv 看不到 session 旗標）時，才改讀 Claude Code
+為這個 session 留的 job 記錄）。前景程序沒帶旗標時，不會因為有舊 job 記錄而被判成可顯示。判斷不了就不訂閱（沒帶 `--channels` 的 session 會 ack 後靜默丟掉訊息）。
 中控與各 carrier scope 都帶 `AGENT_SCOPE`，完全不讀指標，行為不變。
 
 此模式下 server 不宣告權限 relay（`claude/channel/permission`），不發配對確認與重啟完成通知（由中控的
-server 負責），並附加 instructions 要求 session 回覆的第一行用 `[回報] <session_name>: `（需要 user
-回答時用 `[等你回覆] ...`）；每則收到的訊息都帶 `session_name`，每次現讀 session 記錄。
+server 負責），不把 `yes xxxxx` / `no xxxxx` 文字當權限回覆攔截，並附加 instructions 要求 session 回覆
+帶 `session_name` 的訊息時，第一行用 `[回報] <session_name>: `（需要 user 回答時用 `[等你回覆] ...`）；
+每則收到的訊息都帶 `session_name`，每次現讀 session 記錄。
+
+判斷通過之前（判斷失敗則一直如此），`reply`、`react`、`edit_message`、`download_attachment` 一律回錯誤
+（`session-direct 未啟用（<原因>）`），不碰 Telegram。收不到訊息的 session 也發不出訊息，等於回到此模式出現前
+的狀態（那時這類 session 讀不到 bot token，server 直接退出）。
 
 session 經 `reply` 送出的每則訊息（分段的每一段、每個附件；`edit_message` 不算）都以 tg-send 相同的行格式
-`{message_id, session_id, session_name, sent_at}` 追加進訊息對照表，user 回覆它時就能送回同一個 session。
+`{message_id, session_id, session_name, sent_at}` 再加上送往的 `chat_id`，追加進訊息對照表，user 回覆它時就能送回同一個 session。
 寫入失敗只記 log，不讓 reply 失敗。中控自己的回覆不記錄，回覆它們仍進中控。同一個 `message_id` 有多筆時以
 最後一筆有效行為準。
 
@@ -176,8 +182,11 @@ session 經 `reply` 送出的每則訊息（分段的每一段、每個附件；
 期間對它的回覆送到中控。
 
 限制：指標與「能否顯示 channel」的判斷讀 Claude Code 自己的檔案（`~/.claude/sessions/<pid>.json`、
-`~/.claude/jobs/*/state.json`），不是公開介面；格式一變，session 就不再訂閱、回覆改送中控。訊息對照表
-信任任何本機程序寫入的內容，與本 plugin 其他部分的邊界相同。手動開、沒帶 `--channels` 的 session
+`~/.claude/jobs/*/state.json`），不是公開介面；格式一變，session 就不再訂閱、回覆改送中控。指標一開，
+所有啟動時沒帶 `AGENT_SCOPE` / `TELEGRAM_STATE_DIR` 的 session 都會載入中控的 bot token（現況是讀不到、server
+直接退出）；但除非通過上面的判斷，它們的 Telegram 工具一律回錯誤。這些 server 都不會自己呼叫 `getUpdates`，
+收訊只走 poller 訂閱。訊息對照表信任任何本機程序寫入的內容，與本 plugin 其他部分的邊界相同。不支援就地截斷
+對照表（copytruncate 這類）：poller 會漏讀；要清理請用換檔（新檔取代舊檔）。手動開、沒帶 `--channels` 的 session
 照舊走中控；要啟用就加上 `--channels plugin:telegram@<marketplace>`。
 
 ## 核准請求（inline 按鈕，loopback 介面）
