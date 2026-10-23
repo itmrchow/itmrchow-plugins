@@ -9,11 +9,12 @@
  * The file is append-only and never rotated, so a full re-read per lookup
  * would grow without bound; instead the reader keeps what it parsed and on each
  * lookup reads only the bytes appended since — a full reload happens only when
- * the file shrank or was replaced. Truncating the file in place and letting it
- * grow back past the read offset (copytruncate-style rotation) is NOT detected:
- * clear or rotate it by replacing the file (a new inode) instead. When a
- * message_id appears more than once,
+ * the file shrank or was replaced. When a message_id appears more than once,
  * the last valid line wins, the same as the carrier's find-session.
+ *
+ * Truncating the file in place and letting it grow back past the read offset
+ * (copytruncate-style rotation) is NOT detected: clear or rotate it by
+ * replacing the file (a new inode) instead.
  *
  * Any read failure reads as "not found", which sends the reply to the hub as before.
  */
