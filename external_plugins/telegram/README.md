@@ -143,6 +143,92 @@ first line keeps the status the message was sent with.
 | --- | --- | --- |
 | `TELEGRAM_FIRST_LINE_FORMAT` | unset (off) | Read by both `poller.ts` and `server.ts`. `1` or `true` (trimmed, case-insensitive) adds the first line to the rows marked above; anything else leaves those messages exactly as before, so other bots sharing this plugin are unaffected. Set it on both processes. Each prints its reading at startup: `telegram poller: first-line format on|off (unset)|off (value is not 1 / true) (TELEGRAM_FIRST_LINE_FORMAT)` on stderr (`telegram channel:` for server.ts). |
 
+## Replies straight to a session (session-direct mode)
+
+Off by default, on both sides. When on, a DM that **quote-replies** to a message
+some Claude session sent goes straight to that session instead of to the hub
+(the conversation scope `telegram-dm-<user id>`). The session sees it as an
+ordinary `<channel source="telegram">` message. In every other case the message
+is routed exactly as before.
+
+**How a reply is routed.** After the existing interceptions (`/reauth`
+`/authcode`, then approval buttons and reject-comment replies), the poller goes
+direct only when all of these hold; otherwise it routes as before:
+
+- a new message (not an edit, not a button press) in a private chat, from a
+  sender in `access.json` `allowFrom`, not starting with `/` (commands stay
+  with the hub);
+- it quote-replies to a message this bot sent, and that message's `message_id`
+  is in the message map with a `session_id`. An entry that also records
+  `chat_id` must match the chat (Telegram numbers messages per chat);
+- that session's scope is subscribed right now and the write succeeds.
+
+The poller never starts a session for this: an offline session means the hub
+gets the message, and waking sessions stays the hub's job.
+
+**Which sessions subscribe.** A server started with neither `AGENT_SCOPE` nor
+`TELEGRAM_STATE_DIR` in its environment — which is how `claude --bg` and
+`claude respawn` always start it — reads the pointer file below. When it is on,
+the server uses the pointer's state dir (bot token, `access.json`, poller port
+from its `.env`) and subscribes as `telegram-dm-s<session id, 32 hex>`, but only
+once it is certain the session shows channel messages: its own claude process
+was started with `--channels plugin:telegram@<marketplace>`, read from that
+process's argv, or — only when that process is a `claude --bg` spare
+(`claude bg-spare --bg-spare …`), whose argv never shows the session's flags —
+from Claude Code's job record for this session. A foreground process without
+the flag is never rescued by an old job record. If that cannot be told, it does
+not subscribe (a session without `--channels` would
+ack every message and drop it silently). The hub and every carrier scope set
+`AGENT_SCOPE`, so they never read the pointer and behave exactly as before.
+
+In this mode the server does not declare the permission relay
+(`claude/channel/permission`), skips the pairing confirmation and the startup
+notice (the hub's server does those), does not treat `yes xxxxx` / `no xxxxx`
+texts as permission answers, and adds instructions asking the session to start
+each reply to a message that carries `session_name` with `[回報] <session_name>: `
+(or `[等你回覆] ...` when it needs an answer); every inbound tag carries
+`session_name`, read fresh from the session's record.
+
+Until that check passes — and for good when it fails — `reply`, `react`,
+`edit_message` and `download_attachment` answer with an error
+(`session-direct 未啟用 (<reason>)`) and touch nothing in Telegram. A session that
+cannot be reached cannot send either, which is where such sessions stood before
+this mode existed (they found no bot token and the server exited).
+
+Each message the session sends through `reply` (every chunk and attachment;
+`edit_message` adds nothing) is appended to the message map in tg-send's line
+format, `{message_id, session_id, session_name, sent_at}`, plus the `chat_id`
+it went to, so a reply to it
+comes back to the same session. A failed write is logged and never fails the
+reply. The hub's own replies are not recorded, so replies to them stay with the
+hub. When the same `message_id` appears more than once, the last valid line wins.
+
+| Setting | Read by | Meaning |
+| --- | --- | --- |
+| `TELEGRAM_SESSION_DIRECT` | `poller.ts` (environment or `$TELEGRAM_STATE_DIR/.env`) | `1` / `true` turns routing on. Off also refuses every `telegram-dm-s…` subscription (HTTP 503), so a session configured on its own takes no slots. Startup prints `telegram poller: session-direct on (map <path>)\|off (<reason>)`. |
+| `TELEGRAM_MESSAGE_MAP_FILE` | `poller.ts`, and `server.ts` in session-direct mode (from the pointer's `<stateDir>/.env`) | Absolute path of the message map (JSON Lines `{message_id, session_id, ...}`, optional `chat_id`). Required when the switch is on; no default. Put it in the state dir's `.env` so both processes read the same value: a background session never sees the poller's launch environment. The poller reads it incrementally (only bytes appended since the last lookup); malformed lines, including valid JSON without `message_id` / `session_id`, are skipped. |
+| `~/.claude/channels/telegram-session-direct.json` | `server.ts` | `{"enabled": true, "stateDir": "<absolute path>"}`. A file, not an env var, because background and respawned sessions do not get the launch environment. Missing, invalid, or `enabled` not `true` = off. |
+
+**Slots.** Session scopes do not count toward `MAX_SCOPES` when the poller
+decides whether to start a session, so they can never lock the hub out. A new
+session scope may subscribe only while the live total stays under `MAX_SCOPES`;
+over it the poller answers 503, the session retries with backoff, and replies to
+it reach the hub meanwhile.
+
+Limits: the pointer and the "can show channel" check read Claude Code's own
+files (`~/.claude/sessions/<pid>.json`, `~/.claude/jobs/*/state.json`), which are
+not a public interface; if they change, sessions stop subscribing and replies go
+to the hub. With the pointer on, every session started without `AGENT_SCOPE` /
+`TELEGRAM_STATE_DIR` loads the hub's bot token (today such a session finds none
+and its server exits); its Telegram tools stay refused unless the check above
+passes. None of these servers ever calls `getUpdates` — inbound only arrives
+through the poller subscription. The message map is trusted as written by any
+local process, the same boundary as the rest of this plugin. Truncating the map
+in place (copytruncate-style) is not supported: the poller would miss lines;
+clear or rotate it by replacing the file. A session started by hand without
+`--channels` stays on the hub; add `--channels plugin:telegram@<marketplace>` to
+opt in.
+
 ## Approval requests over inline buttons (loopback interface)
 
 Off by default. When the poller has `TELEGRAM_APPROVAL_BUTTONS` set to `1` or
@@ -162,7 +248,7 @@ request body are ignored.
 | `TELEGRAM_APPROVAL_TIMEOUT_SECONDS` | `86400` | How long a request waits for a button when the create call names no `timeout_seconds`. |
 | `TELEGRAM_APPROVAL_COMMENT_TIMEOUT_SECONDS` | `300` | How long a "reject" waits for a written comment when the create call names no `comment_timeout_seconds`. |
 | `TELEGRAM_POLLER_PORT` | `7852` | Existing variable; the interface lives on the poller's port. |
-| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL, used to point the poller at a local fake. **Only a loopback host is accepted** (`127.0.0.1`, `localhost`, `[::1]`; `http` or `https`; no credentials in the URL; a trailing `/` is dropped), so the bot token cannot leave the machine through it. An accepted value prints `WARNING TELEGRAM_API_ROOT is set` on stderr at startup. Any other value — another host, an unparsable URL — is ignored: the poller prints `TELEGRAM_API_ROOT ignored (<reason>)` (never the value itself) and talks to Telegram's servers as usual. Independent of `TELEGRAM_APPROVAL_BUTTONS`. |
+| `TELEGRAM_API_ROOT` | unset | Test hook: Bot API base URL, used to point the poller at a local fake. **Only a loopback host is accepted** (`127.0.0.1`, `localhost`, `[::1]`; `http` or `https`; no credentials in the URL; a trailing `/` is dropped), so the bot token cannot leave the machine through it. An accepted value prints `WARNING TELEGRAM_API_ROOT is set` on stderr at startup. Any other value — another host, an unparsable URL — is ignored: the poller prints `TELEGRAM_API_ROOT ignored (<reason>)` (never the value itself) and talks to Telegram's servers as usual. Independent of `TELEGRAM_APPROVAL_BUTTONS`. `server.ts` honours the same variable with the same rules (from its environment or state `.env`), so its tests can run without Telegram. |
 
 Both timeouts accept fractions and must be above 0 and at most 604800 (7 days);
 an unusable value falls back to the default with a warning on stderr.

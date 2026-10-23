@@ -29,6 +29,11 @@ export type RouteContext = {
   botInfo?: unknown
   /** Injectable for tests; production uses setTimeout. */
   setTimer?: (fn: () => void, ms: number) => void
+  /**
+   * Session-direct routing (JP-380): the session scope this update should go
+   * straight to, or undefined for the normal route. Unset = feature off.
+   */
+  resolveDirectScope?: (update: Update) => string | undefined
 }
 
 type ChatLike = { id: number; type: string }
@@ -119,12 +124,63 @@ async function abandonScope(
   await ctx.notify(chatId, textForOutcome(outcome))
 }
 
+/** Wrap an update for one scope's subscription. */
+function buildEnvelope(scopeId: string, update: Update, ctx: RouteContext): InboundEnvelope {
+  return {
+    envelopeId: randomUUID(),
+    scopeId,
+    platform: PLATFORM,
+    payload: update,
+    ts: Date.now(),
+    botInfo: ctx.botInfo,
+  }
+}
+
+/**
+ * Hand an update straight to the session scope it replies to, when that scope
+ * is online right now.
+ *
+ * Never queues and never spawns: a session-direct scope is a live Claude
+ * session the user started, not one the poller can bring up, so anything short
+ * of a live connection returns false and the caller routes the update exactly
+ * as before — to the hub.
+ *
+ * @param update - Raw Telegram update.
+ * @param ctx - Injected collaborators.
+ * @returns true when the update was written to the session's subscription.
+ */
+function deliverDirect(update: Update, ctx: RouteContext): boolean {
+  let scopeId: string | undefined
+  try {
+    scopeId = ctx.resolveDirectScope?.(update)
+  } catch (err) {
+    // A lookup failure must cost the direct route, never the update itself.
+    process.stderr.write(`telegram poller: session-direct lookup failed for update ${update.update_id}: ${err}\n`)
+    return false
+  }
+  if (!scopeId) return false
+  if (ctx.registry.state(scopeId) !== 'connected') {
+    process.stderr.write(`telegram poller: session-direct ${scopeId} offline, routing update ${update.update_id} as usual\n`)
+    return false
+  }
+  if (!ctx.deliver(scopeId, [buildEnvelope(scopeId, update, ctx)])) {
+    ctx.registry.onDisconnected(scopeId)
+    process.stderr.write(`telegram poller: session-direct ${scopeId} delivery failed, routing update ${update.update_id} as usual\n`)
+    return false
+  }
+  process.stderr.write(`telegram poller: session-direct update ${update.update_id} delivered to ${scopeId}\n`)
+  return true
+}
+
 /**
  * Route one raw update to its scope, spawning that scope if it does not exist.
  *
  * Deliberately does NOT apply the access policy: dmPolicy / allowFrom /
  * requireMention / pairing all stay in server.ts's gate(). A partial copy here
  * would mean two independent verdicts on the same message.
+ *
+ * A quote-reply that ctx.resolveDirectScope maps to an online session scope
+ * goes there instead (JP-380); in every other case the route is unchanged.
  *
  * Expected failures (no scope, spawn refused, delivery race) are handled and
  * reported inside; a throw out of this function means the update was NOT
@@ -142,15 +198,10 @@ export async function routeUpdate(update: Update, ctx: RouteContext): Promise<vo
     return
   }
 
+  if (deliverDirect(update, ctx)) return
+
   const scopeId = buildScopeId(PLATFORM, target.kind, target.anchorId)
-  const envelope: InboundEnvelope = {
-    envelopeId: randomUUID(),
-    scopeId,
-    platform: PLATFORM,
-    payload: update,
-    ts: Date.now(),
-    botInfo: ctx.botInfo,
-  }
+  const envelope = buildEnvelope(scopeId, update, ctx)
 
   const decision = ctx.registry.admit(scopeId, envelope)
 

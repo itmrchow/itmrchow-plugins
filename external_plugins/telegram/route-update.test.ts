@@ -501,3 +501,78 @@ test('poller 放行新聊天室但 spawn 回報容量已滿（exit 2）：沿用
   expect(h.spawned).toEqual(['telegram-dm-333'])
   expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
 })
+
+// --- JP-380 session-direct --------------------------------------------------
+
+const SESSION_SCOPE = 'telegram-dm-sce12d2022bf14502bef08967233bd2d9'
+
+function directHarness(opts: { deliverOk?: (scopeId: string) => boolean; direct?: string | undefined | Error } = {}) {
+  const h = harness()
+  const deliveredTo: string[] = []
+  h.ctx.deliver = (scopeId, envelopes) => {
+    if (opts.deliverOk && !opts.deliverOk(scopeId)) return false
+    deliveredTo.push(scopeId)
+    h.delivered.push(...envelopes)
+    return true
+  }
+  h.ctx.resolveDirectScope = () => {
+    if (opts.direct instanceof Error) throw opts.direct
+    return 'direct' in opts ? opts.direct : SESSION_SCOPE
+  }
+  return { ...h, deliveredTo }
+}
+
+test('直送：專屬 scope 在線 -> 只投遞給它，中控收不到、不 spawn', async () => {
+  const h = directHarness()
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onSubscribed(SESSION_SCOPE)
+  await routeUpdate(privateUpdate(1), h.ctx)
+  expect(h.deliveredTo).toEqual([SESSION_SCOPE])
+  expect(h.delivered[0].scopeId).toBe(SESSION_SCOPE)
+  expect(h.spawned).toEqual([])
+})
+
+test('回落：專屬 scope 不在線（未知 / 斷線）-> 照現行走中控，且不替它 spawn', async () => {
+  for (const setup of ['unknown', 'disconnected'] as const) {
+    const h = directHarness()
+    h.ctx.registry.onSubscribed('telegram-dm-555')
+    if (setup === 'disconnected') {
+      h.ctx.registry.onSubscribed(SESSION_SCOPE)
+      h.ctx.registry.onDisconnected(SESSION_SCOPE)
+    }
+    await routeUpdate(privateUpdate(1), h.ctx)
+    expect(h.deliveredTo).toEqual(['telegram-dm-555'])
+    expect(h.spawned).toEqual([])
+    expect(h.ctx.registry.state(SESSION_SCOPE)).toBe(setup === 'unknown' ? undefined : 'disconnected')
+  }
+})
+
+test('回落：專屬 scope 投遞失敗 -> 標斷線、改走中控', async () => {
+  const h = directHarness({ deliverOk: scopeId => scopeId !== SESSION_SCOPE })
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onSubscribed(SESSION_SCOPE)
+  await routeUpdate(privateUpdate(1), h.ctx)
+  expect(h.deliveredTo).toEqual(['telegram-dm-555'])
+  expect(h.ctx.registry.state(SESSION_SCOPE)).toBe('disconnected')
+})
+
+test('回落：查不到對照 -> 照現行（中控不在線就照常 spawn 中控）', async () => {
+  const h = directHarness({ direct: undefined })
+  await routeUpdate(privateUpdate(1), h.ctx)
+  expect(h.spawned).toEqual(['telegram-dm-555'])
+})
+
+test('回落：查表丟例外 -> 不影響這則訊息，照現行走中控', async () => {
+  const h = directHarness({ direct: new Error('boom') })
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  await routeUpdate(privateUpdate(1), h.ctx)
+  expect(h.deliveredTo).toEqual(['telegram-dm-555'])
+})
+
+test('未設 resolveDirectScope（開關關）時行為與原本相同', async () => {
+  const h = harness()
+  h.ctx.registry.onSubscribed('telegram-dm-555')
+  h.ctx.registry.onSubscribed(SESSION_SCOPE)
+  await routeUpdate(privateUpdate(1), h.ctx)
+  expect(h.delivered.map(e => e.scopeId)).toEqual(['telegram-dm-555'])
+})

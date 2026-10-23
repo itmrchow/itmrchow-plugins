@@ -39,12 +39,16 @@ export type SubscribeHub = {
  * them would let a caller mark a scope connected while no socket exists.
  *
  * @param opts.registry - Shared dispatch state machine.
+ * @param opts.authorize - Admission check run on every subscription to a valid
+ *   scope-id; false answers 503 and touches nothing, so the subscriber backs
+ *   off and retries. Defaults to admitting every valid scope.
  * @param opts.onSubscribe - Observability hook, called after the scope is live.
  * @param opts.onDisconnect - Observability hook, called after cleanup.
  * @returns The hub. The caller is responsible for calling listen().
  */
 export function createSubscribeServer(opts: {
   registry: ScopeRegistry
+  authorize?: (scopeId: string) => boolean
   onSubscribe?: (scopeId: string) => void
   onDisconnect?: (scopeId: string) => void
 }): SubscribeHub {
@@ -74,6 +78,13 @@ export function createSubscribeServer(opts: {
     if (!isValidScopeId(scopeId)) {
       res.writeHead(400)
       res.end('invalid scope')
+      return
+    }
+    // Before any registry call: a refused subscriber must leave no entry behind
+    // and must not take over a live connection under the same scope.
+    if (opts.authorize && !opts.authorize(scopeId)) {
+      res.writeHead(503)
+      res.end('scope refused')
       return
     }
     res.writeHead(200, {
