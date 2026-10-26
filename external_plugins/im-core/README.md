@@ -86,13 +86,14 @@ export IM_CORE_DIR="$(jq -r --arg key "im-core@itmrchow-plugins" '
 ```bash
 export AGENT_SCOPES_DIR="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}"
 export IM_SEND_BIN="$IM_CORE_DIR/scripts/im-send.sh"
+export IM_TMUX_LIB="$REPO_ROOT/scripts/lib-scope-tmux.sh"   # carrier 自己的 tmux lib，完整路徑（/clear、/resume 用）
 source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || {
   echo "im-core lib 載入失敗，見上方訊息" >&2
   exit 1
 }
 ```
 
-必填變數見上面的環境變數契約表。**三種變數由三個不同的關卡守，不是全部由 loader 守**：
+必填變數見上面的環境變數契約表。**四種變數由四個不同的關卡守，不是全部由 loader 守**：
 
 | 變數 | 誰在擋 | 何時擋 | 訊息長相 |
 |---|---|---|---|
