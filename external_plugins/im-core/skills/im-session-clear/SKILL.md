@@ -22,19 +22,35 @@ source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || exit 1
 
 SEND="$IM_SEND_BIN"
 SCOPE="$AGENT_SCOPE"
-NEW_ID="$(scope_new_uuid)"
 
-# 寫失敗就停在這裡：底下的 /exit 照送的話，agent 會重啟回原本那個 session。
+# tmux 函式住在宿主的 lib，由 IM_TMUX_LIB 定址；缺值或載不起來就回報失敗並停下。
+if ! ( : "${IM_TMUX_LIB:?IM_TMUX_LIB not set — launcher 未匯出，應指向 carrier 的 scripts/lib-scope-tmux.sh}" ) \
+   || ! source "$IM_TMUX_LIB"; then
+  "$SEND" "<SRC>" "<CID>" "切換失敗：IM_TMUX_LIB 未設定或載入失敗，請聯絡管理員"
+  exit 0
+fi
+
+# 先取得 window；取不到就停在這裡，intent 一個字都還沒寫。
+if ! TARGET="$(scope_tmux_target "$SCOPE")" || [ -z "$TARGET" ]; then
+  "$SEND" "<SRC>" "<CID>" "切換失敗，請稍後再試或聯絡管理員"
+  exit 0
+fi
+
+NEW_ID="$(scope_new_uuid)"
 if ! im_write_intent "$SCOPE" new-session "$NEW_ID"; then
   "$SEND" "<SRC>" "<CID>" "切換失敗，請稍後再試或聯絡管理員"
   exit 0
 fi
 
-# 背景送確認：/exit 之後本 skill 不再執行，確認只能由背景進程送。
-# 一定要排在上面那個失敗檢查之後 —— 先發的話，失敗時使用者會收到「已開始新的對話」。
-( sleep 3 && "$SEND" "<SRC>" "<CID>" "已開始新的對話，先前的內容仍可用 /resume 找回" >/dev/null 2>&1 ) &
+# /exit 送不出去就撤回剛寫的 intent，讓下次重啟維持原本的 session。
+if ! tmux send-keys -t "$TARGET" "/exit" Enter; then
+  rm -f "$(scope_intent_file "$SCOPE" new-session)"
+  "$SEND" "<SRC>" "<CID>" "切換失敗，請稍後再試或聯絡管理員"
+  exit 0
+fi
 
-tmux send-keys -t "$(scope_tmux_target "$SCOPE")" "/exit" Enter
+# /exit 已送出，確認交給背景進程送（本 skill 在 /exit 後不再執行）。
+( sleep 3 && "$SEND" "<SRC>" "<CID>" "已開始新的對話，先前的內容仍可用 /resume 找回" >/dev/null 2>&1 ) &
 ```
 
 `<SRC>` / `<CID>` 換成入站 `<channel>` tag 的實際值。
@@ -49,7 +65,16 @@ tmux send-keys -t "$(scope_tmux_target "$SCOPE")" "/exit" Enter
   `/resume` 同一套寫法。**不要**退回 session 名（例如 `${TMUX_TARGET:-claude-tg-agent}`
   這種 fallback）：`send-keys` 對 session 名會送到當下的 active window，也就是可能打斷
   另一個 scope。未知 scope 時 `scope_tmux_target` 回非 0，寧可中止也不要打錯 window。
-- **`im_write_intent` 失敗就停**，而且背景確認訊息要排在檢查之後：順序寫反的話，使用者
-  會收到「已開始新的對話」但實際上還在原本那個。
+- 執行順序固定如下，任一步失敗就回報「切換失敗…」並停下（`IM_TMUX_LIB` 那一步的訊息點名該變數，因為重試無效、要管理員修宿主設定）：
+  - [ ] source `$IM_TMUX_LIB`（宿主 launcher 匯出，值是 carrier 的 `scripts/lib-scope-tmux.sh`
+        完整路徑）
+  - [ ] 以 `scope_tmux_target` 取得 window（回非 0 或空字串都算失敗）
+  - [ ] `im_write_intent` 寫 `new-session` intent
+  - [ ] `tmux send-keys` 送 `/exit`；回非 0 時先刪掉剛寫的 intent（`scope_intent_file` 給路徑）
+  - [ ] 送出成功後才由背景進程發「已開始新的對話」
+  這個順序讓 intent 只在 `/exit` 確實送出時留下，確認訊息也只在送出成功後才發；曾發生
+  `/exit` 沒送出、intent 卻已寫入、使用者照樣收到「已開始新的對話」的誤報。
+- `scope_tmux_target` 一律來自 `$IM_TMUX_LIB`：window 怎麼命名是宿主的知識，plugin 端
+  只負責 source 宿主給的那份 lib。
 - `/exit` 送出後 context 立即消失，後續步驟不會執行 —— 任何要回覆的話都得在這之前發出，
   或交給背景進程。

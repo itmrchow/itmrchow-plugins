@@ -22,7 +22,11 @@ source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || exit 1
 是否設好 `AGENT_SCOPES_DIR`。不要直接 source 個別 lib —— 下次新增一支 lib 時，直接
 source 的那份會靜默漏載。載入失敗一定 `|| exit 1`，不要吞掉。
 
-（`IM_LIB_DIR` 已於 JP-203 退場：lib 現在住在 im-core 內，im-core 不再需要 carrier repo。）
+（`IM_LIB_DIR` 已退場：shell lib 現在住在 im-core 內；唯一還向宿主借的是 tmux 函式，經 `IM_TMUX_LIB` 取得，見下段。）
+
+`/clear` 與 `/resume`（第二輪）另外要送 `/exit` 到 scope 的 tmux window，tmux 函式
+（`scope_tmux_target`）由宿主提供：載入 lib 之後 source `$IM_TMUX_LIB`（宿主 launcher 匯出，
+值是 carrier 的 `scripts/lib-scope-tmux.sh` 完整路徑），寫法見這兩個 skill 的 bash 區塊。
 
 ## 1. 從入站訊息取得的欄位
 

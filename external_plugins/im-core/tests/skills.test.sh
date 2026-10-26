@@ -61,4 +61,14 @@ else
   bad "skill builds the transcripts path itself:"$'\n'"$out"
 fi
 
+# --- 5. no skill builds a tmux target itself ---
+# window 怎麼命名是宿主的知識：skill 只用宿主經 IM_TMUX_LIB 給的 scope_tmux_target。
+# 在 skill 裡用 TMUX_SESSION 自己拼 target，宿主改了命名方式時 /exit 會靜默送錯 window。
+out="$(grep -rn 'TMUX_SESSION' "$SKILLS")"
+if [ -z "$out" ]; then
+  ok "no skill builds a tmux target from TMUX_SESSION"
+else
+  bad "skill builds a tmux target itself:"$'\n'"$out"
+fi
+
 exit $fail

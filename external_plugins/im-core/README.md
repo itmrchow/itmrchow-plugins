@@ -19,6 +19,7 @@
 | `skills/im-session-rename/` | `/rename <name>`，替當前 session 命名 |
 | `skills/im-session-resume/` | `/resume`，列出可切換的對話並切過去 |
 | `tests/skills.test.sh` | skill 內容的靜態衛生測試（見下） |
+| `tests/session-skills.bats` | 從 `/clear`、`/resume` 的 SKILL.md 取出 bash 區塊，在只載 plugin lib 的環境實跑 |
 | `scripts/lib/lib-loader.sh` | 全部 shell lib 的單一入口，驗環境契約後依 manifest 載入 |
 | `scripts/lib/manifest.txt` | 載入清單唯一真相來源（loader 與宿主 preflight 共讀） |
 | `scripts/lib/{scope,im,channels,spawn-contract}.sh` | scope 值域 / 六指令判定 / channel 值域 / spawn exit code 契約 |
@@ -39,6 +40,7 @@
 | `IM_SEND_BIN` | 宿主 | 是 | `$IM_CORE_DIR/scripts/im-send.sh` |
 | `AGENT_SCOPES_DIR` | 宿主 | 是 | pointer / ledger / intent / admins 四種檔案的根。**本 plugin 刻意不給預設值** |
 | `AGENT_SCOPE` | 宿主 | 是（agent 內） | 本進程服務的 scope-id。由 `scope_resolve` 在呼叫時驗，不由 loader 驗 —— 見下方 §3 的守衛對照表 |
+| `IM_TMUX_LIB` | 宿主 | 是（`/clear`、`/resume` 用） | carrier 的 `scripts/lib-scope-tmux.sh` 完整路徑。兩個 skill 由此取得 `scope_tmux_target`；window 怎麼命名屬於宿主，plugin 只 source 這份 lib。未設或載不起來時 skill 回報「切換失敗：IM_TMUX_LIB 未設定或載入失敗，請聯絡管理員」並中止，不寫 intent |
 | `AGENT_WORKSPACE_DIR` | 宿主 | 強烈建議 | transcripts 目錄的來源。未設時退回 `$PWD`，而 `$PWD` 不對就等於「沒有任何對話」 |
 | `CHANNELS` / `CHANNEL` | 宿主 | 呼叫 `channels_resolve` 時 | 本機跑哪些 channel。兩者皆未設時 `channels_resolve` 回非 0 |
 | `BOOTSTRAP_SCOPE` / `BOOTSTRAP_EXTRA_CHANNELS` | 宿主 | 否 | 綁定 box-wide port 的 channel 由哪個 scope 承載 |
@@ -52,7 +54,7 @@ lib 尋址與 im-send 位置是兩件事，綁在一起的話任一邊搬家都�
 
 ## 宿主接入步驟（新 carrier / 新機器照這份做）
 
-im-core 現在**不需要 carrier repo**：shell lib 住在本 plugin 內。宿主要做的只有四件事。
+im-core 的 shell lib 住在本 plugin 內；唯一向宿主借的是 tmux 函式（`/clear`、`/resume` 經 `IM_TMUX_LIB` source carrier 的 `scripts/lib-scope-tmux.sh`）。宿主要做的只有四件事。
 
 ### 1. 安裝並 pin 版本
 
@@ -84,18 +86,20 @@ export IM_CORE_DIR="$(jq -r --arg key "im-core@itmrchow-plugins" '
 ```bash
 export AGENT_SCOPES_DIR="${AGENT_SCOPES_DIR:-$HOME/.claude/agent-scopes}"
 export IM_SEND_BIN="$IM_CORE_DIR/scripts/im-send.sh"
+export IM_TMUX_LIB="$REPO_ROOT/scripts/lib-scope-tmux.sh"   # carrier 自己的 tmux lib，完整路徑（/clear、/resume 用）
 source "$IM_CORE_DIR/scripts/lib/lib-loader.sh" || {
   echo "im-core lib 載入失敗，見上方訊息" >&2
   exit 1
 }
 ```
 
-必填變數見上面的環境變數契約表。**三種變數由三個不同的關卡守，不是全部由 loader 守**：
+必填變數見上面的環境變數契約表。**四種變數由四個不同的關卡守，不是全部由 loader 守**：
 
 | 變數 | 誰在擋 | 何時擋 | 訊息長相 |
 |---|---|---|---|
 | `AGENT_SCOPES_DIR` | `im_core_load`（本檔的 loader） | source loader 當下 | `[im-core/lib-loader] AGENT_SCOPES_DIR 未設 —— ...` |
 | `IM_CORE_DIR` / `IM_SEND_BIN` | 各 skill preamble 的 `: "${VAR:?...}"` | skill 執行第一行 | `IM_CORE_DIR not set — launcher 未匯出...` |
+| `IM_TMUX_LIB` | `/clear`、`/resume` skill 的 tmux 段 | 寫 intent 之前 | stderr `IM_TMUX_LIB not set — launcher 未匯出...`，IM 回「切換失敗：IM_TMUX_LIB 未設定或載入失敗，請聯絡管理員」 |
 | `AGENT_SCOPE` | `scope_resolve`（`scripts/lib/scope.sh`） | 呼叫它的時候（launcher 開機即呼叫） | `[lib-scope] AGENT_SCOPE is not set (expected shape: ...)` |
 
 `AGENT_SCOPE` 刻意**不**進 loader：`setup.sh` 這類部署腳本會 source 同一批 lib，但執行時根本
@@ -133,6 +137,7 @@ done < <(grep -v '^[[:space:]]*#' "$CANDIDATE/scripts/lib/manifest.txt" | grep -
 | `[im-core/lib-loader] AGENT_SCOPES_DIR 未設 ...` | 宿主沒 export 這個變數 | 照 §3 補上；本 plugin 刻意不給預設值 |
 | `[im-core/lib-loader] manifest 列出的 lib 缺檔：...` | 安裝不完整，或 manifest 與實際檔案漂移 | 重跑 `claude plugin update im-core@itmrchow-plugins`；仍缺就是該版本壞了，照下方退版 |
 | skill 回報 `IM_CORE_DIR not set — launcher 未匯出` | §2 的賦值漏了 `export` | 見 §2；只賦值不 export 時 launcher 自己會過、agent 內每個指令都會掛 |
+| `/clear`、`/resume` 回「切換失敗：IM_TMUX_LIB 未設定或載入失敗」 | 宿主 launcher 沒 export `IM_TMUX_LIB`，或路徑不是 carrier 的 `scripts/lib-scope-tmux.sh` | launcher 匯出 `IM_TMUX_LIB="$REPO_ROOT/scripts/lib-scope-tmux.sh"` 後重啟；部署時 carrier 先於 plugin 更新 |
 | `/resume` 找不到任何東西、pointer / ledger 都是空的 | `AGENT_SCOPES_DIR` 指到打錯字的路徑 | loader 只驗非空、不驗路徑是否是你想的那個（那是宿主的設定責任）。用 `ls "$AGENT_SCOPES_DIR"` 對一次 |
 
 ### 退版（pin 回舊版）
@@ -261,6 +266,7 @@ poller unit **不得**加 `NoNewPrivileges=yes`（driver 需要 `sudo -n systemc
 bash scripts/im-send.test.sh    # im-send dry-run 單元測試（不打網路；curl 以 stub 驗逾時參數）
 bash tests/skills.test.sh       # skill 內容靜態衛生測試
 bash tests/lib-loader.test.sh   # loader 契約
+bats tests/session-skills.bats  # /clear、/resume 的 bash 區塊實跑（tmux / im-send 以 stub 替換）
 bash tests/parity.test.sh       # shell 與 TS 的契約 parity（需 sibling plugin 在場）
 bats tests/                     # lib 的行為測試（scope / im / channels）與重新驗證執行器（reauth-*，flow 需 tmux）
 ```
