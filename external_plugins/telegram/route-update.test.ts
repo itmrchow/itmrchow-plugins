@@ -502,7 +502,7 @@ test('poller 放行新聊天室但 spawn 回報容量已滿（exit 2）：沿用
   expect(h.notified).toEqual([{ chatId: 333, text: CAP_TEXT }])
 })
 
-// --- JP-380 session-direct --------------------------------------------------
+// --- session-direct ---------------------------------------------------------
 
 const SESSION_SCOPE = 'telegram-dm-sce12d2022bf14502bef08967233bd2d9'
 

@@ -1,22 +1,20 @@
 /**
- * The message -> session map (JP-380).
+ * The message -> session map.
  *
  * The file is JSON Lines, one object per sent message:
  * `{message_id, session_id, session_name, sent_at}` and optionally `chat_id`.
  * Two kinds of writer append to it: the carrier's tg-send, and a session-direct
  * server's reply tool (appendMessageMapEntries below). The poller only reads.
  *
- * The file is append-only and never rotated, so a full re-read per lookup
- * would grow without bound; instead the reader keeps what it parsed and on each
- * lookup reads only the bytes appended since — a full reload happens only when
- * the file shrank or was replaced. When a message_id appears more than once,
- * the last valid line wins, the same as the carrier's find-session.
+ * The reader keeps what it parsed and on each lookup reads only the bytes
+ * appended since; a full reload happens only when the file shrank or was
+ * replaced. When a message_id appears more than once, the last valid line wins.
  *
  * Truncating the file in place and letting it grow back past the read offset
  * (copytruncate-style rotation) is NOT detected: clear or rotate it by
  * replacing the file (a new inode) instead.
  *
- * Any read failure reads as "not found", which sends the reply to the hub as before.
+ * Any read failure reads as "not found".
  */
 import { appendFileSync, closeSync, openSync, readSync, statSync } from 'node:fs'
 

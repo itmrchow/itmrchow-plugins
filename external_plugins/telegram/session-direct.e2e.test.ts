@@ -1,5 +1,5 @@
 /**
- * Black-box tests for session-direct routing (JP-380): the REAL poller process,
+ * Black-box tests for session-direct routing: the REAL poller process,
  * a fake Telegram Bot API, and SSE subscribers standing in for the hub and a
  * task session — nothing in-process.
  */

@@ -1,16 +1,12 @@
 /**
- * Session-direct routing, poller side (JP-380): a DM that quote-replies to a
- * bot message goes straight to the Claude session that message came from,
- * instead of through the hub.
+ * Session-direct routing, poller side: a DM that quote-replies to a bot message
+ * goes straight to the Claude session that message came from, instead of
+ * through the hub.
  *
  * Everything here only ever narrows: whenever a step cannot be decided — no
  * reply, an unknown message, a session that is not online — the caller routes
- * the update exactly as it did before this module existed. The poller never
- * spawns a session-direct scope.
- *
- * Split out of poller.ts for the same reason as the other small modules here:
- * poller.ts exits at import time when half-configured, so it cannot be imported
- * by a test.
+ * the update through the normal route. The poller never spawns a
+ * session-direct scope.
  */
 import type { Update } from 'grammy/types'
 import { isAbsolute } from 'node:path'

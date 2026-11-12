@@ -80,8 +80,7 @@ export function createSubscribeServer(opts: {
       res.end('invalid scope')
       return
     }
-    // Before any registry call: a refused subscriber must leave no entry behind
-    // and must not take over a live connection under the same scope.
+    // Refuse before any registry call.
     if (opts.authorize && !opts.authorize(scopeId)) {
       res.writeHead(503)
       res.end('scope refused')

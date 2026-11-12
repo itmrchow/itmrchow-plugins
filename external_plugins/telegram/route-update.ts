@@ -30,7 +30,7 @@ export type RouteContext = {
   /** Injectable for tests; production uses setTimeout. */
   setTimer?: (fn: () => void, ms: number) => void
   /**
-   * Session-direct routing (JP-380): the session scope this update should go
+   * Session-direct routing: the session scope this update should go
    * straight to, or undefined for the normal route. Unset = feature off.
    */
   resolveDirectScope?: (update: Update) => string | undefined

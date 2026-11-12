@@ -1,5 +1,5 @@
 /**
- * Black-box tests for session-direct mode on the server side (JP-380): the REAL
+ * Black-box tests for session-direct mode on the server side: the REAL
  * server.ts process, driven over MCP stdio like Claude Code drives it, against
  * an in-test subscription hub and a fake Telegram Bot API.
  *

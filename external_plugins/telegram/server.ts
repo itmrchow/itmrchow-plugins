@@ -89,12 +89,7 @@ setDefaultResultOrder('ipv4first')
 // measured the same as `curl -4` on that host. (JP-193)
 setDefaultAutoSelectFamily(false)
 
-// Session-direct mode (JP-380): a plain session — launched with neither
-// AGENT_SCOPE nor TELEGRAM_STATE_DIR, which is how `claude --bg` and
-// `claude respawn` always start it — reads a pointer file at a fixed path to
-// find the hub's state dir and subscribe under its own scope. Decided from the
-// env as launched, before the state .env load below, so nothing in a state
-// .env can switch the hub or a carrier scope into it.
+// Session-direct mode: resolved from the launch env and a fixed-path pointer file, before the state .env load.
 const SESSION_DIRECT = resolveSessionDirectPointer(
   process.env,
   join(homedir(), '.claude', 'channels', SESSION_DIRECT_POINTER_NAME),
@@ -160,9 +155,7 @@ const POLLER_HOST = '127.0.0.1'
 // Which conversation this process serves — set by the carrier's launcher. It is
 // the subscription key, so a wrong or missing value means this process receives
 // nothing at all; validate loudly rather than subscribing to garbage.
-// Never taken in session-direct mode, not even from the state .env: that .env
-// is the hub's, and a session subscribing as the hub's scope would take the
-// hub's messages away from it.
+// Always empty in session-direct mode, even when the state .env sets it.
 const AGENT_SCOPE = SESSION_DIRECT_ON ? '' : process.env.AGENT_SCOPE ?? ''
 
 // Session-direct mode only: this session's own claude process, once the probe
@@ -170,15 +163,10 @@ const AGENT_SCOPE = SESSION_DIRECT_ON ? '' : process.env.AGENT_SCOPE ?? ''
 // session name carried on every inbound message.
 let sessionClaudePid: number | undefined
 // Session-direct mode only: why the tools are refused, until the probe passes.
-// A session that cannot show channel messages gets no Telegram tools at all —
-// the same as before this mode existed, when such a session found no token.
 let sessionDirectRefusal: string | undefined = SESSION_DIRECT_ON ? 'channel check has not finished' : undefined
 // The scope this process actually subscribed under, for log lines.
 let subscribedScope = AGENT_SCOPE
-// Session-direct mode only: where the reply tool records what it sent, so the
-// user's reply to it comes back here. The same setting the poller reads,
-// taken from the state .env (the launch env is not available to a background
-// session). Unset = nothing recorded; replies to those messages reach the hub.
+// Session-direct mode only: the message map file the reply tool appends to; unset = nothing recorded.
 const MESSAGE_MAP_FILE = SESSION_DIRECT_ON ? resolveMessageMapFile(process.env) : undefined
 if (SESSION_DIRECT_ON && !MESSAGE_MAP_FILE) {
   process.stderr.write(`telegram channel: session-direct not recording sent messages (${MESSAGE_MAP_FILE_ENV} unset or not an absolute path in ${STATE_DIR}/.env)\n`)
@@ -207,10 +195,7 @@ process.on('uncaughtException', err => {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-// Test hook, the same one the poller has: point the Bot API client at a local
-// fake so the black-box tests can run this process without Telegram. Loopback
-// hosts only, so the token cannot leave the machine through it (see
-// resolveApiRoot); loud when set, so it is never mistaken for production.
+// Test hook: point the Bot API client at a loopback fake (see resolveApiRoot).
 const API_ROOT_RESOLUTION = resolveApiRoot(process.env[API_ROOT_ENV])
 if (API_ROOT_RESOLUTION.kind === 'ignored') {
   process.stderr.write(`telegram channel: ${API_ROOT_ENV} ignored (${API_ROOT_RESOLUTION.reason}); using Telegram's Bot API servers\n`)
@@ -537,9 +522,7 @@ function checkApprovals(): void {
   }
 }
 
-// Not in session-direct mode: the hub's server owns these one-per-bot chores
-// (it shares this state dir), and every session-direct server racing it for the
-// same file would only add more senders of the same confirmation.
+// Hub-only chore: skipped in session-direct mode.
 if (!STATIC && !SESSION_DIRECT_ON) setInterval(checkApprovals, 5000).unref()
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
@@ -570,10 +553,7 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
-// Session-direct mode only (JP-380). The user reads many sessions' messages in
-// one chat, so each one must say on its first line which session it is from.
-// Worded as a condition on the tag: instructions are fixed before the channel
-// check runs, and a session that fails it never receives such a tag.
+// Session-direct mode only: first-line format for replies to quote-replied messages.
 const SESSION_DIRECT_INSTRUCTIONS = [
   '',
   'When a <channel source="telegram"> tag carries a session_name attribute, the user quote-replied to a message this session sent, and session_name is this session\'s name, already in display form.',
@@ -594,9 +574,7 @@ const mcp = new Server(
         // gate()/access.allowFrom already drops non-allowlisted senders before
         // handleInbound runs. A server that can't authenticate the replier
         // should NOT declare this.
-        // Left out in session-direct mode (JP-380): such a session already
-        // gets its permission buttons from the PermissionRequest hook, and a
-        // second set from here would ask the user the same question twice.
+        // Left out in session-direct mode.
         ...(SESSION_DIRECT_ON ? {} : { 'claude/channel/permission': {} }),
       },
     },
@@ -801,8 +779,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
-        // finally: a send that fails part-way still records the parts that did
-        // go out, since the user can reply to any of them.
+        // finally: record the parts already sent, even when a later part fails.
         try {
           try {
             for (let i = 0; i < chunks.length; i++) {
@@ -1192,7 +1169,7 @@ function announceStartup(): void {
     })
   }
 }
-// Same reason as checkApprovals above: the startup notice belongs to the hub.
+// Hub-only: skipped in session-direct mode.
 if (!SESSION_DIRECT_ON) announceStartup()
 
 // Inline-button handler for permission requests. Callback data is
@@ -1394,8 +1371,7 @@ async function handleInbound(
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
-  // Not in session-direct mode: the permission relay is not declared there, so
-  // no request can be pending and swallowing a "yes again" would be pure loss.
+  // Skipped in session-direct mode.
   const permMatch = SESSION_DIRECT_ON ? null : PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
     void mcp.notification({
@@ -1475,8 +1451,7 @@ async function handleInbound(
 function recordSentMessages(chatId: string, messageIds: readonly number[]): void {
   const sessionId = process.env.CLAUDE_CODE_SESSION_ID
   if (!MESSAGE_MAP_FILE || !sessionId || messageIds.length === 0) return
-  // Raw name, as tg-send records it; "" when unknown (the map is routed by
-  // session_id alone, the name is for people).
+  // Raw session name; "" when unknown.
   const record = sessionClaudePid === undefined ? undefined : sessionProbeIo.readSessionRecord(sessionClaudePid)
   const sessionName = record?.name?.trim() ?? ''
   try {

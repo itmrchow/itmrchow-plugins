@@ -1,22 +1,17 @@
 /**
- * Session-direct mode, server side (JP-380): an ordinary Claude session — not
- * the hub, not a carrier scope — subscribes to the poller under its own scope
- * so a reply to one of its messages reaches it directly.
+ * Session-direct mode, server side: an ordinary Claude session — not the hub,
+ * not a carrier scope — subscribes to the poller under its own scope and
+ * receives replies to its own messages directly.
  *
- * Two things must be known without the launch command's env, because
- * `claude --bg` and `claude respawn` start the session without it:
+ * Two things are resolved without the launch command's env:
  *  - whether the mode is on and which state dir (bot token, access.json,
  *    poller port) to use — from a pointer file at a fixed path;
- *  - whether this session can show channel messages at all — a session started
- *    without `--channels` acks every delivery and then drops it silently, so
- *    it must never subscribe. Read from the session's own claude process argv,
- *    or for a background session from the job record Claude Code keeps.
+ *  - whether this session can show channel messages — from the session's own
+ *    claude process argv, or for a background session from the job record
+ *    Claude Code keeps. A session that cannot show them never subscribes.
  *
  * Every step is fail-closed: anything unreadable or unexpected means "off" /
- * "cannot show", and the session keeps today's behaviour (replies go to the hub).
- *
- * Split out of server.ts because server.ts needs an MCP client to start, so it
- * cannot be imported by a test.
+ * "cannot show", and replies keep going to the hub.
  */
 import { execFileSync } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'

@@ -143,10 +143,7 @@ const REAUTH_BIN = process.env.REAUTH_BIN
 // is intercepted and no state file is written.
 const APPROVAL_CONFIG = resolveApprovalConfig(process.env)
 
-// Session-direct routing (JP-380): a DM reply to a message some session sent
-// goes straight to that session while it is online. Off unless explicitly
-// enabled with a map file; off also refuses every session-direct subscription,
-// so a session configured on its own cannot take scope slots.
+// Session-direct routing config; when off, every session-direct subscription is refused.
 const SESSION_DIRECT = resolvePollerSessionDirect(process.env)
 process.stderr.write(
   `telegram poller: session-direct ${SESSION_DIRECT.enabled ? `on (map ${SESSION_DIRECT.mapFile})` : `off (${SESSION_DIRECT.reason})`} (${SESSION_DIRECT_SWITCH_ENV})\n`,
@@ -196,9 +193,7 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
 const bot = API_ROOT ? new Bot(TOKEN, { client: { apiRoot: API_ROOT } }) : new Bot(TOKEN)
-// Session scopes are cap-exempt in admit(): the poller never spawns them, so
-// they must not be able to lock the hub (or any spawnable scope) out of a slot.
-// Their own cap is applied at subscribe time by authorize below.
+// Session scopes are cap-exempt here; their cap is applied at subscribe time by authorize.
 const registry = new ScopeRegistry({
   maxScopes: MAX_SCOPES,
   maxQueue: MAX_QUEUE_PER_SCOPE,
@@ -218,8 +213,7 @@ const hub = createSubscribeServer({
   onSubscribe: scopeId => process.stderr.write(`telegram poller: ${scopeId} subscribed\n`),
   onDisconnect: scopeId => {
     process.stderr.write(`telegram poller: ${scopeId} disconnected\n`)
-    // A session scope is never admitted or spawned, so an empty entry left
-    // behind would only grow the registry with every session ever seen.
+    // Drop an idle session scope's empty registry entry.
     if (isSessionScopeId(scopeId)) registry.forgetIfIdle(scopeId)
   },
 })
