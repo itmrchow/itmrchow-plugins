@@ -23,6 +23,7 @@ function collect(
   want: number,
 ): { done: Promise<InboundEnvelope[]>; stop: () => void } {
   let stop = (): void => {}
+  let stopped = false
   const done = new Promise<InboundEnvelope[]>((resolve, reject) => {
     const out: InboundEnvelope[] = []
     const timer = setTimeout(() => reject(new Error('補送逾時')), 3000)
@@ -40,9 +41,14 @@ function collect(
         res.on('data', feed)
       },
     )
-    req.on('error', reject)
+    req.on('error', err => {
+      // Ignore the socket hang-up raised by our own stop().
+      if (stopped && (err as NodeJS.ErrnoException).code === 'ECONNRESET') return
+      reject(err)
+    })
     req.end()
     stop = () => {
+      stopped = true
       clearTimeout(timer)
       req.destroy()
     }
