@@ -73,13 +73,14 @@ im_admins_file() {
 # im_is_admin <platform> <sender id>: 0 when the sender is an admin of that
 # platform, 1 otherwise.
 #
-# Two sources, picked by whether ONCALL_ROLES_DB_URL is set and non-empty:
+# Two sources, picked by whether ONCALL_ROLES_DB_URL holds anything besides
+# whitespace:
 #   - set:   A0 (ONCALL_A0_USER_ID) plus the A1 rows of the oncall role database,
 #            the same list for every platform (im_is_role_admin).
-#   - unset: the `admins` array of im_admins_file, per platform — a file no
-#            automated writer touches, and none creates either (see
-#            lib-access.sh): it exists only if a human made it. A role database
-#            sitting at its default path is NOT read in this case.
+#   - unset: the `admins` array of im_admins_file, per platform. The list is
+#            maintained outside the skills (deploy config or a human); no skill
+#            ever writes it. A role database sitting at its default path is NOT
+#            read in this case.
 # An id claimed in the message body is never consulted, and an empty / missing
 # sender id is never an admin: the gate must fail closed, since the caller of a
 # failing gate is /restart and /create-token.
