@@ -33,7 +33,7 @@ make_session() {
   local sid="$1" title="${2:-}" age="${3:-0}" file="$IM_PROJECTS_DIR/$1.jsonl"
   printf '{"type":"user"}\n' > "$file"
   [ -n "$title" ] && printf '{"type":"ai-title","aiTitle":"%s"}\n' "$title" >> "$file"
-  touch -t "$(date -r "$(( $(date +%s) - age ))" +%Y%m%d%H%M.%S)" "$file"
+  python3 -c 'import os, sys, time; t = time.time() - int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$file" "$age"
 }
 
 claim_session() { printf '%s\n' "$2" >> "$AGENT_SCOPES_DIR/$1.sessions"; }
