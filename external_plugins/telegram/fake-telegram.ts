@@ -32,6 +32,8 @@ export type FakeTelegram = {
   failing: Set<string>
   /** Queue an update; update_id is assigned here. @returns The assigned id. */
   inject: (update: Omit<Update, 'update_id'>) => number
+  /** @returns How many getUpdates calls arrived (not recorded in calls, see UNRECORDED_METHODS). */
+  getUpdatesCount: () => number
   /** @returns Number of injected updates no getUpdates offset has confirmed yet. */
   unconfirmed: () => number
   /** @returns Recorded calls of one method. */
@@ -50,6 +52,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   let queue: Update[] = []
   let nextUpdateId = 1
   let nextMessageId = FIRST_MESSAGE_ID
+  let getUpdatesCalls = 0
 
   const respond = (method: string, params: Record<string, unknown>): unknown => {
     if (method === 'getMe') {
@@ -87,6 +90,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         send(HTTP_SERVER_ERROR, { ok: false, error_code: HTTP_SERVER_ERROR, description: `fake failure: ${method}` })
         return
       }
+      if (method === 'getUpdates') getUpdatesCalls++
       if (method !== 'getUpdates') {
         send(HTTP_OK, { ok: true, result: respond(method, params) })
         return
@@ -113,6 +117,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       queue.push({ ...update, update_id: updateId } as Update)
       return updateId
     },
+    getUpdatesCount: () => getUpdatesCalls,
     unconfirmed: () => queue.length,
     callsOf: method => calls.filter(call => call.method === method),
     close: () =>

@@ -27,16 +27,21 @@ export class ScopeRegistry {
   readonly #entries = new Map<string, Entry>()
   readonly #maxScopes: number
   readonly #maxQueue: number
+  readonly #isCapExempt: (scopeId: string) => boolean
 
   /**
    * @param opts.maxScopes - Cap on simultaneously live scopes; each one costs a
    *   full Claude process, so an uncapped registry lets a burst of unknown
    *   senders exhaust the host.
    * @param opts.maxQueue - Cap on messages held per scope while it starts up.
+   * @param opts.isCapExempt - Scopes that never count toward maxScopes. For
+   *   scopes the poller never spawns (they subscribe on their own), so a crowd
+   *   of them cannot lock a spawnable scope out. Defaults to none.
    */
-  constructor(opts: { maxScopes: number; maxQueue: number }) {
+  constructor(opts: { maxScopes: number; maxQueue: number; isCapExempt?: (scopeId: string) => boolean }) {
     this.#maxScopes = opts.maxScopes
     this.#maxQueue = opts.maxQueue
+    this.#isCapExempt = opts.isCapExempt ?? (() => false)
   }
 
   /**
@@ -50,7 +55,7 @@ export class ScopeRegistry {
   admit(scopeId: string, envelope: InboundEnvelope): DispatchResult {
     const entry = this.#entries.get(scopeId)
     if (!entry) {
-      if (this.#countLive() >= this.#maxScopes) return { action: 'rejected', reason: 'cap_reached' }
+      if (this.#countLive(true) >= this.#maxScopes) return { action: 'rejected', reason: 'cap_reached' }
       this.#entries.set(scopeId, { state: 'connecting', queue: [envelope] })
       return { action: 'spawn' }
     }
@@ -158,18 +163,47 @@ export class ScopeRegistry {
   }
 
   /**
+   * Count every live scope (connecting or connected), cap-exempt ones
+   * included — for callers enforcing a cap of their own on exempt scopes.
+   *
+   * @returns Number of live scopes.
+   */
+  countLiveScopes(): number {
+    return this.#countLive(false)
+  }
+
+  /**
+   * Drop a disconnected scope that holds nothing, so scopes that only ever
+   * subscribe on their own (and are never admitted or spawned) do not pile up
+   * for the life of the process. A scope still holding un-acked messages is
+   * kept, so a reconnect still gets them.
+   *
+   * @param scopeId - The scope that disconnected.
+   * @returns true when the entry was removed.
+   */
+  forgetIfIdle(scopeId: string): boolean {
+    const entry = this.#entries.get(scopeId)
+    if (!entry || entry.state !== 'disconnected' || entry.queue.length > 0) return false
+    this.#entries.delete(scopeId)
+    return true
+  }
+
+  /**
    * Counts the scopes the cap is about: connecting or connected. Disconnected
    * entries are kept for their queue but must not count — onDisconnected()
    * never deletes and onSubscribed() adds scopes that skipped admit(), so
    * counting every entry meant "distinct scopes seen since the poller started",
    * and a long-running poller ended up rejecting every new chat (JP-384).
    *
+   * @param skipExempt - Leave out cap-exempt scopes, as admit() does.
    * @returns Number of live scopes.
    */
-  #countLive(): number {
+  #countLive(skipExempt: boolean): number {
     let live = 0
-    for (const entry of this.#entries.values()) {
-      if (entry.state !== 'disconnected') live++
+    for (const [scopeId, entry] of this.#entries) {
+      if (entry.state === 'disconnected') continue
+      if (skipExempt && this.#isCapExempt(scopeId)) continue
+      live++
     }
     return live
   }
