@@ -281,6 +281,54 @@ PY
   done
 }
 
+@test "role db: surrounding whitespace in the url is ignored" {
+  make_roles_db "$TMP/roles.db" 200
+  export ONCALL_A0_USER_ID=100
+  export ONCALL_ROLES_DB_URL="sqlite:///$TMP/roles.db "
+  run im_is_admin telegram 200
+  [ "$status" -eq 0 ]
+  export ONCALL_ROLES_DB_URL=" sqlite:///$TMP/roles.db"
+  run im_is_admin telegram 200
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: a whitespace-only url counts as unset and reads the platform admins file" {
+  write_admins telegram '{"version":1,"admins":["777"]}'
+  make_roles_db "$AGENT_SCOPES_DIR/oncall-roles.db" 200
+  export ONCALL_A0_USER_ID=100
+  export ONCALL_ROLES_DB_URL="   "
+  run im_is_admin telegram 777
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 100
+  [ "$status" -ne 0 ]
+  run im_is_admin telegram 200
+  [ "$status" -ne 0 ]
+}
+
+@test "role db: no A0 and an unreadable database means nobody is an admin" {
+  write_admins telegram '{"version":1,"admins":["777"]}'
+  export ONCALL_ROLES_DB_URL="sqlite:///$TMP/missing.db"
+  unset ONCALL_A0_USER_ID
+  local id rc
+  for id in 100 200 777; do
+    rc=0
+    im_is_admin telegram "$id" 2>"$TMP/err" || rc=$?
+    [ "$rc" -eq 1 ]
+    [ ! -s "$TMP/err" ]
+  done
+}
+
+@test "role db: a url and A0 set in the shell but not exported are read consistently" {
+  make_roles_db "$TMP/roles.db" 200
+  ONCALL_A0_USER_ID=100
+  ONCALL_ROLES_DB_URL="sqlite:///$TMP/roles.db"
+  export -n ONCALL_A0_USER_ID ONCALL_ROLES_DB_URL
+  run im_is_admin telegram 200
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+}
+
 @test "role db: query parameters after the path are ignored" {
   make_roles_db "$TMP/roles.db" 200
   export ONCALL_A0_USER_ID=100

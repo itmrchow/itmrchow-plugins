@@ -89,8 +89,8 @@ im_is_admin() {
   local platform="$1" sender="$2" file
   [ -n "$platform" ] || return 1
   [ -n "$sender" ] || return 1
-  if [ -n "${ONCALL_ROLES_DB_URL:-}" ]; then
-    im_is_role_admin "$sender"
+  if [[ "${ONCALL_ROLES_DB_URL:-}" =~ [^[:space:]] ]]; then
+    im_is_role_admin "$sender" "$ONCALL_ROLES_DB_URL"
     return
   fi
   file="$(im_admins_file "$platform")"
@@ -106,28 +106,29 @@ sys.exit(0 if isinstance(admins, list) and os.environ["IM_SENDER"] in [str(i) fo
 PY
 }
 
-# im_is_role_admin <sender id>: 0 when the sender is A0 or an A1 of the oncall
-# role database, 1 otherwise. Platform-independent.
+# im_is_role_admin <sender id> <role db url>: 0 when the sender is A0 or an A1 of
+# the oncall role database, 1 otherwise. Platform-independent.
 #
-# Reads ONCALL_ROLES_DB_URL (only `sqlite:////<absolute path>`) and
-# ONCALL_A0_USER_ID. The database is opened read-only and queried on every call,
-# so removing an A1 takes effect without a restart. Anything unreadable — other
-# URL schemes, a relative path, a missing file, a missing a1_members table, a
-# corrupt file — leaves A0 as the only admin.
+# <role db url> must be `sqlite:////<absolute path>`; surrounding whitespace is
+# ignored, and so is anything from `?` on (query parameters). A0 comes from
+# ONCALL_A0_USER_ID, also with surrounding whitespace ignored. The database is
+# opened read-only and queried on every call, so adding or removing an A1 takes
+# effect without a restart. Anything unreadable — other URL schemes, a relative
+# path, a missing file, a missing a1_members table, a corrupt file — leaves A0 as
+# the only admin, and nobody when A0 is not set either.
 # Returns: 0 / 1.
 im_is_role_admin() {
-  local sender="$1"
+  local sender="$1" url="$2"
   [ -n "$sender" ] || return 1
-  IM_SENDER="$sender" python3 <<'PY'
-import os, sqlite3, sys, urllib.parse
+  python3 - "$sender" "$url" "${ONCALL_A0_USER_ID:-}" <<'PY'
+import sqlite3, sys, urllib.parse
 
 SQLITE_URL_PREFIX = "sqlite:///"
 A1_LOOKUP_SQL = "SELECT 1 FROM a1_members WHERE user_id = ? LIMIT 1"
 
-sender = os.environ["IM_SENDER"]
-if sender == os.environ.get("ONCALL_A0_USER_ID", "").strip():
+sender, url, a0 = sys.argv[1], sys.argv[2].strip(), sys.argv[3].strip()
+if sender == a0:
     sys.exit(0)
-url = os.environ.get("ONCALL_ROLES_DB_URL", "")
 if not url.startswith(SQLITE_URL_PREFIX):
     sys.exit(1)
 path = url[len(SQLITE_URL_PREFIX):].split("?", 1)[0]
