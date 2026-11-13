@@ -18,6 +18,7 @@ setup() {
   export IM_CORE_DIR="${BATS_TEST_DIRNAME}/.."
   export IM_SEND_BIN="$TMP/bin/im-send"
   export AGENT_SCOPE=telegram-dm-1
+  unset ONCALL_ROLES_DB_URL ONCALL_A0_USER_ID
   export EVENTS="$TMP/events.log"
   mkdir -p "$AGENT_SCOPES_DIR" "$IM_PROJECTS_DIR" "$TMP/bin"
   : > "$EVENTS"
@@ -213,6 +214,15 @@ OTHER_SCOPE=telegram-group-n100
   [ "$(cat "$AGENT_SCOPES_DIR/$OTHER_SCOPE.resume")" = "$SID" ]
   grep -qF "send telegram|123|已切換 group 的對話，重啟後生效" "$EVENTS"
   ! grep -qF "切換中" "$EVENTS"
+}
+
+@test "resume: 有設角色資料庫時，資料庫裡的 A1 照 admin 切別的 scope" {
+  python3 -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE a1_members (user_id TEXT PRIMARY KEY)"); c.execute("INSERT INTO a1_members VALUES (?)", ("42",)); c.commit()' "$TMP/roles.db"
+  export ONCALL_ROLES_DB_URL="sqlite:///$TMP/roles.db" ONCALL_A0_USER_ID=100
+  seed_resume_rows "$OTHER_SCOPE" "$SID"
+  run_skill im-session-resume 2
+  grep -qF "tmux send-keys -t claude-tg-agent:$OTHER_SCOPE /exit Enter" "$EVENTS"
+  [ "$(cat "$AGENT_SCOPES_DIR/$OTHER_SCOPE.resume")" = "$SID" ]
 }
 
 @test "resume: IM_TMUX_LIB 未設時點名該變數回報失敗，不寫 intent、不送 /exit、不發確認" {

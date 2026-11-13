@@ -73,16 +73,25 @@ im_admins_file() {
 # im_is_admin <platform> <sender id>: 0 when the sender is an admin of that
 # platform, 1 otherwise.
 #
-# The only source is the `admins` array of im_admins_file — a file no automated
-# writer touches, and none creates either (see lib-access.sh): it exists only if
-# a human made it. An id claimed in the message body is never consulted, and an
-# empty / missing sender id is never an admin: the gate must fail closed, since
-# the caller of a failing gate is /restart and /create-token.
+# Two sources, picked by whether ONCALL_ROLES_DB_URL is set and non-empty:
+#   - set:   A0 (ONCALL_A0_USER_ID) plus the A1 rows of the oncall role database,
+#            the same list for every platform (im_is_role_admin).
+#   - unset: the `admins` array of im_admins_file, per platform — a file no
+#            automated writer touches, and none creates either (see
+#            lib-access.sh): it exists only if a human made it. A role database
+#            sitting at its default path is NOT read in this case.
+# An id claimed in the message body is never consulted, and an empty / missing
+# sender id is never an admin: the gate must fail closed, since the caller of a
+# failing gate is /restart and /create-token.
 # Returns: 0 / 1.
 im_is_admin() {
   local platform="$1" sender="$2" file
   [ -n "$platform" ] || return 1
   [ -n "$sender" ] || return 1
+  if [ -n "${ONCALL_ROLES_DB_URL:-}" ]; then
+    im_is_role_admin "$sender"
+    return
+  fi
   file="$(im_admins_file "$platform")"
   IM_SENDER="$sender" python3 - "$file" <<'PY'
 import json, os, sys
@@ -93,6 +102,45 @@ except (OSError, ValueError):
     sys.exit(1)
 admins = data.get("admins") if isinstance(data, dict) else None
 sys.exit(0 if isinstance(admins, list) and os.environ["IM_SENDER"] in [str(i) for i in admins] else 1)
+PY
+}
+
+# im_is_role_admin <sender id>: 0 when the sender is A0 or an A1 of the oncall
+# role database, 1 otherwise. Platform-independent.
+#
+# Reads ONCALL_ROLES_DB_URL (only `sqlite:////<absolute path>`) and
+# ONCALL_A0_USER_ID. The database is opened read-only and queried on every call,
+# so removing an A1 takes effect without a restart. Anything unreadable — other
+# URL schemes, a relative path, a missing file, a missing a1_members table, a
+# corrupt file — leaves A0 as the only admin.
+# Returns: 0 / 1.
+im_is_role_admin() {
+  local sender="$1"
+  [ -n "$sender" ] || return 1
+  IM_SENDER="$sender" python3 <<'PY'
+import os, sqlite3, sys, urllib.parse
+
+SQLITE_URL_PREFIX = "sqlite:///"
+A1_LOOKUP_SQL = "SELECT 1 FROM a1_members WHERE user_id = ? LIMIT 1"
+
+sender = os.environ["IM_SENDER"]
+if sender == os.environ.get("ONCALL_A0_USER_ID", "").strip():
+    sys.exit(0)
+url = os.environ.get("ONCALL_ROLES_DB_URL", "")
+if not url.startswith(SQLITE_URL_PREFIX):
+    sys.exit(1)
+path = url[len(SQLITE_URL_PREFIX):].split("?", 1)[0]
+if not path.startswith("/"):
+    sys.exit(1)
+try:
+    conn = sqlite3.connect(f"file:{urllib.parse.quote(path)}?mode=ro", uri=True)
+    try:
+        row = conn.execute(A1_LOOKUP_SQL, (sender,)).fetchone()
+    finally:
+        conn.close()
+except sqlite3.Error:
+    sys.exit(1)
+sys.exit(0 if row is not None else 1)
 PY
 }
 

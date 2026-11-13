@@ -15,6 +15,7 @@ setup() {
   export INVITES_FILE="$TMP/channels/invites.json"
   export DISCORD_STATE_DIR="$TMP/channels/discord"
   export AGENT_SCOPE=telegram-dm-1
+  unset ONCALL_ROLES_DB_URL ONCALL_A0_USER_ID
   mkdir -p "$AGENT_SCOPES_DIR" "$IM_PROJECTS_DIR" "$DISCORD_STATE_DIR"
   # 一個入口，不逐支 source：逐支 source 會在新增 lib 時靜默漏載，
   # 而測試通過但 production 少一支函式是最糟的組合。
@@ -38,6 +39,46 @@ make_session() {
 claim_session() { printf '%s\n' "$2" >> "$AGENT_SCOPES_DIR/$1.sessions"; }
 
 pick_visible() { im_row_sid "$(im_sessions_rows "$1" "$2")" "$3"; }
+
+# Point the gate at a role database at <path>, A0 = 100.
+use_roles_db() {
+  export ONCALL_ROLES_DB_URL="sqlite:///$1"
+  export ONCALL_A0_USER_ID=100
+}
+
+# Create a role database at <path> whose a1_members holds the given ids.
+make_roles_db() {
+  local db="$1"
+  shift
+  python3 - "$db" "$@" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("CREATE TABLE a1_members (user_id TEXT PRIMARY KEY, added_at TEXT)")
+conn.executemany("INSERT INTO a1_members (user_id, added_at) VALUES (?, '')", [(i,) for i in sys.argv[2:]])
+conn.commit()
+conn.close()
+PY
+}
+
+add_a1() {
+  python3 - "$1" "$2" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT INTO a1_members (user_id, added_at) VALUES (?, '')", (sys.argv[2],))
+conn.commit()
+conn.close()
+PY
+}
+
+remove_a1() {
+  python3 - "$1" "$2" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("DELETE FROM a1_members WHERE user_id = ?", (sys.argv[2],))
+conn.commit()
+conn.close()
+PY
+}
 
 # ── admin gate ────────────────────────────────────────────────────────────────
 
@@ -95,6 +136,162 @@ pick_visible() { im_row_sid "$(im_sessions_rows "$1" "$2")" "$3"; }
   # until the day someone edits the new file and nothing changes.
   write_access '{"admins":{"discord":["999"]}}'
   run im_is_admin discord 999
+  [ "$status" -ne 0 ]
+}
+
+# ── admin gate: oncall role database ─────────────────────────────────────────
+
+@test "role db: A0 is an admin even when absent from a1_members" {
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: an A1 row is an admin, and stops being one once removed" {
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 200
+  [ "$status" -eq 0 ]
+  remove_a1 "$TMP/roles.db" 200
+  run im_is_admin telegram 200
+  [ "$status" -ne 0 ]
+}
+
+@test "role db: an A1 added while running is an admin on the next check" {
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 300
+  [ "$status" -ne 0 ]
+  add_a1 "$TMP/roles.db" 300
+  run im_is_admin telegram 300
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: an id that only appears in other tables is not an admin" {
+  make_roles_db "$TMP/roles.db" 200
+  python3 -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE role_audit (target_user_id TEXT, action TEXT)"); c.execute("INSERT INTO role_audit VALUES (?, ?)", ("300", "remove")); c.commit()' "$TMP/roles.db"
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 300
+  [ "$status" -ne 0 ]
+}
+
+@test "role db: A0 listed in a1_members too is still an admin" {
+  make_roles_db "$TMP/roles.db" 100 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: neither A0 nor A1 is not an admin" {
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 300
+  [ "$status" -ne 0 ]
+}
+
+@test "role db: the list is the same for every platform" {
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin discord 200
+  [ "$status" -eq 0 ]
+  run im_is_admin discord 100
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: the platform admins file is ignored once the db is configured" {
+  write_admins telegram '{"version":1,"admins":["777"]}'
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 777
+  [ "$status" -ne 0 ]
+}
+
+@test "role db: an empty sender id is never an admin, even with an empty A0" {
+  make_roles_db "$TMP/roles.db" 200
+  use_roles_db "$TMP/roles.db"
+  export ONCALL_A0_USER_ID=""
+  run im_is_admin telegram ""
+  [ "$status" -ne 0 ]
+}
+
+@test "role db: a missing file leaves only A0, and is not created by the read" {
+  write_admins telegram '{"version":1,"admins":["777"]}'
+  use_roles_db "$TMP/missing.db"
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 777
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+  [ ! -e "$TMP/missing.db" ]
+}
+
+@test "role db: once a missing database appears, its A1 pass without a restart" {
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 200
+  [ "$status" -ne 0 ]
+  make_roles_db "$TMP/roles.db" 200
+  run im_is_admin telegram 200
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: a database without a1_members leaves only A0" {
+  python3 -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE other (x TEXT)"); c.commit()' "$TMP/roles.db"
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 200
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+}
+
+@test "role db: a corrupt file leaves only A0" {
+  printf 'not a database at all, just text padding it out.......' > "$TMP/roles.db"
+  use_roles_db "$TMP/roles.db"
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 200
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+}
+
+@test "role db: a non-sqlite or relative url leaves only A0" {
+  make_roles_db "$TMP/roles.db" 200
+  export ONCALL_A0_USER_ID=100
+  local url
+  for url in "postgresql://h/db" "sqlite+pysqlite:///$TMP/roles.db" "sqlite://" "sqlite:///roles.db"; do
+    export ONCALL_ROLES_DB_URL="$url"
+    run im_is_admin telegram 100
+    [ "$status" -eq 0 ]
+    run im_is_admin telegram 200
+    [ "$status" -ne 0 ]
+  done
+}
+
+@test "role db: query parameters after the path are ignored" {
+  make_roles_db "$TMP/roles.db" 200
+  export ONCALL_A0_USER_ID=100
+  export ONCALL_ROLES_DB_URL="sqlite:///$TMP/roles.db?timeout=5"
+  run im_is_admin telegram 200
+  [ "$status" -eq 0 ]
+}
+
+@test "role db: an unset or empty url keeps reading the platform admins file" {
+  # OCI case: with no url, a role database at its default path changes nothing.
+  write_admins telegram '{"version":1,"admins":["777"]}'
+  make_roles_db "$AGENT_SCOPES_DIR/oncall-roles.db" 200
+  export ONCALL_A0_USER_ID=100
+  export ONCALL_ROLES_DB_URL=""
+  run im_is_admin telegram 777
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 200
+  [ "$status" -ne 0 ]
+  run im_is_admin telegram 100
+  [ "$status" -ne 0 ]
+  unset ONCALL_ROLES_DB_URL
+  run im_is_admin telegram 777
+  [ "$status" -eq 0 ]
+  run im_is_admin telegram 100
   [ "$status" -ne 0 ]
 }
 
