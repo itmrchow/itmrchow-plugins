@@ -225,6 +225,21 @@ OTHER_SCOPE=telegram-group-n100
   [ "$(cat "$AGENT_SCOPES_DIR/$OTHER_SCOPE.resume")" = "$SID" ]
 }
 
+@test "resume: 有設角色資料庫時，群組裡資料庫的 A1 受理、不在名單的人不受理" {
+  python3 -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE a1_members (user_id TEXT PRIMARY KEY)"); c.commit()' "$TMP/roles.db"
+  printf '{"admins":["42"]}' > "$AGENT_SCOPES_DIR/telegram-admins.json"
+  export ONCALL_ROLES_DB_URL="sqlite:///$TMP/roles.db" ONCALL_A0_USER_ID=100
+  export AGENT_SCOPE=telegram-group-1
+  run_skill im-session-resume 1
+  grep -qF "send telegram|123|這個指令只能在私訊使用" "$EVENTS"
+  : > "$EVENTS"
+  python3 -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO a1_members VALUES (?)", ("42",)); c.commit()' "$TMP/roles.db"
+  run_skill im-session-resume 1
+  [ "$status" -eq 0 ]
+  ! grep -qF "只能在私訊" "$EVENTS"
+  grep -qF "send telegram|123|" "$EVENTS"
+}
+
 @test "resume: IM_TMUX_LIB 未設時點名該變數回報失敗，不寫 intent、不送 /exit、不發確認" {
   seed_resume_rows telegram-dm-1 "$SID"
   unset IM_TMUX_LIB

@@ -255,6 +255,19 @@ PY
   [ -z "$output" ]
 }
 
+@test "role db: an unreadable file leaves only A0, and the caller keeps running" {
+  [ "$(id -u)" -ne 0 ] || skip "root ignores file permissions"
+  make_roles_db "$TMP/roles.db" 200
+  chmod 000 "$TMP/roles.db"
+  use_roles_db "$TMP/roles.db"
+  local rc=0
+  im_is_admin telegram 200 2>"$TMP/err" || rc=$?
+  [ "$rc" -eq 1 ]
+  [ ! -s "$TMP/err" ]
+  run im_is_admin telegram 100
+  [ "$status" -eq 0 ]
+}
+
 @test "role db: a non-sqlite or relative url leaves only A0" {
   make_roles_db "$TMP/roles.db" 200
   export ONCALL_A0_USER_ID=100
