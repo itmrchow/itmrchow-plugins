@@ -21,6 +21,7 @@ setup() {
   mkdir -p "$AGENT_SCOPES_DIR" "$TMP/agent"
   printf 'A=1\n' > "$REAUTH_ENV_FILE"
   printf '{"version":1,"admins":["777"]}' > "$AGENT_SCOPES_DIR/discord-admins.json"
+  unset ONCALL_ROLES_DB_URL ONCALL_A0_USER_ID
 }
 teardown() {
   local i
@@ -207,4 +208,12 @@ code()  { printf '%s\n' "$2" | "$BIN" code --platform discord --sender "$1" --ch
   sleep 3
   run code 777 'abc#def'; kill "$live"
   [ "$status" -eq 13 ]
+}
+
+@test "start: with the role database configured, an A1 there is authorized and the admins file is not" {
+  python3 -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE a1_members (user_id TEXT PRIMARY KEY)"); c.execute("INSERT INTO a1_members VALUES (?)", ("900",)); c.commit()' "$TMP/roles.db"
+  export ONCALL_ROLES_DB_URL="sqlite:///$TMP/roles.db" ONCALL_A0_USER_ID=100
+  run start 777; [ "$status" -eq 10 ]
+  run start 900 group; [ "$status" -eq 11 ]
+  run start 100 group; [ "$status" -eq 11 ]
 }

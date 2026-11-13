@@ -38,7 +38,9 @@
 |---|---|---|---|
 | `IM_CORE_DIR` | 宿主 | 是 | 本 plugin 根目錄（pinned installPath）。skill 由此定址 `im-common.md` 與 `scripts/lib/lib-loader.sh` |
 | `IM_SEND_BIN` | 宿主 | 是 | `$IM_CORE_DIR/scripts/im-send.sh` |
-| `AGENT_SCOPES_DIR` | 宿主 | 是 | pointer / ledger / intent / admins 四種檔案的根。**本 plugin 刻意不給預設值** |
+| `AGENT_SCOPES_DIR` | 宿主 | 是 | pointer / ledger / intent / admins 四種檔案的根（admins 檔只在沒設 `ONCALL_ROLES_DB_URL` 時讀）。**本 plugin 刻意不給預設值** |
+| `ONCALL_ROLES_DB_URL` | 宿主 | 否 | oncall 角色資料庫連線網址，只認 `sqlite:////<絕對路徑>`。有設且非空 -> `im_is_admin` 改判 A0 + 資料庫 `a1_members` 的 A1（不分平台），讀不到只認 A0；沒設 -> 照舊讀 `<platform>-admins.json`，預設位置的資料庫檔不讀 |
+| `ONCALL_A0_USER_ID` | 宿主 | 否（有設 `ONCALL_ROLES_DB_URL` 時才用） | A0 的 user_id；與 `a1_members` 取聯集。沒設 = 沒有 A0 |
 | `AGENT_SCOPE` | 宿主 | 是（agent 內） | 本進程服務的 scope-id。由 `scope_resolve` 在呼叫時驗，不由 loader 驗 —— 見下方 §3 的守衛對照表 |
 | `IM_TMUX_LIB` | 宿主 | 是（`/clear`、`/resume` 用） | carrier 的 `scripts/lib-scope-tmux.sh` 完整路徑。兩個 skill 由此取得 `scope_tmux_target`；window 怎麼命名屬於宿主，plugin 只 source 這份 lib。未設或載不起來時 skill 回報「切換失敗：IM_TMUX_LIB 未設定或載入失敗，請聯絡管理員」並中止，不寫 intent |
 | `AGENT_WORKSPACE_DIR` | 宿主 | 強烈建議 | transcripts 目錄的來源。未設時退回 `$PWD`，而 `$PWD` 不對就等於「沒有任何對話」 |
@@ -210,7 +212,8 @@ reauth.sh _exec_setup_token <config dir>   # 內部，tmux 內執行
 
 | 變數 | 必填 | a1-b 值（poller unit 設定） | 說明 |
 |---|---|---|---|
-| `AGENT_SCOPES_DIR` | 是 | `/home/agent/.claude/agent-scopes` | `im_is_admin` 讀 `<platform>-admins.json` |
+| `AGENT_SCOPES_DIR` | 是 | `/home/agent/.claude/agent-scopes` | 沒設 `ONCALL_ROLES_DB_URL` 時，`im_is_admin` 讀 `<platform>-admins.json` |
+| `ONCALL_ROLES_DB_URL` / `ONCALL_A0_USER_ID` | 否 | （不設） | 有設時 `im_is_admin` 改讀角色資料庫，見「環境變數契約」 |
 | `REAUTH_ENV_FILE` | 是 | `/home/agent/claude-tg-agent/.env` | 必須是一般檔（非 symlink）、可讀寫 |
 | `REAUTH_AGENT_SERVICE` | 是 | `claude-tg-agent` | 必須與 sudoers 字面值一致（不可加 `.service`） |
 | `REAUTH_STATE_DIR` | 是 | `/home/agent/.claude/reauth` | 0700；鎖、狀態、code 檔、隔離 config、`token-issued.json`。路徑不得含 `'` |
