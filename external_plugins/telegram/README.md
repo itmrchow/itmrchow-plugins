@@ -376,6 +376,7 @@ failed, state file lost, or dropped 24 hours after it settled).
   "status": "denied",
   "decision": "reject",
   "comment": "narrow the scope, drop X",
+  "decided_via": "button",
   "created_at_ms": 1790927386899,
   "expires_at_ms": 1791013786899,
   "resolved_at_ms": 1790927400000
@@ -398,6 +399,11 @@ has exactly the fields above.
 
 Judge by `status`, not by `decision`: a `consumed` request still shows the
 button that approved it.
+
+`decided_via` says how the approve / reject decision was made: `"button"` for a
+button press, `"text"` for a typed reply (see below), `null` while nothing has
+been decided and for `cancelled` / `expired`. A comment typed after pressing
+退回 leaves it `"button"`; a comment added after typing 退回 leaves it `"text"`.
 
 **Cancel — `POST /approvals/<id>/cancel`** (no body needed)
 
@@ -467,6 +473,19 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
   the poller and is **not** delivered to any session. A non-text reply gets
   "[等你回覆] <session_name>: 請用文字回覆意見。" and the wait continues. No reply within the comment
   timeout settles it as `denied` with `comment: ""`.
+- A pending `approve_reject` request can also be decided by typing: a
+  **quote-reply** to its request message from someone in `allowFrom`, compared
+  with surrounding whitespace trimmed and letter case ignored. The whole text
+  `approve` or `核准` counts as pressing approve. Text that starts with `退回` or
+  `reject`, followed by the end, whitespace or punctuation, counts as pressing
+  退回: whatever follows (leading whitespace and punctuation removed) settles it
+  as `denied` with that comment at once; the bare keyword asks for a comment
+  exactly like the button. The reply is consumed by the poller, the bot answers
+  "[系統] <session_name>: 已認列打字回覆：[已 approve]" (or `[已退回]`), and the
+  message is rewritten as for the button. Any other text (`rejected`, a
+  question), a reply to an `allow_deny` request or to a request that is no
+  longer pending, an edited message, and a plain message that quotes nothing
+  are routed to sessions as before.
 - A reply that starts with `/` is never a comment: it is routed as usual, so
   bot commands such as `/restart` keep working while a comment is awaited.
 - A quote-reply to the prompt that arrives after the request has settled

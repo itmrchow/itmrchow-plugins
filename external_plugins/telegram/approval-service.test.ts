@@ -8,6 +8,7 @@ import type { ApprovalBinding } from './approval-binding'
 import { ApprovalStore, type ApprovalKind } from './approval-store'
 import {
   createApprovalService,
+  parseTypedDecision,
   renderApprovalText,
   type ApprovalButton,
   type ApprovalService,
@@ -86,6 +87,7 @@ function harness(allowFrom: string[] = [String(U1)]): Harness {
         calls.push({ method: 'answerCallback', id, text })
       },
       sendText: async (chatId, text) => {
+        refuse('sendText')
         calls.push({ method: 'sendText', chatId, text })
       },
     },
@@ -682,4 +684,181 @@ test('已被擋下的結果標籤加在末尾，第一行維持 [已被擋下]',
   const text = edits(h).at(-1)?.text ?? ''
   expect(text.split('\n')[0]).toBe(BLOCKED_FIRST_LINE)
   expect(text.endsWith('\n\n[已允許]')).toBe(true)
+})
+
+const sentTexts = (h: Harness): Extract<ApiCall, { method: 'sendText' }>[] =>
+  h.calls.filter((c): c is Extract<ApiCall, { method: 'sendText' }> => c.method === 'sendText')
+
+test.each([
+  ['approve', { action: 'approve', comment: null }],
+  ['  Approve  ', { action: 'approve', comment: null }],
+  ['APPROVE', { action: 'approve', comment: null }],
+  ['核准', { action: 'approve', comment: null }],
+  ['\u3000核准\n', { action: 'approve', comment: null }],
+  ['退回', { action: 'reject', comment: null }],
+  ['Reject', { action: 'reject', comment: null }],
+  ['退回：', { action: 'reject', comment: null }],
+  ['reject.', { action: 'reject', comment: null }],
+  ['退回：理由文字', { action: 'reject', comment: '理由文字' }],
+  ['reject 理由文字', { action: 'reject', comment: '理由文字' }],
+  ['REJECT, 理由文字', { action: 'reject', comment: '理由文字' }],
+  ['退回 ，  理由文字  ', { action: 'reject', comment: '理由文字' }],
+  ['退回\n第一行\n第二行', { action: 'reject', comment: '第一行\n第二行' }],
+  ['退回：理由，還有：細節', { action: 'reject', comment: '理由，還有：細節' }],
+])('打字解析 %p -> 決定', (text: string, expected: unknown) => {
+  expect(parseTypedDecision(text)).toEqual(expected as ReturnType<typeof parseTypedDecision>)
+})
+
+test.each([
+  ['rejected'], ['rejection 理由'], ['退回去'], ['approved'], ['approve 理由'], ['核准了'], ['先問個問題'],
+  ['請退回'], [''], ['   '], ['ok'], ['退回~理由'],
+])('打字解析 %p -> 不認列', (text: string) => {
+  expect(parseTypedDecision(text)).toBeNull()
+})
+
+test('回覆 pending approve 型請求打 approve：已核准、來源 text、吃掉該則、回執、訊息改為已 approve', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T1', 'approve_reject')
+  expect(await h.service.interceptUpdate(message(U1, ' Approve ', messageId))).toBe(true)
+  expect(h.service.get('T1')).toMatchObject({ status: 'approved', decision: 'approve', comment: null, decidedVia: 'text' })
+  expect(sentTexts(h)).toEqual([{ method: 'sendText', chatId: U1, text: '[系統] OP-8820: 已認列打字回覆：[已 approve]' }])
+  expect(edits(h)).toEqual([{ method: 'editText', chatId: U1, messageId, text: '請求 T1\n\n[已 approve]' }])
+})
+
+test('回覆打「核准」等同 approve', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T2', 'approve_reject')
+  expect(await h.service.interceptUpdate(message(U1, '核准', messageId))).toBe(true)
+  expect(h.service.get('T2')).toMatchObject({ status: 'approved', decidedVia: 'text' })
+})
+
+test.each([['退回：理由文字'], ['reject 理由文字']])('回覆打 %p：直接以意見結案、來源 text、不發補意見提示', async (text: string) => {
+  const h = harness()
+  const messageId = await createOne(h, 'T3', 'approve_reject')
+  expect(await h.service.interceptUpdate(message(U1, text, messageId))).toBe(true)
+  expect(h.service.get('T3')).toMatchObject({ status: 'denied', decision: 'reject', comment: '理由文字', decidedVia: 'text' })
+  expect(prompts(h)).toEqual([])
+  expect(sentTexts(h).at(-1)?.text).toBe('[系統] OP-8820: 已認列打字回覆：[已退回]')
+  expect(edits(h).at(-1)?.text).toBe('請求 T3\n\n[已退回] 意見：理由文字')
+})
+
+test('回覆只打「退回」：跟按退回一樣請 user 補意見；補完結案，來源仍是 text', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T4', 'approve_reject')
+  expect(await h.service.interceptUpdate(message(U1, '退回', messageId))).toBe(true)
+  expect(h.service.get('T4')).toMatchObject({ status: 'awaiting_comment', decision: 'reject', decidedVia: 'text' })
+  expect(sentTexts(h).at(-1)?.text).toBe('[系統] OP-8820: 已認列打字回覆：[已退回]')
+  expect(edits(h).at(-1)?.text).toBe('請求 T4\n\n[已按退回] 等待意見中')
+  expect(prompts(h)).toHaveLength(1)
+  expect(prompts(h)[0].replyTo).toBe(messageId)
+
+  expect(await h.service.interceptUpdate(message(U1, '補的意見', prompts(h)[0].messageId))).toBe(true)
+  expect(h.service.get('T4')).toMatchObject({ status: 'denied', comment: '補的意見', decidedVia: 'text' })
+})
+
+test('只打「退回」後逾時未補 -> 無意見退回，來源 text', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T5', 'approve_reject')
+  await h.service.interceptUpdate(message(U1, '退回', messageId))
+  h.advance(COMMENT_TIMEOUT_SECONDS * 1000)
+  await h.service.sweep()
+  expect(h.service.get('T5')).toMatchObject({ status: 'denied', comment: '', decidedVia: 'text' })
+})
+
+test('按鈕核准 / 退回（含按退回後打字補意見）來源是 button', async () => {
+  const h = harness()
+  const approveId = await createOne(h, 'T6', 'approve_reject')
+  await h.service.interceptUpdate(press('appr:approve:T6', U1, approveId))
+  expect(h.service.get('T6')).toMatchObject({ status: 'approved', decidedVia: 'button' })
+
+  const rejectId = await createOne(h, 'T7', 'approve_reject')
+  await h.service.interceptUpdate(press('appr:reject:T7', U1, rejectId))
+  await h.service.interceptUpdate(message(U1, 'approve', prompts(h)[0].messageId))
+  expect(h.service.get('T7')).toMatchObject({ status: 'denied', comment: 'approve', decidedVia: 'button' })
+})
+
+test('其他文字、非文字、/ 指令回覆 pending 請求：不吃掉、狀態不變、不回執', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T8', 'approve_reject')
+  for (const text of ['rejected', '先問個問題', 'approve 一下', '/approve', '/restart', undefined]) {
+    expect(await h.service.interceptUpdate(message(U1, text, messageId))).toBe(false)
+  }
+  expect(h.service.get('T8')).toMatchObject({ status: 'pending', decision: null, decidedVia: null })
+  expect(sentTexts(h)).toEqual([])
+})
+
+test('允許 / 拒絕型請求不認打字', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T9', 'allow_deny')
+  for (const text of ['approve', '核准', '退回', 'reject 理由']) {
+    expect(await h.service.interceptUpdate(message(U1, text, messageId))).toBe(false)
+  }
+  expect(h.service.get('T9')).toMatchObject({ status: 'pending', decidedVia: null })
+  expect(sentTexts(h)).toEqual([])
+})
+
+test('名單外的人、bot 的回覆，以及沒有回覆任何訊息的 approve 都不認列', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T10', 'approve_reject')
+  expect(await h.service.interceptUpdate(message(U2, 'approve', messageId, { chatId: U1 }))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, 'approve', messageId, { isBot: true }))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, 'approve'))).toBe(false)
+  expect(await h.service.interceptUpdate(message(U1, 'approve', 31337))).toBe(false)
+  expect(h.service.get('T10')).toMatchObject({ status: 'pending', decidedVia: null })
+})
+
+test('不同 chat 回覆同一個 message id 不認列', async () => {
+  const h = harness([String(U1), String(U2)])
+  const messageId = await createOne(h, 'T11', 'approve_reject')
+  const u2Copy = sentRequests(h).find(sent => sent.chatId === U2)
+  expect(u2Copy?.messageId).not.toBe(messageId)
+  expect(await h.service.interceptUpdate(message(U2, 'approve', messageId))).toBe(false)
+  expect(h.service.get('T11')?.status).toBe('pending')
+  expect(await h.service.interceptUpdate(message(U2, 'approve', u2Copy?.messageId))).toBe(true)
+  expect(h.service.get('T11')).toMatchObject({ status: 'approved', decidedVia: 'text' })
+})
+
+test('已結案或已逾時的請求打字不改結果', async () => {
+  const h = harness()
+  const doneId = await createOne(h, 'T12', 'approve_reject')
+  await h.service.interceptUpdate(press('appr:approve:T12', U1, doneId))
+  expect(await h.service.interceptUpdate(message(U1, '退回：改主意', doneId))).toBe(false)
+  expect(h.service.get('T12')).toMatchObject({ status: 'approved', decidedVia: 'button' })
+
+  const cancelledId = await createOne(h, 'T13', 'approve_reject')
+  await h.service.cancel('T13')
+  expect(await h.service.interceptUpdate(message(U1, 'approve', cancelledId))).toBe(false)
+  expect(h.service.get('T13')).toMatchObject({ status: 'cancelled', decidedVia: null })
+
+  const lateId = await createOne(h, 'T14', 'approve_reject')
+  h.advance(TIMEOUT_SECONDS * 1000)
+  expect(await h.service.interceptUpdate(message(U1, 'approve', lateId))).toBe(false)
+  expect(h.service.get('T14')).toMatchObject({ status: 'expired', decidedVia: null })
+})
+
+test('打字 approve 後再按退回或再打字都不翻盤', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T15', 'approve_reject')
+  await h.service.interceptUpdate(message(U1, 'approve', messageId))
+  await h.service.interceptUpdate(press('appr:reject:T15', U1, messageId))
+  expect(await h.service.interceptUpdate(message(U1, '退回', messageId))).toBe(false)
+  expect(h.service.get('T15')).toMatchObject({ status: 'approved', decision: 'approve', decidedVia: 'text' })
+})
+
+test('回執或改訊息失敗時決定仍然記錄、仍吃掉該則', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T16', 'approve_reject')
+  h.fail.add('sendText')
+  h.fail.add('editText')
+  expect(await h.service.interceptUpdate(message(U1, 'approve', messageId))).toBe(true)
+  expect(h.service.get('T16')?.status).toBe('approved')
+})
+
+test('編輯過的訊息（edited_message）改成 approve 不認列', async () => {
+  const h = harness()
+  const messageId = await createOne(h, 'T17', 'approve_reject')
+  const original = message(U1, '先問個問題', messageId)
+  const edited = { update_id: ++updateId, edited_message: { ...original.message, text: 'approve' } } as unknown as Update
+  expect(await h.service.interceptUpdate(edited)).toBe(false)
+  expect(h.service.get('T17')).toMatchObject({ status: 'pending', decidedVia: null })
 })

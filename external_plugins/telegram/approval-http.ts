@@ -76,6 +76,7 @@ export type ApprovalView = {
   status: ApprovalRequest['status']
   decision: ApprovalRequest['decision']
   comment: string | null
+  decided_via: ApprovalRequest['decidedVia']
   created_at_ms: number
   expires_at_ms: number
   resolved_at_ms: number | null
@@ -106,6 +107,7 @@ export function toApprovalView(request: ApprovalRequest): ApprovalView {
     status: request.status,
     decision: request.decision,
     comment: request.comment,
+    decided_via: request.decidedVia,
     created_at_ms: request.createdAtMs,
     expires_at_ms: request.expiresAtMs,
     resolved_at_ms: request.resolvedAtMs,

@@ -2,9 +2,10 @@
  * Approval requests over Telegram inline buttons (JP-315).
  *
  * Ties the store to the Bot API: sends a request as a message with buttons,
- * turns callback_query / quote-reply updates into decisions, and rewrites the
- * message to its final state. The Bot API is injected so everything here runs
- * against a fake in tests.
+ * turns callback_query / quote-reply updates (comments, and typed approve /
+ * reject replies to a pending approve_reject request) into decisions, and
+ * rewrites the message to its final state. The Bot API is injected so
+ * everything here runs against a fake in tests.
  *
  * Two entry points, on purpose kept apart:
  * - create / get / cancel / consume — reachable from the loopback interface;
@@ -70,10 +71,18 @@ const ALREADY_SETTLED_TEXT = '這筆請求已經處理過了。'
 const COMMENT_REQUESTED_TEXT = '請回覆意見'
 const TEXT_ONLY_COMMENT_TEXT = '請用文字回覆意見。'
 const COMMENT_TOO_LATE_TEXT = '這筆請求已經結案，這則意見沒有被記錄。'
+const TYPED_DECISION_RECEIPT_PREFIX = '已認列打字回覆：'
 /** Bot commands are never comments: a /restart typed into the forced reply box must still reach its handler. */
 const COMMAND_PREFIX = '/'
+const TYPED_APPROVE_RE = /^(?:approve|核准)$/iu
+/** A reject keyword followed by the end, whitespace or punctuation. */
+const TYPED_REJECT_RE = /^(?:退回|reject)(?=$|[\s\p{P}])/iu
+const LEADING_SEPARATORS_RE = /^[\s\p{P}]+/u
 
 export type ApprovalButton = { text: string; callbackData: string }
+
+/** A typed reply read as a decision; `comment` is the reject comment after the keyword, null when none. */
+export type TypedDecision = { action: Extract<ApprovalAction, 'approve' | 'reject'>; comment: string | null }
 
 /** The slice of the Bot API this feature uses. */
 export type ApprovalTelegramApi = {
@@ -174,6 +183,30 @@ export function renderApprovalText(request: ApprovalRequest): string {
   const rendered = `${composeMessageText(request.bindingDisplay, request.text, request.sessionName)}\n\n${outcomeLabel(request)}`
   if (rendered.length <= TELEGRAM_MESSAGE_LIMIT) return rendered
   return `${rendered.slice(0, TELEGRAM_MESSAGE_LIMIT - TRUNCATION_MARK.length)}${TRUNCATION_MARK}`
+}
+
+/**
+ * Read a typed reply as an approve / reject decision. Surrounding whitespace
+ * and letter case are ignored. The whole text must be `approve` / `核准` to
+ * approve; a reject starts with `退回` / `reject` followed by the end,
+ * whitespace or punctuation, and whatever follows (minus its leading
+ * whitespace and punctuation) is the comment.
+ *
+ * @param text - The reply text as received.
+ * @returns The decision, or null when the text is not one.
+ *
+ * @example
+ * parseTypedDecision(' Approve ')     // { action: 'approve', comment: null }
+ * parseTypedDecision('退回：理由文字') // { action: 'reject', comment: '理由文字' }
+ * parseTypedDecision('rejected')      // null
+ */
+export function parseTypedDecision(text: string): TypedDecision | null {
+  const trimmed = text.trim()
+  if (TYPED_APPROVE_RE.test(trimmed)) return { action: 'approve', comment: null }
+  const match = TYPED_REJECT_RE.exec(trimmed)
+  if (!match) return null
+  const comment = trimmed.slice(match[0].length).replace(LEADING_SEPARATORS_RE, '')
+  return { action: 'reject', comment: comment === '' ? null : comment }
 }
 
 function describeCommentWindow(commentTimeoutMs: number): string {
@@ -319,7 +352,37 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     await rewriteMessages(result.request)
   }
 
-  /** @returns true when the message was a comment (or an attempt at one) and is consumed. */
+  /** @returns true when the reply was read as a decision on a pending approve_reject request and is consumed. */
+  const handleTypedDecision = async (
+    message: NonNullable<Update['message']>,
+    target: SentMessage,
+    fromId: number,
+  ): Promise<boolean> => {
+    const pending = store.findPendingByMessage(target)
+    if (!pending || pending.kind !== 'approve_reject') return false
+    if (!deps.loadAllowFrom().includes(String(fromId))) return false
+    const typed = message.text === undefined ? null : parseTypedDecision(message.text)
+    if (!typed) return false
+
+    const result = store.decideByText(pending.id, typed.action, typed.comment, target)
+    if (result.outcome !== 'resolved' && result.outcome !== 'awaiting_comment') return false
+    const receipt = formatFirstLine(
+      FIRST_LINE_STATUS.system,
+      result.request.sessionName,
+      `${TYPED_DECISION_RECEIPT_PREFIX}${DECIDED_LABELS[typed.action]}`,
+    )
+    await api.sendText(message.chat.id, receipt).catch(err => {
+      log(`telegram poller: approval ${result.request.id} typed-decision receipt failed: ${err}`)
+    })
+    if (result.outcome === 'awaiting_comment') {
+      await askForComment(result.request, target.chatId, target.messageId)
+      return true
+    }
+    await rewriteMessages(result.request)
+    return true
+  }
+
+  /** @returns true when the message was a comment (or an attempt at one) or a typed decision, and is consumed. */
   const handleReply = async (message: NonNullable<Update['message']>): Promise<boolean> => {
     const repliedTo = message.reply_to_message
     if (!repliedTo || !message.from || message.from.is_bot) return false
@@ -330,7 +393,7 @@ export function createApprovalService(deps: ApprovalServiceDeps): ApprovalServic
     // The request still waiting for this comment, else the one whose prompt this
     // reply arrived too late for.
     const owner = request ?? store.findClosedByPrompt(target)
-    if (!owner) return false
+    if (!owner) return handleTypedDecision(message, target, message.from.id)
     // Not ours to swallow: an outsider's reply takes today's route, where
     // server.ts's gate applies the access policy as it always has.
     if (!deps.loadAllowFrom().includes(String(message.from.id))) return false
