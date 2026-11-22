@@ -303,6 +303,7 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
   "status": "denied",
   "decision": "reject",
   "comment": "範圍要再縮小，拿掉 X",
+  "decided_via": "button",
   "created_at_ms": 1790927386899,
   "expires_at_ms": 1791013786899,
   "resolved_at_ms": 1790927400000
@@ -323,6 +324,10 @@ bot 的擁有者用兩顆按鈕回答一個是非題，並讀回按了哪一顆�
 | `consumed` | 原為 `approved`，已經由「消耗」用掉。終態，不再算核准。 | `allow` / `approve`（保留當初核准的按鈕當紀錄） | `null` |
 
 判斷請以 `status` 為準，不要看 `decision`：`consumed` 的請求仍顯示當初核准的按鈕。
+
+`decided_via` 記核准 / 退回的決定怎麼做出的：按按鈕為 `"button"`、打字回覆（見下方）為 `"text"`；
+還沒決定，以及 `cancelled` / `expired` 為 `null`。按「退回」按鈕後打字補意見仍是 `"button"`；
+打字「退回」後再補意見仍是 `"text"`。
 
 **取消 —— `POST /approvals/<id>/cancel`**（不需 body）
 
@@ -377,6 +382,13 @@ curl -s -X POST http://127.0.0.1:7852/approvals/appr_3f9c1e7a5b2d4c6e8a0b1d2f3a4
 - 「退回」讓請求進入 `awaiting_comment`，bot 另發一則提示請 user 回覆。意見 = `allowFrom` 內的人
   **引用回覆**該提示（或原請求訊息）的文字。這則回覆由 poller 吃掉，**不會**轉給任何 session。
   非文字的回覆會收到「[等你回覆] <session_name>: 請用文字回覆意見。」並繼續等。等意見逾時則記為 `denied`、`comment: ""`。
+- `pending` 的 `approve_reject` 請求也可以打字決定：`allowFrom` 內的人**引用回覆**該請求訊息，
+  比對時去頭尾空白、不分大小寫。整則等於 `approve` 或 `核准` -> 等同按 approve。以 `退回` 或 `reject`
+  開頭、且關鍵字後面是結尾、空白或標點 -> 等同按「退回」：後面有文字就去掉開頭的空白與標點、當意見直接記為
+  `denied`；只有關鍵字時跟按鈕一樣請 user 補意見。這則回覆由 poller 吃掉，bot 回一句
+  「[系統] <session_name>: 已認列打字回覆：[已 approve]」（或 `[已退回]`），訊息改寫與按按鈕相同。
+  其他文字（`rejected`、提問）、回覆 `allow_deny` 請求或已不是 `pending` 的請求、編輯過的訊息、
+  沒有引用任何訊息的一般訊息，照舊轉給 session。
 - 以 `/` 開頭的回覆一律不算意見、照常轉送，所以等意見期間 `/restart` 這類 bot 指令照樣有效。
 - 請求已結案（等意見逾時、被取消）後才引用回覆提示訊息：不記錄、也不轉給 session，bot 回一句
   「[系統] <session_name>: 這筆請求已經結案，這則意見沒有被記錄。」。

@@ -4,10 +4,11 @@
  * The decision lives here, inside the poller process, and nowhere else: there
  * is deliberately NO method that sets a request to approved or denied from a
  * caller-supplied value. The only ways a request leaves `pending` are a button
- * press, a written comment, a cancel and the clock — and the first two are only
- * ever called from the Telegram update path. That is what keeps a session from
- * approving its own request: the loopback interface can reach create(), get(),
- * cancel() and consume(), none of which can produce `approved`.
+ * press, a typed approve / reject reply, a written comment, a cancel and the
+ * clock — and the first three are only ever called from the Telegram update
+ * path. That is what keeps a session from approving its own request: the
+ * loopback interface can reach create(), get(), cancel() and consume(), none of
+ * which can produce `approved`.
  *
  * consume() (JP-374) only ever moves an approval the other way: an `approved`
  * request created with a binding becomes `consumed` the first time a caller
@@ -24,6 +25,8 @@ import { HUB_SESSION_NAME } from './first-line'
 
 export type ApprovalKind = 'allow_deny' | 'approve_reject'
 export type ApprovalAction = 'allow' | 'deny' | 'approve' | 'reject'
+/** How a decision was made: a button press or a typed approve / reject reply. */
+export type DecidedVia = 'button' | 'text'
 export type ApprovalStatus =
   | 'pending'
   | 'awaiting_comment'
@@ -52,6 +55,8 @@ export type ApprovalRequest = {
   decision: ApprovalAction | null
   /** The reviewer's comment on a reject; '' when none came, null otherwise. */
   comment: string | null
+  /** How the decision was made; null until one is, and for cancelled / expired. */
+  decidedVia: DecidedVia | null
   createdAtMs: number
   expiresAtMs: number
   commentTimeoutMs: number
@@ -107,6 +112,7 @@ const ALL_STATUSES: ReadonlySet<string> = new Set([
 /** Every button there is, derived from the kinds so the two cannot drift apart. */
 export const ALL_ACTIONS: readonly ApprovalAction[] = Object.values(ACTIONS_BY_KIND).flat()
 const KNOWN_ACTIONS: ReadonlySet<string> = new Set(ALL_ACTIONS)
+const KNOWN_DECIDED_VIA: ReadonlySet<string> = new Set<DecidedVia>(['button', 'text'])
 
 const STATE_FILE_VERSION = 1
 const STATE_FILE_MODE = 0o600
@@ -151,6 +157,10 @@ function isOptionalString(value: unknown): boolean {
   return value === undefined || typeof value === 'string'
 }
 
+function isOptionalDecidedVia(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === 'string' && KNOWN_DECIDED_VIA.has(value))
+}
+
 function isApprovalRequest(value: unknown): value is ApprovalRequest {
   if (typeof value !== 'object' || value === null) return false
   const request = value as Record<string, unknown>
@@ -164,6 +174,7 @@ function isApprovalRequest(value: unknown): value is ApprovalRequest {
     typeof request.status === 'string' && ALL_STATUSES.has(request.status) &&
     (request.decision === null || (typeof request.decision === 'string' && KNOWN_ACTIONS.has(request.decision))) &&
     (request.comment === null || typeof request.comment === 'string') &&
+    isOptionalDecidedVia(request.decidedVia) &&
     typeof request.createdAtMs === 'number' &&
     typeof request.expiresAtMs === 'number' &&
     typeof request.commentTimeoutMs === 'number' &&
@@ -236,6 +247,7 @@ export class ApprovalStore {
       status: 'pending',
       decision: null,
       comment: null,
+      decidedVia: null,
       commentDeadlineMs: null,
       resolvedAtMs: null,
       prompts: [],
@@ -255,23 +267,7 @@ export class ApprovalStore {
    *   left the request untouched.
    */
   press(id: string, action: ApprovalAction, pressedOn: SentMessage): PressOutcome {
-    const request = this.#requests.get(id)
-    if (!request) return { outcome: 'not_found' }
-    if (!ACTIONS_BY_KIND[request.kind].includes(action)) return { outcome: 'wrong_action' }
-    if (!ownsMessage(request.messages, pressedOn)) return { outcome: 'wrong_message' }
-    if (request.status !== 'pending') return { outcome: 'already_settled', request }
-
-    request.decision = action
-    if (action === 'reject') {
-      request.status = 'awaiting_comment'
-      request.commentDeadlineMs = this.#now() + request.commentTimeoutMs
-      this.#save()
-      return { outcome: 'awaiting_comment', request }
-    }
-    request.status = APPROVING_ACTIONS.has(action) ? 'approved' : 'denied'
-    request.resolvedAtMs = this.#now()
-    this.#save()
-    return { outcome: 'resolved', request }
+    return this.#decide(id, action, pressedOn, 'button', null)
   }
 
   /**
@@ -301,6 +297,35 @@ export class ApprovalStore {
       if (request.status !== 'awaiting_comment' && ownsMessage(request.prompts, repliedTo)) return request
     }
     return undefined
+  }
+
+  /**
+   * Find the still-pending request whose request message is the given message.
+   *
+   * @param repliedTo - The message a user quote-replied to.
+   * @returns The pending request, or undefined.
+   */
+  findPendingByMessage(repliedTo: SentMessage): ApprovalRequest | undefined {
+    for (const request of this.#requests.values()) {
+      if (request.status === 'pending' && ownsMessage(request.messages, repliedTo)) return request
+    }
+    return undefined
+  }
+
+  /**
+   * Apply a typed approve / reject reply, under the same checks as a button
+   * press. Called only from the Telegram reply path.
+   *
+   * @param id - Request id.
+   * @param action - The action the reply was read as.
+   * @param comment - Reject comment typed after the keyword; null when none.
+   *   A reject without one waits for a comment like a pressed reject.
+   * @param typedOn - The message the reply quoted.
+   * @returns What the reply did. Anything but `resolved` / `awaiting_comment`
+   *   left the request untouched.
+   */
+  decideByText(id: string, action: ApprovalAction, comment: string | null, typedOn: SentMessage): PressOutcome {
+    return this.#decide(id, action, typedOn, 'text', comment)
   }
 
   /**
@@ -346,6 +371,7 @@ export class ApprovalStore {
     if (!isOpenStatus(request.status)) return { outcome: 'unchanged', request }
     request.status = 'cancelled'
     request.decision = null
+    request.decidedVia = null
     request.resolvedAtMs = this.#now()
     this.#save()
     return { outcome: 'cancelled', request }
@@ -413,6 +439,34 @@ export class ApprovalStore {
     return { outcome: 'consumed', request }
   }
 
+  #decide(
+    id: string,
+    action: ApprovalAction,
+    decidedOn: SentMessage,
+    decidedVia: DecidedVia,
+    comment: string | null,
+  ): PressOutcome {
+    const request = this.#requests.get(id)
+    if (!request) return { outcome: 'not_found' }
+    if (!ACTIONS_BY_KIND[request.kind].includes(action)) return { outcome: 'wrong_action' }
+    if (!ownsMessage(request.messages, decidedOn)) return { outcome: 'wrong_message' }
+    if (request.status !== 'pending') return { outcome: 'already_settled', request }
+
+    request.decision = action
+    request.decidedVia = decidedVia
+    if (action === 'reject' && comment === null) {
+      request.status = 'awaiting_comment'
+      request.commentDeadlineMs = this.#now() + request.commentTimeoutMs
+      this.#save()
+      return { outcome: 'awaiting_comment', request }
+    }
+    request.status = APPROVING_ACTIONS.has(action) ? 'approved' : 'denied'
+    if (action === 'reject') request.comment = comment
+    request.resolvedAtMs = this.#now()
+    this.#save()
+    return { outcome: 'resolved', request }
+  }
+
   #load(): void {
     if (!existsSync(this.#filePath)) return
     try {
@@ -429,6 +483,7 @@ export class ApprovalStore {
           bindingKey: request.bindingKey ?? null,
           bindingDisplay: request.bindingDisplay ?? null,
           sessionName: request.sessionName ?? HUB_SESSION_NAME,
+          decidedVia: request.decidedVia ?? null,
         })
       }
     } catch (err) {
@@ -453,9 +508,9 @@ export class ApprovalStore {
   // Every transition except consume() ignores that: the decision stands in
   // memory and the message is still rewritten, and if the poller then restarts
   // the request comes back in its last saved state, which for those
-  // transitions is never more permissive (nothing but a button press writes
-  // `approved`). consume() is the exception — its last saved state is
-  // `approved` — so it hands the failure to its caller instead.
+  // transitions is never more permissive. consume() is the exception — its
+  // last saved state is `approved` — so it hands the failure to its caller
+  // instead.
   #save(): boolean {
     const state: StateFile = { version: STATE_FILE_VERSION, requests: [...this.#requests.values()] }
     const tmp = `${this.#filePath}.tmp`

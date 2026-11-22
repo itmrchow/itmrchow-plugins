@@ -240,7 +240,10 @@ test.each([
 test('store 沒有任何可直接寫入決定的公開方法', () => {
   const methods = Object.getOwnPropertyNames(ApprovalStore.prototype).filter(name => name !== 'constructor').sort()
   expect(methods).toEqual(
-    ['add', 'addPrompt', 'cancel', 'consume', 'findAwaitingComment', 'findClosedByPrompt', 'get', 'press', 'recordComment', 'size', 'sweep'].sort(),
+    [
+      'add', 'addPrompt', 'cancel', 'consume', 'decideByText', 'findAwaitingComment', 'findClosedByPrompt',
+      'findPendingByMessage', 'get', 'press', 'recordComment', 'size', 'sweep',
+    ].sort(),
   )
 })
 
@@ -370,12 +373,14 @@ test('舊版狀態檔（沒有綁定欄位、沒有 session name）照常載入�
   }
   writeFileSync(filePath, JSON.stringify({ version: 1, requests: [legacy] }))
   const store = openStore()
-  expect(store.get('old')).toMatchObject({ status: 'approved', bindingKey: null, bindingDisplay: null, sessionName: 'tg-hub' })
+  expect(store.get('old')).toMatchObject({
+    status: 'approved', bindingKey: null, bindingDisplay: null, sessionName: 'tg-hub', decidedVia: null,
+  })
   expect(store.consume('old', KEY).outcome).toBe('binding_mismatch')
   expect(readdirSync(dir).some(name => name.startsWith('approvals.json.corrupt-'))).toBe(false)
 })
 
-test.each([['bindingKey'], ['bindingDisplay'], ['sessionName']])('狀態檔裡 %s 型別不對視為損毀', (field: string) => {
+test.each([['bindingKey'], ['bindingDisplay'], ['sessionName'], ['decidedVia']])('狀態檔裡 %s 型別不對視為損毀', (field: string) => {
   const bad = {
     id: 'a', kind: 'allow_deny', text: 't', status: 'approved', decision: 'allow', comment: null,
     createdAtMs: 1, expiresAtMs: 2, commentTimeoutMs: 3, commentDeadlineMs: null, resolvedAtMs: 1,
@@ -416,4 +421,93 @@ test('其他轉換寫檔失敗時照舊：決定留在記憶體，重啟後回�
 test('session name 隨請求落檔，重開後照舊', () => {
   openStore().add(newApproval('named'))
   expect(openStore().get('named')?.sessionName).toBe('OP-8820')
+})
+
+test('新增的請求 decidedVia 為 null；按鈕做出的決定記 button，退回後補意見仍是 button', () => {
+  const store = openStore()
+  expect(store.add(newApproval('a', 'approve_reject')).decidedVia).toBeNull()
+  store.press('a', 'approve', on())
+  expect(store.get('a')?.decidedVia).toBe('button')
+
+  store.add(newApproval('b', 'approve_reject', 11))
+  store.press('b', 'reject', on(11))
+  expect(store.get('b')?.decidedVia).toBe('button')
+  store.recordComment('b', '打字補的意見')
+  expect(store.get('b')).toMatchObject({ status: 'denied', comment: '打字補的意見', decidedVia: 'button' })
+})
+
+test('取消與逾時的請求 decidedVia 為 null；取消等意見中的請求一併清掉', () => {
+  const store = openStore()
+  store.add(newApproval('waiting', 'approve_reject'))
+  store.press('waiting', 'reject', on())
+  store.cancel('waiting')
+  expect(store.get('waiting')).toMatchObject({ status: 'cancelled', decision: null, decidedVia: null })
+
+  store.add(newApproval('late', 'approve_reject', 11))
+  clock += TIMEOUT_MS
+  store.sweep()
+  expect(store.get('late')).toMatchObject({ status: 'expired', decidedVia: null })
+})
+
+test('findPendingByMessage 只找 pending 且核准訊息相符的請求', () => {
+  const store = openStore()
+  store.add(newApproval('open', 'approve_reject'))
+  store.add(newApproval('done', 'approve_reject', 11))
+  store.press('done', 'approve', on(11))
+  expect(store.findPendingByMessage(on())?.id).toBe('open')
+  expect(store.findPendingByMessage(on(11))).toBeUndefined()
+  expect(store.findPendingByMessage(on(99))).toBeUndefined()
+  expect(store.findPendingByMessage({ chatId: CHAT_ID + 1, messageId: 10 })).toBeUndefined()
+})
+
+test('打字 approve -> approved，decidedVia 記 text', () => {
+  const store = openStore()
+  store.add(newApproval('a', 'approve_reject'))
+  expect(store.decideByText('a', 'approve', null, on()).outcome).toBe('resolved')
+  expect(store.get('a')).toMatchObject({ status: 'approved', decision: 'approve', comment: null, decidedVia: 'text' })
+  expect(store.get('a')?.resolvedAtMs).toBe(clock)
+})
+
+test('打字退回帶意見 -> 直接以該意見結案', () => {
+  const store = openStore()
+  store.add(newApproval('a', 'approve_reject'))
+  expect(store.decideByText('a', 'reject', '理由文字', on()).outcome).toBe('resolved')
+  expect(store.get('a')).toMatchObject({ status: 'denied', decision: 'reject', comment: '理由文字', decidedVia: 'text' })
+})
+
+test('只打退回 -> 進入等意見，補完意見後 decidedVia 仍是 text', () => {
+  const store = openStore()
+  store.add(newApproval('a', 'approve_reject'))
+  expect(store.decideByText('a', 'reject', null, on()).outcome).toBe('awaiting_comment')
+  expect(store.get('a')).toMatchObject({
+    status: 'awaiting_comment', decision: 'reject', decidedVia: 'text', commentDeadlineMs: clock + COMMENT_TIMEOUT_MS,
+  })
+  store.recordComment('a', '補的意見')
+  expect(store.get('a')).toMatchObject({ status: 'denied', comment: '補的意見', decidedVia: 'text' })
+})
+
+test('打字決定沿用按鈕的檢查：允許 / 拒絕型、別的訊息、已結案、查無都不改狀態', () => {
+  const store = openStore()
+  store.add(newApproval('allowDeny', 'allow_deny'))
+  expect(store.decideByText('allowDeny', 'approve', null, on()).outcome).toBe('wrong_action')
+  expect(store.get('allowDeny')).toMatchObject({ status: 'pending', decidedVia: null })
+
+  store.add(newApproval('a', 'approve_reject', 11))
+  expect(store.decideByText('a', 'approve', null, on(99)).outcome).toBe('wrong_message')
+  store.press('a', 'reject', on(11))
+  expect(store.decideByText('a', 'approve', null, on(11)).outcome).toBe('already_settled')
+  expect(store.get('a')).toMatchObject({ status: 'awaiting_comment', decidedVia: 'button' })
+
+  expect(store.decideByText('missing', 'approve', null, on()).outcome).toBe('not_found')
+})
+
+test('decidedVia 隨請求落檔，重開後照舊', () => {
+  const store = openStore()
+  store.add(newApproval('typed', 'approve_reject'))
+  store.decideByText('typed', 'approve', null, on())
+  store.add(newApproval('pressed', 'approve_reject', 11))
+  store.press('pressed', 'approve', on(11))
+  const reopened = openStore()
+  expect(reopened.get('typed')?.decidedVia).toBe('text')
+  expect(reopened.get('pressed')?.decidedVia).toBe('button')
 })

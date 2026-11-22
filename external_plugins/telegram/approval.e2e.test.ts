@@ -1220,3 +1220,214 @@ describe('第一行格式（JP-379）', () => {
     expect(world.stderr.join('')).toContain(`telegram poller: first-line format ${state} (TELEGRAM_FIRST_LINE_FORMAT)`)
   }, TEST_TIMEOUT_MS)
 })
+
+describe('打字核准', () => {
+  const promptIdOf = (world: World): number => {
+    const index = world.fake.callsOf('sendMessage').findIndex(c => (c.params.reply_markup as Json | undefined)?.force_reply === true)
+    expect(index).toBeGreaterThanOrEqual(0)
+    return FIRST_FAKE_MESSAGE_ID + index
+  }
+
+  test('回覆 pending approve 型請求打「 Approve 」：已核准、來源 text、回執、訊息改為已 approve、不轉給 session；跨重啟保留', async () => {
+    const world = await startWorld()
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    const { messageId, text } = await create(world, 'W1', 'approve_reject')
+
+    sendDm(world, U1, ' Approve ', { replyTo: messageId })
+    sendDm(world, U1, '之後的一般訊息')
+    await waitFor(() => session.envelopes.length === 1, 'the later DM to be routed')
+
+    expect(await statusOf(world, 'W1')).toMatchObject({ status: 'approved', decision: 'approve', decided_via: 'text' })
+    expect(routedTexts(session.envelopes)).toEqual(['之後的一般訊息'])
+    expect(world.fake.callsOf('sendMessage')[1].params).toMatchObject({ chat_id: U1, text: '[系統] tg-hub: 已認列打字回覆：[已 approve]' })
+    expect(lastEdit(world, messageId)?.text).toBe(`${text}\n\n[已 approve]`)
+    session.stop()
+
+    await stopPoller(world)
+    await startPoller(world, restartEnv)
+    expect(await statusOf(world, 'W1')).toMatchObject({ status: 'approved', decided_via: 'text' })
+  }, TEST_TIMEOUT_MS)
+
+  test.each([['退回：理由文字'], ['reject 理由文字']])('回覆打 %p：退回、意見為理由文字、來源 text、回執、不轉給 session', async (typed: string) => {
+    const world = await startWorld()
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    const { messageId, text } = await create(world, 'W2', 'approve_reject')
+    sendDm(world, U1, typed, { replyTo: messageId })
+    sendDm(world, U1, '之後的一般訊息')
+    await waitFor(() => session.envelopes.length === 1, 'the later DM to be routed')
+    await waitFor(() => lastEdit(world, messageId)?.text === `${text}\n\n[已退回] 意見：理由文字`, 'reject edit')
+    expect(await statusOf(world, 'W2')).toMatchObject({ status: 'denied', decision: 'reject', comment: '理由文字', decided_via: 'text' })
+    expect(routedTexts(session.envelopes)).toEqual(['之後的一般訊息'])
+    expect(world.fake.callsOf('sendMessage')[1].params).toMatchObject({ chat_id: U1, text: '[系統] tg-hub: 已認列打字回覆：[已退回]' })
+    expect(world.fake.callsOf('sendMessage')).toHaveLength(2)
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  test.each([['退回'], ['reject']])('回覆只打 %p：跟按退回一樣送補意見提示；補完結案，來源 text', async (typed: string) => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'W3', 'approve_reject')
+    sendDm(world, U1, typed, { replyTo: messageId })
+    await drained(world)
+    expect(await statusOf(world, 'W3')).toMatchObject({ status: 'awaiting_comment', decision: 'reject', decided_via: 'text' })
+    const promptId = await waitFor(() => world.fake.callsOf('sendMessage').length >= 3 && promptIdOf(world), 'comment prompt')
+    const prompt = world.fake.callsOf('sendMessage')[promptId - FIRST_FAKE_MESSAGE_ID].params
+    expect(prompt.chat_id).toBe(U1)
+    expect(prompt.text).toBe('[等你回覆] tg-hub: 請「回覆」這則訊息寫下退回意見。5 分鐘內沒有回覆，會記為無意見退回。')
+    expect(prompt.reply_markup).toEqual({ force_reply: true })
+    expect((prompt.reply_parameters as Json).message_id).toBe(messageId)
+
+    sendDm(world, U1, '補的意見', { replyTo: promptId })
+    await drained(world)
+    expect(await statusOf(world, 'W3')).toMatchObject({ status: 'denied', comment: '補的意見', decided_via: 'text' })
+  }, TEST_TIMEOUT_MS)
+
+  test('按鈕核准與按退回後打字補意見：來源 button', async () => {
+    const world = await startWorld()
+    const approved = await create(world, 'W4', 'approve_reject')
+    pressButton(world, 'appr:approve:W4', U1, approved.messageId)
+    const rejected = await create(world, 'W5', 'approve_reject')
+    pressButton(world, 'appr:reject:W5', U1, rejected.messageId)
+    await drained(world)
+    sendDm(world, U1, '按鈕後的意見', { replyTo: promptIdOf(world) })
+    await drained(world)
+    expect(await statusOf(world, 'W4')).toMatchObject({ status: 'approved', decided_via: 'button' })
+    expect(world.fake.callsOf('sendMessage').filter(c => String(c.params.text).includes('已認列'))).toEqual([])
+    expect(await statusOf(world, 'W5')).toMatchObject({ status: 'denied', comment: '按鈕後的意見', decided_via: 'button' })
+  }, TEST_TIMEOUT_MS)
+
+  test('其他文字、允許 / 拒絕型、未引用、/ 指令、已結案照常轉給 session；名單外的人不認列；狀態都不變', async () => {
+    const world = await startWorld()
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    const pending = await create(world, 'W6', 'approve_reject')
+    const allowDeny = await create(world, 'W7', 'allow_deny')
+    const settled = await create(world, 'W8', 'approve_reject')
+    pressButton(world, 'appr:approve:W8', U1, settled.messageId)
+    await drained(world)
+
+    sendDm(world, U1, 'rejected', { replyTo: pending.messageId })
+    sendDm(world, U1, '先問個問題', { replyTo: pending.messageId })
+    sendDm(world, U1, 'approve', { replyTo: allowDeny.messageId })
+    sendDm(world, U1, 'approve')
+    sendDm(world, U1, '/approve', { replyTo: pending.messageId })
+    sendDm(world, U1, '退回：改主意', { replyTo: settled.messageId })
+    sendDm(world, U1, '退回：理由', { replyTo: allowDeny.messageId })
+    sendDm(world, U1, 'approve', { replyTo: 4242 })
+    sendDm(world, U2, 'approve', { replyTo: pending.messageId, chatId: U1 })
+    sendDm(world, FAKE_BOT_ID, 'approve', { replyTo: pending.messageId, chatId: U1, isBot: true })
+    await drained(world)
+    await waitFor(() => session.envelopes.length >= 8, 'eight updates routed')
+
+    expect(routedTexts(session.envelopes).slice(0, 8)).toEqual([
+      'rejected', '先問個問題', 'approve', 'approve', '/approve', '退回：改主意', '退回：理由', 'approve',
+    ])
+    expect(await statusOf(world, 'W6')).toMatchObject({ status: 'pending', decided_via: null })
+    expect(await statusOf(world, 'W7')).toMatchObject({ status: 'pending', decided_via: null })
+    expect(await statusOf(world, 'W8')).toMatchObject({ status: 'approved', decided_via: 'button' })
+    expect(world.fake.callsOf('sendMessage').filter(c => String(c.params.text).includes('已認列'))).toEqual([])
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  test('已逾時的請求打字 approve：不改結果、照常轉給 session', async () => {
+    const world = await startWorld()
+    const session = subscribe(world, `telegram-dm-${U1}`)
+    await waitFor(() => world.stderr.join('').includes('subscribed'), 'subscription')
+    const { messageId } = await create(world, 'W9', 'approve_reject', { timeout_seconds: SHORT_TIMEOUT_SECONDS })
+    await sleep(SHORT_TIMEOUT_SECONDS * 1000 + 100)
+    sendDm(world, U1, 'approve', { replyTo: messageId })
+    await waitFor(() => session.envelopes.length === 1, 'routed')
+    expect(await statusOf(world, 'W9')).toMatchObject({ status: 'expired', decided_via: null })
+    session.stop()
+  }, TEST_TIMEOUT_MS)
+
+  test('舊版狀態檔（沒有 decidedVia）照常載入：查詢回 decided_via null，不當成損毀', async () => {
+    const world = await startWorld()
+    await stopPoller(world)
+    const now = Date.now()
+    const legacy = {
+      id: 'W10', kind: 'approve_reject', text: 't', status: 'pending', decision: null, comment: null,
+      createdAtMs: now, expiresAtMs: now + LONG_TIMEOUT_SECONDS * 1000, commentTimeoutMs: 5000,
+      commentDeadlineMs: null, resolvedAtMs: null, messages: [{ chatId: U1, messageId: 4242 }], prompts: [],
+    }
+    writeFileSync(join(world.stateDir, 'approvals.json'), JSON.stringify({ version: 1, requests: [legacy] }), { mode: 0o600 })
+    await startPoller(world, restartEnv)
+    expect(await statusOf(world, 'W10')).toMatchObject({ status: 'pending', decided_via: null })
+    expect(readdirSync(world.stateDir).some(name => name.includes('.corrupt-'))).toBe(false)
+    sendDm(world, U1, '核准', { replyTo: 4242 })
+    await drained(world)
+    expect(await statusOf(world, 'W10')).toMatchObject({ status: 'approved', decided_via: 'text' })
+  }, TEST_TIMEOUT_MS)
+})
+
+describe('打字核准：文字邊界與並行', () => {
+  test.each([
+    ['approve please', 'pending', null],
+    ['\n\tapprove\t\n', 'approved', null],
+    ['reject: 理由文字', 'denied', '理由文字'],
+    ['退回 ，、 理由文字', 'denied', '理由文字'],
+    ['退回理由文字', 'pending', null],
+    ['REJECT 理由文字', 'denied', '理由文字'],
+  ])('回覆打 %p -> %s', async (typed: string, status: string, comment: string | null) => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'X1', 'approve_reject')
+    sendDm(world, U1, typed, { replyTo: messageId })
+    await drained(world)
+    expect(await statusOf(world, 'X1')).toMatchObject({ status, comment, decided_via: status === 'pending' ? null : 'text' })
+  }, TEST_TIMEOUT_MS)
+
+  test('兩筆等待中：回覆 A 打 approve 只改 A；之後按 A 的退回按鈕不翻盤、來源仍是 text', async () => {
+    const world = await startWorld()
+    const a = await create(world, 'X2', 'approve_reject')
+    await create(world, 'X3', 'approve_reject')
+    sendDm(world, U1, 'approve', { replyTo: a.messageId })
+    await drained(world)
+    pressButton(world, 'appr:reject:X2', U1, a.messageId)
+    await drained(world)
+    expect(await statusOf(world, 'X2')).toMatchObject({ status: 'approved', decision: 'approve', decided_via: 'text' })
+    expect(await statusOf(world, 'X3')).toMatchObject({ status: 'pending', decided_via: null })
+  }, TEST_TIMEOUT_MS)
+
+  test('已退回結案的請求再打 approve：仍為退回', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'X4', 'approve_reject')
+    sendDm(world, U1, '退回：不行', { replyTo: messageId })
+    await drained(world)
+    sendDm(world, U1, 'approve', { replyTo: messageId })
+    await drained(world)
+    expect(await statusOf(world, 'X4')).toMatchObject({ status: 'denied', comment: '不行', decided_via: 'text' })
+  }, TEST_TIMEOUT_MS)
+
+  test('先回覆「先問」再把該訊息編輯成 approve：不認列', async () => {
+    const world = await startWorld()
+    const { messageId } = await create(world, 'X5', 'approve_reject')
+    const replyId = 777_001
+    const base = {
+      message_id: replyId,
+      date: 0,
+      from: { id: U1, is_bot: false, first_name: 'u' },
+      chat: { id: U1, type: 'private', first_name: 'u' },
+      reply_to_message: { message_id: messageId, date: 0, chat: { id: U1, type: 'private', first_name: 'u' } },
+    }
+    world.fake.inject({ message: { ...base, text: '先問' } } as never)
+    world.fake.inject({ edited_message: { ...base, text: 'approve', edit_date: 1 } } as never)
+    await drained(world)
+    expect(await statusOf(world, 'X5')).toMatchObject({ status: 'pending', decided_via: null })
+  }, TEST_TIMEOUT_MS)
+
+  test('[已被擋下]（有綁定的允許 / 拒絕型）請求打 approve：狀態不變', async () => {
+    const world = await startWorld()
+    const res = await call(world, 'POST', '/approvals', {
+      id: 'X6', text: '要跑危險指令', kind: 'allow_deny', timeout_seconds: LONG_TIMEOUT_SECONDS,
+      binding_session: 'session-1111', binding_subject: 'git push --force origin main', session_name: 'OP-1',
+    })
+    expect(res.status).toBe(201)
+    const messageId = FIRST_FAKE_MESSAGE_ID
+    expect(String(world.fake.callsOf('sendMessage')[0].params.text)).toStartWith('[已被擋下]')
+    sendDm(world, U1, 'approve', { replyTo: messageId })
+    sendDm(world, U1, '核准', { replyTo: messageId })
+    await drained(world)
+    expect(await statusOf(world, 'X6')).toMatchObject({ status: 'pending', decided_via: null })
+  }, TEST_TIMEOUT_MS)
+})

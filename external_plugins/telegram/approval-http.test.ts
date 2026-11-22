@@ -95,16 +95,18 @@ test('建立 -> 查詢 pending -> 按鈕允許 -> 查詢 approved', async () => 
   const { port, service, sent } = await startServer({ enabled: true })
   const created = await call(port, 'POST', '/approvals', { id: 'R1', text: '可以 merge 嗎', kind: 'allow_deny' })
   expect(created.status).toBe(201)
-  expect(created.body).toMatchObject({ id: 'R1', kind: 'allow_deny', status: 'pending', decision: null, comment: null })
+  expect(created.body).toMatchObject({
+    id: 'R1', kind: 'allow_deny', status: 'pending', decision: null, comment: null, decided_via: null,
+  })
   expect(Object.keys(created.body as object).sort()).toEqual(
-    ['comment', 'created_at_ms', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'],
+    ['comment', 'created_at_ms', 'decided_via', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'],
   )
 
   expect(await statusOf(port, 'R1')).toBe('pending')
   await service?.interceptUpdate(pressAllow('R1', sent[0]))
   const settled = await call(port, 'GET', '/approvals/R1')
   expect(settled.status).toBe(200)
-  expect(settled.body).toMatchObject({ status: 'approved', decision: 'allow' })
+  expect(settled.body).toMatchObject({ status: 'approved', decision: 'allow', decided_via: 'button' })
 })
 
 test('查詢不存在的請求回 404 not_found', async () => {
@@ -197,11 +199,13 @@ test('顯示文字含特殊字元、換行、中文與接近上限的長文時�
 test('loopback 介面沒有寫入決定的動作：各種嘗試後請求仍 pending', async () => {
   const { port } = await startServer({ enabled: true })
   await call(port, 'POST', '/approvals', { id: 'R40', text: 't', kind: 'allow_deny' })
-  const smuggled = { status: 'approved', decision: 'allow', result: 'allow', comment: 'x', resolved_at_ms: 1 }
+  const smuggled = {
+    status: 'approved', decision: 'allow', result: 'allow', comment: 'x', resolved_at_ms: 1, decided_via: 'text',
+  }
 
   // (a) 建立時夾帶結果欄位：新 id 與既有 id
   const fresh = await call(port, 'POST', '/approvals', { id: 'R41', text: 't', kind: 'allow_deny', ...smuggled })
-  expect(fresh.body).toMatchObject({ status: 'pending', decision: null, comment: null })
+  expect(fresh.body).toMatchObject({ status: 'pending', decision: null, comment: null, decided_via: null })
   await call(port, 'POST', '/approvals', { id: 'R40', text: 't', kind: 'allow_deny', ...smuggled })
 
   // (b) 查詢 / 取消以外的 method 與夾帶 body
@@ -326,7 +330,7 @@ test('沒帶綁定欄位的請求，回應欄位與既有格式完全相同', as
   await call(port, 'POST', '/approvals', { id: 'K2', text: 't', kind: 'allow_deny' })
   const queried = await call(port, 'GET', '/approvals/K2')
   expect(Object.keys(queried.body as object).sort()).toEqual(
-    ['comment', 'created_at_ms', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'],
+    ['comment', 'created_at_ms', 'decided_via', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'],
   )
 })
 
@@ -476,7 +480,7 @@ test('帶 session_name 建立：201，回應欄位與既有格式相同（不回
   const res = await call(port, 'POST', '/approvals', { id: 'N1', text: 't', kind: 'allow_deny', session_name: 'OP-8820' })
   expect(res.status).toBe(201)
   expect(Object.keys(res.body as Record<string, unknown>).sort()).toEqual(
-    ['comment', 'created_at_ms', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'].sort(),
+    ['comment', 'created_at_ms', 'decided_via', 'decision', 'expires_at_ms', 'id', 'kind', 'resolved_at_ms', 'status'].sort(),
   )
 })
 
@@ -487,4 +491,25 @@ test('4096 上限把第一行摘要算進去：區塊加 text 放得下、加上
   const withoutFirstLine = composeMessageText(renderBindingDisplay(body.binding_subject), body.text, 'OP-8820').split('\n').slice(1).join('\n')
   expect(withoutFirstLine.length).toBeLessThanOrEqual(4096)
   expect(parseCreateBody(JSON.stringify(body), DEFAULTS).ok).toBe(false)
+})
+
+test('打字 approve 認列後查詢回 decided_via: text', async () => {
+  const { port, service, sent } = await startServer({ enabled: true })
+  await call(port, 'POST', '/approvals', { id: 'V1', text: 't', kind: 'approve_reject' })
+  expect((await call(port, 'GET', '/approvals/V1')).body).toMatchObject({ status: 'pending', decided_via: null })
+  const typed = {
+    update_id: 2,
+    message: {
+      message_id: 900,
+      date: 0,
+      text: 'approve',
+      from: { id: U1, is_bot: false, first_name: 'u' },
+      chat: { id: U1, type: 'private', first_name: 'u' },
+      reply_to_message: { message_id: sent[0], date: 0, chat: { id: U1, type: 'private' } },
+    },
+  } as unknown as Update
+  expect(await service?.interceptUpdate(typed)).toBe(true)
+  expect((await call(port, 'GET', '/approvals/V1')).body).toMatchObject({
+    status: 'approved', decision: 'approve', decided_via: 'text',
+  })
 })
