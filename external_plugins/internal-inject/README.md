@@ -100,7 +100,11 @@ triggers a shutdown:
   Code) the server is gone within a few seconds
 
 An orphan left behind by an older version is not cleaned up by this; kill it by
-hand (`lsof -ti tcp:7844 -sTCP:LISTEN`).
+hand, replacing `7844` if `INTERNAL_INJECT_PORT` is set:
+
+```bash
+kill $(lsof -ti tcp:7844 -sTCP:LISTEN)
+```
 
 ## Configuration
 

@@ -91,8 +91,12 @@ server 會跟著啟動它的 Claude Code session 一起結束：關閉 `/inject`
 - 父程序、或 `bun run` 外層的 Claude Code 程序消失 —— 每 2 秒檢查一次，所以
   Claude Code 被強制結束（例：`kill -9`）後，server 最多約數秒內結束
 
-舊版本留下的孤兒程序不會因此消失，要手動清（`lsof -ti tcp:7844 -sTCP:LISTEN` 找出
-pid）。
+舊版本留下的孤兒程序不會因此消失，要手動清（有設 `INTERNAL_INJECT_PORT` 時把
+`7844` 換成該值）：
+
+```bash
+kill $(lsof -ti tcp:7844 -sTCP:LISTEN)
+```
 
 ## 設定
 
