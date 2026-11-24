@@ -23,7 +23,7 @@ import { createBodyCollector } from './body'
 import { parseInjectBody, REPLY_CHANNELS, type ChannelDelivery } from './inject'
 import { resolveInjectHost } from './inject-host'
 import { resolveInjectPort } from './inject-port'
-import { createShutdown, isOrphaned, isProcessAlive, readParentPid } from './shutdown'
+import { createShutdown, isGrandparentAlive, isOrphaned, readParentPid } from './shutdown'
 
 const DEFAULT_PORT = 7844
 const DEFAULT_HOST = '127.0.0.1'
@@ -187,7 +187,7 @@ setInterval(() => {
     platform: process.platform,
     bootPpid,
     ppid: process.ppid,
-    grandparentAlive: bootGrandparentPid === null || isProcessAlive(bootGrandparentPid),
+    grandparentAlive: isGrandparentAlive(bootGrandparentPid),
     stdinDestroyed: process.stdin.destroyed,
     stdinEnded: process.stdin.readableEnded,
   })

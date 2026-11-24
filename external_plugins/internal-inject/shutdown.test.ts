@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { createShutdown, isOrphaned, isProcessAlive, readParentPid, type OrphanSnapshot } from './shutdown'
+import { createShutdown, isGrandparentAlive, isOrphaned, isProcessAlive, readParentPid, type OrphanSnapshot } from './shutdown'
+import { createBunOnlyPathDir } from './test-support'
 
 const BOOT_PPID = 4242
 
@@ -102,6 +103,17 @@ describe('readParentPid', () => {
 
     expect(readParentPid(child.pid)).toBeNull()
   })
+
+  test('returns null instead of throwing when ps is not on PATH', () => {
+    const script = "import { readParentPid } from './shutdown'; console.log(JSON.stringify(readParentPid(process.pid)))"
+    const result = Bun.spawnSync([process.execPath, '-e', script], {
+      cwd: import.meta.dir,
+      env: { ...process.env, PATH: createBunOnlyPathDir() },
+    })
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.toString().trim()).toBe('null')
+  })
 })
 
 describe('isProcessAlive', () => {
@@ -114,5 +126,22 @@ describe('isProcessAlive', () => {
     await child.exited
 
     expect(isProcessAlive(child.pid)).toBe(false)
+  })
+})
+
+describe('isGrandparentAlive', () => {
+  test('fails open when the grandparent is unknown', () => {
+    expect(isGrandparentAlive(null)).toBe(true)
+  })
+
+  test('is true while the grandparent is running', () => {
+    expect(isGrandparentAlive(process.pid)).toBe(true)
+  })
+
+  test('is false once the grandparent has exited', async () => {
+    const child = Bun.spawn(['true'])
+    await child.exited
+
+    expect(isGrandparentAlive(child.pid)).toBe(false)
   })
 })

@@ -1,9 +1,4 @@
-/**
- * Shutdown helpers for the internal-inject channel server.
- *
- * Kept as its own module so the re-entrancy and orphan rules are unit-testable:
- * server.ts binds its port at module top-level, so it cannot be imported from a test.
- */
+/** Shutdown helpers for the internal-inject channel server. */
 
 const EXIT_CODE_OK = 0
 const WIN32_PLATFORM = 'win32'
@@ -60,16 +55,24 @@ export function isOrphaned(snapshot: OrphanSnapshot): boolean {
 }
 
 /**
- * Look up the parent pid of another process via `ps` (POSIX only).
+ * Look up the parent pid of another process via `ps`.
+ *
+ * Never throws: a missing `ps` executable must not crash the server at boot.
  *
  * @param pid - Process whose parent to look up.
- * @returns The parent pid, or null on win32, when the process does not exist, or when `ps` fails.
+ * @returns The parent pid, or null when the process does not exist, `ps` exits non-zero,
+ *   or `ps` cannot be executed at all (e.g. not on PATH).
  */
 export function readParentPid(pid: number): number | null {
-  if (process.platform === WIN32_PLATFORM) return null
-  const result = Bun.spawnSync(['ps', '-o', 'ppid=', '-p', String(pid)])
-  if (!result.success) return null
-  const parentPid = Number(result.stdout.toString().trim())
+  let output: string
+  try {
+    const result = Bun.spawnSync(['ps', '-o', 'ppid=', '-p', String(pid)])
+    if (!result.success) return null
+    output = result.stdout.toString()
+  } catch {
+    return null
+  }
+  const parentPid = Number(output.trim())
   return Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null
 }
 
@@ -86,4 +89,17 @@ export function isProcessAlive(pid: number): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === ERRNO_NO_PERMISSION
   }
+}
+
+/**
+ * Check whether the grandparent recorded at boot is still running.
+ *
+ * Fails open: an unknown grandparent (null, e.g. `ps` was unavailable at boot) counts
+ * as alive, which disables this check and leaves the ppid and stdin checks in charge.
+ *
+ * @param grandparentPid - Grandparent pid recorded at boot, or null when it could not be read.
+ * @returns True when the grandparent is unknown or still exists.
+ */
+export function isGrandparentAlive(grandparentPid: number | null): boolean {
+  return grandparentPid === null || isProcessAlive(grandparentPid)
 }
