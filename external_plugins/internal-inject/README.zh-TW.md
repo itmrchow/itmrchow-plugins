@@ -81,6 +81,23 @@ bash scripts/internal-inject-token.sh revoke stock-monitor
 401。若改成 exit，inject port 就沒人 listen，而 `claude-tg-agent` 的 watchdog 會把
 「port 沒人聽」判定成 agent 死了 —— 一個缺檔會變成無限重啟迴圈。
 
+## 生命週期
+
+server 會跟著啟動它的 Claude Code session 一起結束：關閉 `/inject` listener，讓下一
+個 session 能 bind 同一個 port。以下任一情況就會結束：
+
+- stdin 被關閉（Claude Code 關掉 MCP 連線）
+- 收到 `SIGTERM`、`SIGINT` 或 `SIGHUP`
+- 父程序、或 `bun run` 外層的 Claude Code 程序消失 —— 每 2 秒檢查一次，所以
+  Claude Code 被強制結束（例：`kill -9`）後，server 最多約數秒內結束
+
+舊版本留下的孤兒程序不會因此消失，要手動清（有設 `INTERNAL_INJECT_PORT` 時把
+`7844` 換成該值）：
+
+```bash
+kill $(lsof -ti tcp:7844 -sTCP:LISTEN)
+```
+
 ## 設定
 
 | Env | 預設 | 用途 |
