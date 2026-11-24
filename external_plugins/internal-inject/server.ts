@@ -23,6 +23,7 @@ import { createBodyCollector } from './body'
 import { parseInjectBody, REPLY_CHANNELS, type ChannelDelivery } from './inject'
 import { resolveInjectHost } from './inject-host'
 import { resolveInjectPort } from './inject-port'
+import { createShutdown, isOrphaned } from './shutdown'
 
 const DEFAULT_PORT = 7844
 const DEFAULT_HOST = '127.0.0.1'
@@ -30,6 +31,7 @@ const HTTP_OK = 200
 const HTTP_UNAUTHORIZED = 401
 const HTTP_NOT_FOUND = 404
 const HTTP_PAYLOAD_TOO_LARGE = 413
+const ORPHAN_CHECK_INTERVAL_MS = 5000
 
 // Per-plugin env key (not a shared INJECT_PORT): every channel plugin binds its
 // own port, and the claude-tg-agent watchdog probes this exact number. The
@@ -106,7 +108,7 @@ await mcp.connect(new StdioServerTransport())
 // Binds INTERNAL_INJECT_HOST (default 127.0.0.1). Exposing this beyond localhost is
 // a deliberate deployment decision with a separate threat model (JP-153/OP-8688) —
 // the token is an identity, not a firewall.
-createServer((req, res) => {
+const injectServer = createServer((req, res) => {
   if (req.method !== 'POST' || (req.url ?? '') !== '/inject') {
     res.writeHead(HTTP_NOT_FOUND)
     res.end('not found')
@@ -164,6 +166,30 @@ createServer((req, res) => {
     res.end('ok')
   })
 }).listen(INTERNAL_INJECT_PORT, INTERNAL_INJECT_HOST)
+
+// Exit together with the Claude session that started us, releasing the inject port.
+const shutdown = createShutdown(() => {
+  process.stderr.write('internal-inject channel: shutting down\n')
+  injectServer.close()
+}, code => process.exit(code))
+process.stdin.on('end', shutdown)
+process.stdin.on('close', shutdown)
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
+process.on('SIGHUP', shutdown)
+
+// Orphan watchdog: reparenting or a dead stdin means the session is gone.
+const bootPpid = process.ppid
+setInterval(() => {
+  const orphaned = isOrphaned({
+    platform: process.platform,
+    bootPpid,
+    ppid: process.ppid,
+    stdinDestroyed: process.stdin.destroyed,
+    stdinEnded: process.stdin.readableEnded,
+  })
+  if (orphaned) shutdown()
+}, ORPHAN_CHECK_INTERVAL_MS).unref()
 
 // Boot-time token check is a WARNING, never an exit. An exit leaves nobody
 // listening on the inject port, and the claude-tg-agent watchdog reads an unbound
