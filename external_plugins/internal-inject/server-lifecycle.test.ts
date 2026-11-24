@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { connect, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createBunOnlyPathDir } from './test-support'
 
 const PLUGIN_DIR = import.meta.dir
 const LOOPBACK = '127.0.0.1'
@@ -18,7 +19,7 @@ const WATCHDOG_INTERVAL_MS = 2_000
 const WATCHDOG_MARGIN_MS = 1_000
 const LONG_TEST_TIMEOUT_MS = 30_000
 const HTTP_OK = 200
-const STDIN_HOLDER_BASE_SECONDS = 100_000
+const STDIN_HOLDER_SECONDS = 60
 
 type ServerSubprocess = Subprocess<'pipe', 'ignore', 'ignore'>
 type ServerLayout = 'direct' | 'parent-shell' | 'grandparent-shell'
@@ -26,7 +27,7 @@ type ServerLayout = 'direct' | 'parent-shell' | 'grandparent-shell'
 let stateDir = ''
 const spawned: ServerSubprocess[] = []
 const usedPorts: number[] = []
-const stdinHolders: number[] = []
+const stdinHolders: string[] = []
 
 beforeAll(() => {
   stateDir = mkdtempSync(join(tmpdir(), 'internal-inject-lifecycle-'))
@@ -43,7 +44,7 @@ afterEach(() => {
     if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL')
   }
   for (const port of usedPorts.splice(0)) killListenerOn(port)
-  for (const seconds of stdinHolders.splice(0)) Bun.spawnSync(['pkill', '-f', `^sleep ${seconds}$`])
+  for (const duration of stdinHolders.splice(0)) runBestEffort(['pkill', '-f', `^sleep ${duration}$`])
 })
 
 process.on('exit', () => {
@@ -124,9 +125,30 @@ async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs: numbe
  * @param port - Port whose listener should be killed.
  */
 function killListenerOn(port: number): void {
-  const lsof = Bun.spawnSync(['lsof', '-ti', `tcp:${port}`, '-sTCP:LISTEN'])
-  const pids = lsof.stdout.toString().split('\n').filter(line => line.trim() !== '')
-  for (const pid of pids) process.kill(Number(pid), 'SIGKILL')
+  const pids = runBestEffort(['lsof', '-ti', `tcp:${port}`, '-sTCP:LISTEN'])
+    .split('\n')
+    .filter(line => line.trim() !== '')
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), 'SIGKILL')
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/**
+ * Run a cleanup command, tolerating a missing executable or a non-zero exit.
+ *
+ * @param cmd - Command and arguments.
+ * @returns The command's stdout, or an empty string when it could not run.
+ */
+function runBestEffort(cmd: string[]): string {
+  try {
+    return Bun.spawnSync(cmd).stdout.toString()
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -134,20 +156,22 @@ function killListenerOn(port: number): void {
  *
  * @param layout - `direct`, or under one (`parent-shell`) or two (`grandparent-shell`) `sh` layers so a test can kill an ancestor.
  * @param fixedPort - Reuse this port instead of reserving a fresh one.
+ * @param envOverrides - Extra environment for the spawned process.
  * @returns The spawned process (the outermost shell for shell layouts) and the inject port.
  */
 async function startServer(
   layout: ServerLayout,
   fixedPort?: number,
+  envOverrides: Record<string, string> = {},
 ): Promise<{ proc: ServerSubprocess; port: number }> {
   const port = fixedPort ?? (await getFreePort())
   usedPorts.push(port)
   const serverCmd = [process.execPath, 'server.ts']
   // Stdin is fed by a sibling `sleep` under the same shell, not by this test process.
-  const stdinHolderSeconds = STDIN_HOLDER_BASE_SECONDS + port
-  stdinHolders.push(stdinHolderSeconds)
-  const parentScript = `sleep ${stdinHolderSeconds} | "${process.execPath}" server.ts; :`
-  const grandparentScript = `sleep ${stdinHolderSeconds} | sh -c '"${process.execPath}" server.ts; :'; :`
+  const stdinHolderDuration = `${STDIN_HOLDER_SECONDS}.${port}`
+  stdinHolders.push(stdinHolderDuration)
+  const parentScript = `sleep ${stdinHolderDuration} | "${process.execPath}" server.ts; :`
+  const grandparentScript = `sleep ${stdinHolderDuration} | sh -c '"${process.execPath}" server.ts; :'; :`
   const layoutCommands: Record<ServerLayout, string[]> = {
     direct: serverCmd,
     'parent-shell': ['sh', '-c', parentScript],
@@ -161,6 +185,7 @@ async function startServer(
       INTERNAL_INJECT_PORT: String(port),
       INTERNAL_INJECT_HOST: LOOPBACK,
       INTERNAL_INJECT_STATE_DIR: stateDir,
+      ...envOverrides,
     },
     stdin: 'pipe',
     stdout: 'ignore',
@@ -207,6 +232,19 @@ describe('server lifecycle', () => {
 
     expect(proc.exitCode).toBeNull()
     expect(await postInject(port)).toBe(HTTP_OK)
+  }, LONG_TEST_TIMEOUT_MS)
+
+  test('still binds and shuts down on stdin close when ps is not on PATH', async () => {
+    const { proc, port } = await startServer('direct', undefined, { PATH: createBunOnlyPathDir() })
+
+    expect(proc.exitCode).toBeNull()
+    expect(await postInject(port)).toBe(HTTP_OK)
+
+    proc.stdin.end()
+
+    expect(await waitForExit(proc, EXIT_TIMEOUT_MS)).toBe(true)
+    expect(proc.exitCode).toBe(0)
+    expect(await canBind(port)).toBe(true)
   }, LONG_TEST_TIMEOUT_MS)
 
   test('exits and releases the port when stdin is closed', async () => {
