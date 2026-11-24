@@ -14,13 +14,14 @@ const POLL_INTERVAL_MS = 100
 const BOOT_TIMEOUT_MS = 10_000
 const EXIT_TIMEOUT_MS = 3_000
 const ORPHAN_EXIT_TIMEOUT_MS = 10_000
-const WATCHDOG_INTERVAL_MS = 5_000
+const WATCHDOG_INTERVAL_MS = 2_000
 const WATCHDOG_MARGIN_MS = 1_000
 const LONG_TEST_TIMEOUT_MS = 30_000
 const HTTP_OK = 200
 const STDIN_HOLDER_BASE_SECONDS = 100_000
 
 type ServerSubprocess = Subprocess<'pipe', 'ignore', 'ignore'>
+type ServerLayout = 'direct' | 'parent-shell' | 'grandparent-shell'
 
 let stateDir = ''
 const spawned: ServerSubprocess[] = []
@@ -131,12 +132,12 @@ function killListenerOn(port: number): void {
 /**
  * Start server.ts with its inject listener on a fresh port and wait until it accepts connections.
  *
- * @param viaShell - Run it under an intermediate `sh` so the test can kill its parent.
+ * @param layout - `direct`, or under one (`parent-shell`) or two (`grandparent-shell`) `sh` layers so a test can kill an ancestor.
  * @param fixedPort - Reuse this port instead of reserving a fresh one.
- * @returns The spawned process (the shell when viaShell) and the inject port.
+ * @returns The spawned process (the outermost shell for shell layouts) and the inject port.
  */
 async function startServer(
-  viaShell: boolean,
+  layout: ServerLayout,
   fixedPort?: number,
 ): Promise<{ proc: ServerSubprocess; port: number }> {
   const port = fixedPort ?? (await getFreePort())
@@ -145,8 +146,14 @@ async function startServer(
   // Stdin is fed by a sibling `sleep` under the same shell, not by this test process.
   const stdinHolderSeconds = STDIN_HOLDER_BASE_SECONDS + port
   stdinHolders.push(stdinHolderSeconds)
-  const shellScript = `sleep ${stdinHolderSeconds} | "${process.execPath}" server.ts; :`
-  const cmd = viaShell ? ['sh', '-c', shellScript] : serverCmd
+  const parentScript = `sleep ${stdinHolderSeconds} | "${process.execPath}" server.ts; :`
+  const grandparentScript = `sleep ${stdinHolderSeconds} | sh -c '"${process.execPath}" server.ts; :'; :`
+  const layoutCommands: Record<ServerLayout, string[]> = {
+    direct: serverCmd,
+    'parent-shell': ['sh', '-c', parentScript],
+    'grandparent-shell': ['sh', '-c', grandparentScript],
+  }
+  const cmd = layoutCommands[layout]
   const proc = Bun.spawn(cmd, {
     cwd: PLUGIN_DIR,
     env: {
@@ -194,16 +201,16 @@ async function postInject(port: number): Promise<number> {
 
 describe('server lifecycle', () => {
   test('stays alive past several watchdog ticks and keeps accepting injects', async () => {
-    const { proc, port } = await startServer(false)
+    const { proc, port } = await startServer('direct')
 
-    await Bun.sleep(WATCHDOG_INTERVAL_MS * 2 + WATCHDOG_MARGIN_MS)
+    await Bun.sleep(WATCHDOG_INTERVAL_MS * 3 + WATCHDOG_MARGIN_MS)
 
     expect(proc.exitCode).toBeNull()
     expect(await postInject(port)).toBe(HTTP_OK)
   }, LONG_TEST_TIMEOUT_MS)
 
   test('exits and releases the port when stdin is closed', async () => {
-    const { proc, port } = await startServer(false)
+    const { proc, port } = await startServer('direct')
 
     proc.stdin.end()
 
@@ -214,7 +221,7 @@ describe('server lifecycle', () => {
 
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
     test(`exits cleanly and releases the port on ${signal}`, async () => {
-      const { proc, port } = await startServer(false)
+      const { proc, port } = await startServer('direct')
 
       proc.kill(signal)
 
@@ -225,7 +232,7 @@ describe('server lifecycle', () => {
   }
 
   test('exits within the orphan deadline when its parent is SIGKILLed while stdin stays open', async () => {
-    const { proc: shell, port } = await startServer(true)
+    const { proc: shell, port } = await startServer('parent-shell')
 
     shell.kill('SIGKILL')
     await shell.exited
@@ -234,12 +241,22 @@ describe('server lifecycle', () => {
     expect(await canBind(port)).toBe(true)
   }, LONG_TEST_TIMEOUT_MS)
 
+  test('exits within the orphan deadline when its grandparent is SIGKILLed while parent and stdin survive', async () => {
+    const { proc: outerShell, port } = await startServer('grandparent-shell')
+
+    outerShell.kill('SIGKILL')
+    await outerShell.exited
+
+    expect(await waitFor(async () => !(await isListening(port)), ORPHAN_EXIT_TIMEOUT_MS)).toBe(true)
+    expect(await canBind(port)).toBe(true)
+  }, LONG_TEST_TIMEOUT_MS)
+
   test('a second server binds the same port right after the first one shut down', async () => {
-    const first = await startServer(false)
+    const first = await startServer('direct')
     first.proc.stdin.end()
     expect(await waitForExit(first.proc, EXIT_TIMEOUT_MS)).toBe(true)
 
-    const second = await startServer(false, first.port)
+    const second = await startServer('direct', first.port)
 
     expect(second.proc.exitCode).toBeNull()
     expect(await postInject(second.port)).toBe(HTTP_OK)

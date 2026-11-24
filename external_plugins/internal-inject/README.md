@@ -95,8 +95,9 @@ triggers a shutdown:
 
 - stdin is closed (Claude Code closed the MCP connection)
 - `SIGTERM`, `SIGINT` or `SIGHUP`
-- the parent process is gone — checked every 5 seconds, so after a hard kill
-  (e.g. `kill -9` of Claude Code) the server is gone within a few seconds
+- the parent process, or the Claude Code process above the `bun run` wrapper, is
+  gone — checked every 2 seconds, so after a hard kill (e.g. `kill -9` of Claude
+  Code) the server is gone within a few seconds
 
 An orphan left behind by an older version is not cleaned up by this; kill it by
 hand (`lsof -ti tcp:7844 -sTCP:LISTEN`).

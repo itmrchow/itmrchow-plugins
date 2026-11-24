@@ -23,7 +23,7 @@ import { createBodyCollector } from './body'
 import { parseInjectBody, REPLY_CHANNELS, type ChannelDelivery } from './inject'
 import { resolveInjectHost } from './inject-host'
 import { resolveInjectPort } from './inject-port'
-import { createShutdown, isOrphaned } from './shutdown'
+import { createShutdown, isOrphaned, isProcessAlive, readParentPid } from './shutdown'
 
 const DEFAULT_PORT = 7844
 const DEFAULT_HOST = '127.0.0.1'
@@ -31,7 +31,7 @@ const HTTP_OK = 200
 const HTTP_UNAUTHORIZED = 401
 const HTTP_NOT_FOUND = 404
 const HTTP_PAYLOAD_TOO_LARGE = 413
-const ORPHAN_CHECK_INTERVAL_MS = 5000
+const ORPHAN_CHECK_INTERVAL_MS = 2000
 
 // Per-plugin env key (not a shared INJECT_PORT): every channel plugin binds its
 // own port, and the claude-tg-agent watchdog probes this exact number. The
@@ -178,13 +178,16 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
-// Orphan watchdog: reparenting or a dead stdin means the session is gone.
+// Orphan watchdog: reparenting, a vanished grandparent (the Claude session above the
+// `bun run` wrapper) or a dead stdin means the session is gone.
 const bootPpid = process.ppid
+const bootGrandparentPid = readParentPid(bootPpid)
 setInterval(() => {
   const orphaned = isOrphaned({
     platform: process.platform,
     bootPpid,
     ppid: process.ppid,
+    grandparentAlive: bootGrandparentPid === null || isProcessAlive(bootGrandparentPid),
     stdinDestroyed: process.stdin.destroyed,
     stdinEnded: process.stdin.readableEnded,
   })

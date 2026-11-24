@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { createShutdown, isOrphaned, type OrphanSnapshot } from './shutdown'
+import { createShutdown, isOrphaned, isProcessAlive, readParentPid, type OrphanSnapshot } from './shutdown'
 
 const BOOT_PPID = 4242
 
@@ -8,6 +8,7 @@ function makeSnapshot(overrides: Partial<OrphanSnapshot> = {}): OrphanSnapshot {
     platform: 'darwin',
     bootPpid: BOOT_PPID,
     ppid: BOOT_PPID,
+    grandparentAlive: true,
     stdinDestroyed: false,
     stdinEnded: false,
     ...overrides,
@@ -69,6 +70,14 @@ describe('isOrphaned', () => {
     expect(isOrphaned(makeSnapshot({ platform: 'win32', ppid: 1 }))).toBe(false)
   })
 
+  test('is true once the grandparent is gone even though the direct parent survives', () => {
+    expect(isOrphaned(makeSnapshot({ grandparentAlive: false }))).toBe(true)
+  })
+
+  test('ignores the grandparent on win32', () => {
+    expect(isOrphaned(makeSnapshot({ platform: 'win32', grandparentAlive: false }))).toBe(false)
+  })
+
   test('is true when stdin has been destroyed', () => {
     expect(isOrphaned(makeSnapshot({ stdinDestroyed: true }))).toBe(true)
   })
@@ -79,5 +88,31 @@ describe('isOrphaned', () => {
 
   test('still detects a dead stdin on win32', () => {
     expect(isOrphaned(makeSnapshot({ platform: 'win32', stdinEnded: true }))).toBe(true)
+  })
+})
+
+describe('readParentPid', () => {
+  test('returns the parent pid of a live process', () => {
+    expect(readParentPid(process.pid)).toBe(process.ppid)
+  })
+
+  test('returns null for a pid that does not exist', async () => {
+    const child = Bun.spawn(['true'])
+    await child.exited
+
+    expect(readParentPid(child.pid)).toBeNull()
+  })
+})
+
+describe('isProcessAlive', () => {
+  test('is true for a running process', () => {
+    expect(isProcessAlive(process.pid)).toBe(true)
+  })
+
+  test('is false once the process has exited', async () => {
+    const child = Bun.spawn(['true'])
+    await child.exited
+
+    expect(isProcessAlive(child.pid)).toBe(false)
   })
 })
